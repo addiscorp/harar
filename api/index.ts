@@ -17,6 +17,7 @@ export interface VaultApiDeps {
   db: VaultDatabase;
   audit: VaultAuditLog;
   recipients: RecipientStore;
+  rotateRecipients: (options?: { force?: boolean }) => Promise<unknown[]>;
   replicas: ReplicaStore;
   signingKeys: SigningKeys;
 }
@@ -27,6 +28,9 @@ export async function handleVaultRequest(request: Request, deps: VaultApiDeps, p
     if (request.method === 'GET' && url.pathname === '/health') return json({ ok: true, machine_id: deps.config.machineId });
 
     const auth = deps.auth.authenticate(request, peerCredentials);
+    if (auth.principal.keyType === 'breakglass') {
+      deps.audit.append({ principal: auth.principal.name, op: 'breakglass_auth' });
+    }
     const secretMatch = url.pathname.match(/^\/secret\/([^/]+\/[^/]+)(?:\/([^/]+))?$/);
     if (secretMatch) {
       const namespace = decodeURIComponent(secretMatch[1]);
@@ -76,7 +80,8 @@ export async function handleVaultRequest(request: Request, deps: VaultApiDeps, p
     }
     if (url.pathname === '/recipient/rotate' && request.method === 'POST') {
       requireAdmin(auth.principal);
-      const recipients = await deps.recipients.rotate();
+      const body = request.headers.get('content-length') === '0' ? undefined : await optionalJson(request);
+      const recipients = await deps.rotateRecipients({ force: body?.force === true });
       deps.audit.append({ principal: auth.principal.name, op: 'recipient_rotate' });
       return json({ recipients });
     }
@@ -114,6 +119,14 @@ export async function handleVaultRequest(request: Request, deps: VaultApiDeps, p
   } catch (error: any) {
     const status = error?.status ?? 500;
     return json({ error: status === 500 ? 'internal_error' : 'request_error', message: error?.message ?? String(error) }, status);
+  }
+}
+
+async function optionalJson(request: Request): Promise<any | undefined> {
+  try {
+    return await request.json();
+  } catch {
+    return undefined;
   }
 }
 

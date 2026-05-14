@@ -16,6 +16,7 @@ type LibcSymbols = {
 };
 
 let libc: { symbols: LibcSymbols } | null | undefined;
+let sodium: { symbols: { sodium_mlock: (addr: unknown, len: number) => number; sodium_munlock: (addr: unknown, len: number) => number } } | null | undefined;
 
 export function getPeerCredentials(fd: number): PeerCredentials | undefined {
   const symbols = getLibc();
@@ -62,15 +63,44 @@ export function coreDumpLimit(): { soft: bigint; hard: bigint } | null {
 }
 
 export function lockMemory(buffer: Uint8Array): boolean {
+  const sodiumSymbols = getSodium();
+  if (sodiumSymbols && buffer.byteLength > 0) return sodiumSymbols.sodium_mlock(ptr(buffer), buffer.byteLength) === 0;
   const symbols = getLibc();
   if (!symbols || buffer.byteLength === 0) return false;
   return symbols.mlock(ptr(buffer), buffer.byteLength) === 0;
 }
 
 export function unlockMemory(buffer: Uint8Array): boolean {
+  const sodiumSymbols = getSodium();
+  if (sodiumSymbols && buffer.byteLength > 0) return sodiumSymbols.sodium_munlock(ptr(buffer), buffer.byteLength) === 0;
   const symbols = getLibc();
   if (!symbols || buffer.byteLength === 0) return false;
   return symbols.munlock(ptr(buffer), buffer.byteLength) === 0;
+}
+
+function getSodium() {
+  if (sodium === undefined) sodium = loadSodium();
+  return sodium?.symbols ?? null;
+}
+
+function loadSodium() {
+  for (const name of ['libsodium.so.23', 'libsodium.so', '/opt/homebrew/lib/libsodium.dylib', '/usr/local/lib/libsodium.dylib']) {
+    try {
+      return dlopen(name, {
+        sodium_mlock: {
+          args: [FFIType.ptr, FFI_USIZE],
+          returns: FFIType.i32,
+        },
+        sodium_munlock: {
+          args: [FFIType.ptr, FFI_USIZE],
+          returns: FFIType.i32,
+        },
+      }) as unknown as { symbols: { sodium_mlock: (addr: unknown, len: number) => number; sodium_munlock: (addr: unknown, len: number) => number } };
+    } catch {
+      // Fall back to libc mlock when libsodium is not present on the host.
+    }
+  }
+  return null;
 }
 
 function getLibc(): LibcSymbols | null {

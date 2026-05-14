@@ -20,7 +20,9 @@ export interface VaultPeer {
 export interface TokenRecord {
   principal: string;
   token_hash: string;
+  key_type?: 'service' | 'breakglass';
   uid?: number;
+  gid?: number;
   admin?: boolean;
   namespaces: string[];
 }
@@ -28,6 +30,8 @@ export interface TokenRecord {
 export interface Principal {
   name: string;
   uid?: number;
+  gid?: number;
+  keyType?: 'service' | 'breakglass';
   admin: boolean;
   namespaces: string[];
 }

@@ -19,23 +19,23 @@ describe('vault API lifecycle', () => {
     const source = await deps('phobos');
     const peer = await deps('bugsy', source.signingKeys.publicKeyPem);
 
-    await expectJson(source, 'POST', '/secret/platform/deka/API_KEY', 'admin-token', { value: 'secret-value' }, 200);
-    const listed = await expectJson(source, 'GET', '/secret/platform/deka', 'svc-token', undefined, 200);
+    await expectJson(source, 'POST', '/secret/platform/deka/API_KEY', 'admin-token', { value: 'secret-value' }, 200, adminPeer);
+    const listed = await expectJson(source, 'GET', '/secret/platform/deka', 'svc-token', undefined, 200, svcPeer);
     expect(listed.keys[0]).toMatchObject({ key: 'API_KEY', version: 1 });
 
-    const read = await expectJson(source, 'GET', '/secret/platform/deka/API_KEY', 'svc-token', undefined, 200);
+    const read = await expectJson(source, 'GET', '/secret/platform/deka/API_KEY', 'svc-token', undefined, 200, svcPeer);
     expect(read).toEqual({ value: 'secret-value', version: 1 });
 
-    await expectJson(source, 'POST', '/recipient', 'admin-token', { id: 'peer-bugsy', type: 'peer', public_key: 'age1bugsy' }, 200);
-    const rotated = await expectJson(source, 'POST', '/recipient/rotate', 'admin-token', undefined, 200);
+    await expectJson(source, 'POST', '/recipient', 'admin-token', { id: 'peer-bugsy', type: 'peer', public_key: 'age1bugsy' }, 200, adminPeer);
+    const rotated = await expectJson(source, 'POST', '/recipient/rotate', 'admin-token', undefined, 200, adminPeer);
     expect(rotated.recipients.length).toBeGreaterThanOrEqual(2);
 
-    const bundle = await expectJson(source, 'GET', '/replicate/pull', 'admin-token', undefined, 200);
-    await expectJson(peer, 'POST', '/replicate/push', 'admin-token', bundle, 200);
-    const nextBundle = await expectJson(source, 'GET', '/replicate/pull', 'admin-token', undefined, 200);
+    const bundle = await expectJson(source, 'GET', '/replicate/pull', 'admin-token', undefined, 200, adminPeer);
+    await expectJson(peer, 'POST', '/replicate/push', 'admin-token', bundle, 200, adminPeer);
+    const nextBundle = await expectJson(source, 'GET', '/replicate/pull', 'admin-token', undefined, 200, adminPeer);
     expect(nextBundle.manifest.manifest.version).toBe(bundle.manifest.manifest.version + 1);
     expect(nextBundle.manifest.manifest.prev_manifest_hash).toBe(manifestHeadHash(bundle.manifest));
-    await expectJson(peer, 'POST', '/replicate/push', 'admin-token', nextBundle, 200);
+    await expectJson(peer, 'POST', '/replicate/push', 'admin-token', nextBundle, 200, adminPeer);
     const replicaRows = JSON.parse(await fs.readFile(path.join(peer.config.dataDir, 'replicas', 'phobos', 'secrets.rows.json'), 'utf8'));
     expect(replicaRows[0].ciphertext).toBeString();
     expect(JSON.stringify(replicaRows)).not.toContain('secret-value');
@@ -46,6 +46,12 @@ describe('vault API lifecycle', () => {
 
     await expectJson(api, 'GET', '/secret/platform/deka', 'uid-token', undefined, 403, { uid: 502, gid: 20, pid: 123 });
     await expectJson(api, 'GET', '/secret/platform/deka', 'uid-token', undefined, 403);
+  });
+
+  test('breakglass token is explicit and audited when peer credentials are unavailable', async () => {
+    const api = await deps('phobos');
+    await expectJson(api, 'GET', '/audit', 'breakglass-token', undefined, 200);
+    expect(api.audit.query().some((row) => row.principal === 'breakglass:root' && row.op === 'breakglass_auth')).toBe(true);
   });
 });
 
@@ -64,18 +70,23 @@ async function deps(machineId: string, phobosSigPub?: string): Promise<VaultApiD
       peers: phobosSigPub ? [{ id: 'phobos', url: 'unix://phobos', ageRecipient: 'age1phobos', signaturePublicKey: phobosSigPub }] : [],
     },
     auth: VaultAuth.fromRecords([
-      { principal: 'admin', token_hash: hashToken('admin-token'), admin: true, namespaces: ['platform/*'] },
-      { principal: 'svc:deka', token_hash: hashToken('svc-token'), namespaces: ['platform/deka'] },
+      { principal: 'admin', token_hash: hashToken('admin-token'), uid: 500, admin: true, namespaces: ['platform/*'] },
+      { principal: 'svc:deka', token_hash: hashToken('svc-token'), uid: 501, namespaces: ['platform/deka'] },
       { principal: 'svc:uid', token_hash: hashToken('uid-token'), uid: 501, namespaces: ['platform/deka'] },
+      { principal: 'breakglass:root', token_hash: hashToken('breakglass-token'), key_type: 'breakglass', admin: true, namespaces: ['platform/*'] },
     ]),
     acl: new VaultAcl(),
     db: VaultDatabase.openInMemory(generateDbKey()),
     audit: VaultAuditLog.openInMemory(),
     recipients,
+    rotateRecipients: async () => recipients.rotate(),
     replicas: new ReplicaStore(dataDir, phobosSigPub ? [{ id: 'phobos', url: 'unix://phobos', ageRecipient: 'age1phobos', signaturePublicKey: phobosSigPub }] : []),
     signingKeys: await loadOrCreateSigningKeys(dataDir),
   };
 }
+
+const adminPeer = { uid: 500, gid: 20, pid: 123 };
+const svcPeer = { uid: 501, gid: 20, pid: 123 };
 
 async function expectJson(
   deps: VaultApiDeps,

@@ -35,6 +35,12 @@ export class RecipientStore {
     const records = await this.readAll();
     const active = records.filter((record) => !record.removed_at);
     if (active.length < this.minRecipients) throw new Error('not enough active recipients to rotate');
+    return this.markVerified(active.map((record) => record.id));
+  }
+
+  async markVerified(ids: string[]): Promise<RecipientRecord[]> {
+    const records = await this.readAll();
+    const active = records.filter((record) => !record.removed_at && ids.includes(record.id));
     const now = new Date().toISOString();
     for (const record of active) record.last_verified_at = now;
     await this.writeAll(records);
@@ -43,6 +49,10 @@ export class RecipientStore {
 
   async publicRecipients(): Promise<string[]> {
     return (await this.list()).filter((record) => record.type !== 'passphrase').map((record) => record.public_key);
+  }
+
+  minRequired(): number {
+    return this.minRecipients;
   }
 
   private async readAll(): Promise<RecipientRecord[]> {

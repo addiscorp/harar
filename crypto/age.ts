@@ -1,4 +1,7 @@
 import { spawn } from 'bun';
+import fs from 'fs/promises';
+import os from 'os';
+import path from 'path';
 
 export interface AgeRunner {
   wrap(plaintext: Uint8Array, recipients: string[]): Promise<Uint8Array>;
@@ -36,9 +39,12 @@ export class MockAgeRunner implements AgeRunner {
     return encodeMock('hardware', recipients.join(','), plaintext);
   }
 
-  async unwrap(ciphertext: Uint8Array, _identityPath = 'mock'): Promise<Uint8Array> {
+  async unwrap(ciphertext: Uint8Array, identityPath = 'mock'): Promise<Uint8Array> {
     const decoded = decodeMock(ciphertext);
     if (decoded.mode !== 'hardware') throw new Error(`cannot unwrap ${decoded.mode} with hardware identity`);
+    if (identityPath.startsWith('recipient:') && !decoded.context.split(',').includes(identityPath.slice('recipient:'.length))) {
+      throw new Error('identity is not a recipient for this artifact');
+    }
     return decoded.plaintext;
   }
 
@@ -54,12 +60,13 @@ export class MockAgeRunner implements AgeRunner {
 }
 
 async function runAge(bin: string, args: string[], stdin: Uint8Array, passphrase?: string): Promise<Uint8Array> {
+  if (passphrase !== undefined) return runAgePassphrase(bin, args, stdin, passphrase);
   const proc = spawn({
     cmd: [bin, ...args],
     stdin: 'pipe',
     stdout: 'pipe',
     stderr: 'pipe',
-    env: passphrase === undefined ? process.env : { ...process.env, AGE_PASSPHRASE: passphrase },
+    env: scrubbedEnv(),
   });
   proc.stdin.write(stdin);
   proc.stdin.end();
@@ -70,6 +77,39 @@ async function runAge(bin: string, args: string[], stdin: Uint8Array, passphrase
   ]);
   if (exitCode !== 0) throw new Error(`age failed: ${stderr.trim() || `exit ${exitCode}`}`);
   return new Uint8Array(stdout);
+}
+
+async function runAgePassphrase(bin: string, args: string[], payload: Uint8Array, passphrase: string): Promise<Uint8Array> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'gild-age-'));
+  const inputPath = path.join(dir, 'payload');
+  const outputPath = path.join(dir, 'payload.age');
+  try {
+    await fs.writeFile(inputPath, payload, { mode: 0o600 });
+    const proc = spawn({
+      cmd: [bin, ...args, '-o', outputPath, inputPath],
+      stdin: 'pipe',
+      stdout: 'pipe',
+      stderr: 'pipe',
+      env: scrubbedEnv(),
+    });
+    proc.stdin.write(new TextEncoder().encode(`${passphrase}\n${passphrase}\n`));
+    proc.stdin.end();
+    const [exitCode, stderr] = await Promise.all([
+      proc.exited,
+      new Response(proc.stderr).text(),
+    ]);
+    if (exitCode !== 0) throw new Error(`age failed: ${stderr.trim() || `exit ${exitCode}`}`);
+    return new Uint8Array(await fs.readFile(outputPath));
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+}
+
+function scrubbedEnv(): Record<string, string> {
+  const env = { ...process.env };
+  delete env.AGE_PASSPHRASE;
+  delete env.GILD_VAULT_RECOVERY_PASSPHRASE;
+  return env as Record<string, string>;
 }
 
 function encodeMock(mode: string, context: string, plaintext: Uint8Array): Uint8Array {

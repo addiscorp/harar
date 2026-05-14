@@ -17,7 +17,8 @@ export interface VaultDaemonOptions {
   config?: string;
   socket?: string;
   sepIdentity?: string;
-  recoveryPassphrase?: string;
+  recoveryPassphraseProvider?: () => Promise<string | undefined>;
+  allowPageableKey?: boolean;
 }
 
 export interface RunningVaultDaemon {
@@ -42,20 +43,35 @@ export async function vaultDaemon(options: VaultDaemonOptions = {}): Promise<nev
 }
 
 export async function startVaultDaemon(options: VaultDaemonOptions = {}): Promise<RunningVaultDaemon> {
-  disableCoreDumps();
   const config = await loadVaultConfig(options.config);
   if (options.socket) config.socketPath = options.socket;
   await ensureVaultDirs(config);
   await fs.rm(config.socketPath, { force: true });
 
   const paths = vaultPaths(config.dataDir);
+  if (!disableCoreDumps()) {
+    await writeStartupFatal(paths.auditDb, 'disable_core_dumps_failed');
+    console.error('startup fatal: failed to disable core dumps');
+    throw new Error('failed to disable core dumps');
+  }
+
   const recipients = new RecipientStore(paths.recipientsJson, config.minRecipients);
   const age = new SubprocessAgeRunner();
-  const keyring = new VaultKeyring(config.dataDir, age, recipients);
-  const dbKey = await keyring.unsealOrCreate({
-    identityPath: options.sepIdentity ?? process.env.GILD_VAULT_SEP_IDENTITY,
-    recoveryPassphrase: options.recoveryPassphrase ?? process.env.GILD_VAULT_RECOVERY_PASSPHRASE,
-  });
+  const keyring = new VaultKeyring(config.dataDir, age, recipients, { allowPageableKey: options.allowPageableKey });
+  const recoveryPassphrase = await loadRecoveryPassphrase(config.dataDir, options.recoveryPassphraseProvider);
+  let dbKey: Uint8Array;
+  try {
+    dbKey = await keyring.unsealOrCreate({
+      identityPath: options.sepIdentity ?? process.env.GILD_VAULT_SEP_IDENTITY,
+      recoveryPassphrase,
+    });
+  } catch (error: any) {
+    if (String(error?.message ?? error).includes('memory lock failed')) {
+      await writeStartupFatal(paths.auditDb, 'db_key_memory_lock_failed');
+      console.error('startup fatal: failed to lock DB key memory; use --allow-pageable-key only for local development');
+    }
+    throw error;
+  }
   const deps = {
     config,
     auth: await VaultAuth.fromFile(config.tokensPath),
@@ -63,6 +79,11 @@ export async function startVaultDaemon(options: VaultDaemonOptions = {}): Promis
     db: await VaultDatabase.open(paths.secretsDb, dbKey),
     audit: await VaultAuditLog.open(paths.auditDb),
     recipients,
+    rotateRecipients: (rotateOptions?: { force?: boolean }) => keyring.rotate(dbKey, {
+      identityPath: options.sepIdentity ?? process.env.GILD_VAULT_SEP_IDENTITY,
+      recoveryPassphrase,
+      force: rotateOptions?.force,
+    }),
     replicas: new ReplicaStore(config.dataDir, config.peers),
     signingKeys: await loadOrCreateSigningKeys(config.dataDir),
   };
@@ -109,6 +130,48 @@ export async function startVaultDaemon(options: VaultDaemonOptions = {}): Promis
       keyring.zero(dbKey);
     },
   };
+}
+
+async function writeStartupFatal(auditDb: string, reason: string): Promise<void> {
+  const audit = await VaultAuditLog.open(auditDb);
+  try {
+    audit.append({ principal: 'system', op: 'startup_fatal', tag: reason });
+  } finally {
+    audit.close();
+  }
+}
+
+async function loadRecoveryPassphrase(dataDir: string, provider?: () => Promise<string | undefined>): Promise<string | undefined> {
+  if (provider) return provider();
+  const fd = process.env.GILD_VAULT_RECOVERY_PASSPHRASE_FD;
+  if (fd) return readPassphraseFd(fd);
+  const configuredPath = process.env.GILD_VAULT_RECOVERY_PASSPHRASE_FILE;
+  const defaultPath = pathJoin(dataDir, 'recovery.passphrase');
+  return readPassphraseFile(configuredPath ?? defaultPath, configuredPath !== undefined);
+}
+
+async function readPassphraseFd(fd: string): Promise<string> {
+  const text = await fs.readFile(`/proc/self/fd/${Number(fd)}`, 'utf8');
+  return text.replace(/\r?\n$/, '');
+}
+
+async function readPassphraseFile(filePath: string, required: boolean): Promise<string | undefined> {
+  let stat;
+  try {
+    stat = await fs.stat(filePath);
+  } catch (error: any) {
+    if (!required && error?.code === 'ENOENT') return undefined;
+    throw error;
+  }
+  if ((stat.mode & 0o077) !== 0) throw new Error(`recovery passphrase file must be mode 0600: ${filePath}`);
+  if (typeof process.getuid === 'function' && process.getuid() === 0 && stat.uid !== 0) {
+    throw new Error(`recovery passphrase file must be owned by root: ${filePath}`);
+  }
+  return (await fs.readFile(filePath, 'utf8')).replace(/\r?\n$/, '');
+}
+
+function pathJoin(...parts: string[]): string {
+  return parts.join('/').replace(/\/+/g, '/');
 }
 
 function installShutdownHandlers(running: RunningVaultDaemon): void {

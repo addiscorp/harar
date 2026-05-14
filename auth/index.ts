@@ -9,7 +9,9 @@ export interface AuthContext {
 }
 
 export class VaultAuth {
-  private constructor(private readonly records: TokenRecord[]) {}
+  private constructor(private readonly records: TokenRecord[]) {
+    validateTokenRecords(records);
+  }
 
   static async fromFile(path: string): Promise<VaultAuth> {
     const parsed = JSON.parse(await fs.readFile(path, 'utf8'));
@@ -26,22 +28,40 @@ export class VaultAuth {
     const tokenHash = hashToken(token);
     const record = this.records.find((candidate) => safeCompare(candidate.token_hash, tokenHash));
     if (!record) throw authError('invalid bearer token', 401);
+    const keyType = record.key_type ?? 'service';
+    if (keyType !== 'breakglass' && !peerCredentials) {
+      throw authError('peer credentials unavailable', 403);
+    }
     const peerUid = peerCredentials?.uid;
-    if (record.uid !== undefined && peerUid !== undefined && record.uid !== peerUid) {
+    if (keyType !== 'breakglass' && peerUid !== undefined && record.uid !== peerUid) {
       throw authError('peer uid does not match token principal', 403);
     }
-    if (record.uid !== undefined && peerUid === undefined) {
-      throw authError('peer credentials unavailable', 403);
+    if (keyType !== 'breakglass' && record.gid !== undefined && peerCredentials?.gid !== record.gid) {
+      throw authError('peer gid does not match token principal', 403);
     }
     return {
       tokenHash,
       principal: {
         name: record.principal,
         uid: record.uid,
+        gid: record.gid,
+        keyType,
         admin: record.admin === true,
         namespaces: record.namespaces,
       },
     };
+  }
+}
+
+function validateTokenRecords(records: TokenRecord[]): void {
+  for (const record of records) {
+    const keyType = record.key_type ?? 'service';
+    if (keyType !== 'service' && keyType !== 'breakglass') {
+      throw new Error(`unsupported token key_type for ${record.principal}`);
+    }
+    if (keyType !== 'breakglass' && record.uid === undefined) {
+      throw new Error(`non-breakglass token ${record.principal} must declare uid`);
+    }
   }
 }
 
