@@ -3,7 +3,6 @@ import { hashToken, VaultAuth } from './index.js';
 
 describe('vault auth', () => {
   test('derives principal from bearer token and rejects namespace mismatch', () => {
-    process.env.GILD_VAULT_ALLOW_MISSING_PEERCRED = '1';
     const auth = VaultAuth.fromRecords([{
       principal: 'svc:deka',
       token_hash: hashToken('token-a'),
@@ -16,11 +15,9 @@ describe('vault auth', () => {
     expect(ctx.principal.name).toBe('svc:deka');
 
     expect(() => auth.authenticate(new Request('http://vault/secret/platform/deka/API_KEY'))).toThrow('missing bearer');
-    delete process.env.GILD_VAULT_ALLOW_MISSING_PEERCRED;
   });
 
   test('rejects peer uid mismatch when credentials are available', () => {
-    process.env.NODE_ENV = 'test';
     const auth = VaultAuth.fromRecords([{
       principal: 'svc:deka',
       token_hash: hashToken('token-a'),
@@ -29,7 +26,20 @@ describe('vault auth', () => {
     }]);
 
     expect(() => auth.authenticate(new Request('http://vault/', {
-      headers: { authorization: 'Bearer token-a', 'x-gild-peer-uid': '502' },
-    }))).toThrow('peer uid');
+      headers: { authorization: 'Bearer token-a' },
+    }), { uid: 502, gid: 20, pid: 123 })).toThrow('peer uid');
+  });
+
+  test('rejects uid-bound token when peer credentials are unavailable', () => {
+    const auth = VaultAuth.fromRecords([{
+      principal: 'svc:deka',
+      token_hash: hashToken('token-a'),
+      uid: 501,
+      namespaces: ['platform/deka'],
+    }]);
+
+    expect(() => auth.authenticate(new Request('http://vault/', {
+      headers: { authorization: 'Bearer token-a' },
+    }))).toThrow('peer credentials unavailable');
   });
 });

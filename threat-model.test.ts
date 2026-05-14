@@ -7,7 +7,9 @@ import { assertPathPrincipalMatch, hashToken, VaultAuth } from './auth/index.js'
 import { aadFor, decryptSecret, encryptSecret, generateDbKey } from './crypto/aead.js';
 import { MockAgeRunner } from './crypto/age.js';
 import { buildSignedManifest } from './manifest/index.js';
+import { manifestHeadHash } from './manifest/index.js';
 import { migrateEnvFile } from './migration/env.js';
+import { coreDumpLimit, disableCoreDumps, getPeerCredentials } from './native.js';
 import { RecipientStore } from './recipients/index.js';
 import { ReplicaStore } from './replication/index.js';
 import { loadOrCreateSigningKeys } from './crypto/signing.js';
@@ -23,7 +25,7 @@ describe('Hamza threat-model regressions F1-F12', () => {
     expect(() => assertPathPrincipalMatch(principal, 'platform/admin')).toThrow('path namespace');
   });
 
-  test('F3 rejects unsigned or rollback replica manifests', async () => {
+  test('F3 rejects unsigned, replayed, rollback, gap, tampered-chain, and cross-source manifests', async () => {
     const src = await fs.mkdtemp(path.join(os.tmpdir(), 'vault-src-'));
     const dst = await fs.mkdtemp(path.join(os.tmpdir(), 'vault-dst-'));
     const keys = await loadOrCreateSigningKeys(src);
@@ -40,9 +42,49 @@ describe('Hamza threat-model regressions F1-F12', () => {
     const store = new ReplicaStore(dst, [{ id: 'phobos', url: 'unix://phobos', ageRecipient: 'age1', signaturePublicKey: keys.publicKeyPem }]);
     await store.apply({ source_machine_id: 'phobos', manifest, rows: db.rows() });
     await expect(store.apply({ source_machine_id: 'phobos', manifest, rows: db.rows() })).rejects.toThrow('rollback');
-    manifest.signature = 'bad';
+    const rollback = buildSignedManifest({
+      machineId: 'phobos',
+      rows: db.rows(),
+      recipients: [],
+      version: 1,
+      privateKeyPem: keys.privateKeyPem,
+      publicKeyPem: keys.publicKeyPem,
+    });
+    await expect(store.apply({ source_machine_id: 'phobos', manifest: rollback, rows: db.rows() })).rejects.toThrow('rollback');
+    const gap = buildSignedManifest({
+      machineId: 'phobos',
+      rows: db.rows(),
+      recipients: [],
+      version: 3,
+      prevManifestHash: manifestHeadHash(manifest),
+      privateKeyPem: keys.privateKeyPem,
+      publicKeyPem: keys.publicKeyPem,
+    });
+    await expect(store.apply({ source_machine_id: 'phobos', manifest: gap, rows: db.rows() })).rejects.toThrow('non-contiguous');
+    const tamperedChain = buildSignedManifest({
+      machineId: 'phobos',
+      rows: db.rows(),
+      recipients: [],
+      version: 2,
+      prevManifestHash: 'wrong-head',
+      privateKeyPem: keys.privateKeyPem,
+      publicKeyPem: keys.publicKeyPem,
+    });
+    await expect(store.apply({ source_machine_id: 'phobos', manifest: tamperedChain, rows: db.rows() })).rejects.toThrow('chain head');
+    const crossSource = buildSignedManifest({
+      machineId: 'bugsy',
+      rows: db.rows(),
+      recipients: [],
+      version: 2,
+      prevManifestHash: manifestHeadHash(manifest),
+      privateKeyPem: keys.privateKeyPem,
+      publicKeyPem: keys.publicKeyPem,
+    });
+    await expect(store.apply({ source_machine_id: 'phobos', manifest: crossSource, rows: db.rows() })).rejects.toThrow('machine_id');
+    const badSignature = structuredClone(manifest);
+    badSignature.signature = 'bad';
     await expect(new ReplicaStore(await fs.mkdtemp(path.join(os.tmpdir(), 'vault-dst-')), [{ id: 'phobos', url: 'unix://phobos', ageRecipient: 'age1', signaturePublicKey: keys.publicKeyPem }])
-      .apply({ source_machine_id: 'phobos', manifest, rows: db.rows() })).rejects.toThrow('signature');
+      .apply({ source_machine_id: 'phobos', manifest: badSignature, rows: db.rows() })).rejects.toThrow('signature');
   });
 
   test('F4 migration quarantines and dry-run preserves source', async () => {
@@ -56,9 +98,30 @@ describe('Hamza threat-model regressions F1-F12', () => {
   });
 
   test('F5 and F7 bind token to peer uid when configured', () => {
-    process.env.NODE_ENV = 'test';
     const auth = VaultAuth.fromRecords([{ principal: 'svc', token_hash: hashToken('token'), uid: 99, namespaces: ['platform/deka'] }]);
-    expect(() => auth.authenticate(new Request('http://vault/', { headers: { authorization: 'Bearer token', 'x-gild-peer-uid': '100' } }))).toThrow('peer uid');
+    expect(() => auth.authenticate(new Request('http://vault/', { headers: { authorization: 'Bearer token' } }), { uid: 100, gid: 20, pid: 123 })).toThrow('peer uid');
+    expect(() => auth.authenticate(new Request('http://vault/', { headers: { authorization: 'Bearer token' } }))).toThrow('peer credentials');
+  });
+
+  test('F2 reads peer credentials from an accepted Unix socket fd', async () => {
+    if (process.platform !== 'linux') return;
+    const sock = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'vault-peer-')), 'sock');
+    let seenUid: number | undefined;
+    const server = Bun.listen({
+      unix: sock,
+      socket: {
+        open(socket) {
+          seenUid = getPeerCredentials((socket as any).fd)?.uid;
+        },
+        data(socket) {
+          socket.end('HTTP/1.1 200 OK\r\ncontent-length:2\r\nconnection:close\r\n\r\nok');
+        },
+      },
+    });
+    const response = await fetch('http://vault/health', { unix: sock } as RequestInit);
+    expect(await response.text()).toBe('ok');
+    server.stop(true);
+    expect(seenUid).toBe(process.getuid?.() ?? -1);
   });
 
   test('F6 Linux TPM PCR binding is not part of macOS SEP v1 code path', () => {
@@ -78,6 +141,12 @@ describe('Hamza threat-model regressions F1-F12', () => {
     audit.append({ principal: 'admin', op: 'write', namespace: 'platform/deka', key: 'API_KEY', tag: 'tag' });
     expect(JSON.stringify(audit.query())).not.toContain('secret-value');
     audit.close();
+  });
+
+  test('F9 disables core dumps in the current process', () => {
+    disableCoreDumps();
+    const limit = coreDumpLimit();
+    if (limit) expect(limit.soft).toBe(0n);
   });
 
   test('F10 refuses recipient lockout without break-glass', async () => {

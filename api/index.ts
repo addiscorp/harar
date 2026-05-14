@@ -5,9 +5,10 @@ import { assertPathPrincipalMatch, requireAdmin, requireNamespaceAccess, VaultAu
 import type { SigningKeys } from '../crypto/signing.js';
 import type { VaultDatabase } from '../db/index.js';
 import { buildSignedManifest } from '../manifest/index.js';
+import { manifestHeadHash } from '../manifest/index.js';
 import { RecipientStore } from '../recipients/index.js';
 import { ReplicaStore } from '../replication/index.js';
-import type { ReplicaBundle, VaultConfig } from '../types.js';
+import type { PeerCredentials, ReplicaBundle, VaultConfig } from '../types.js';
 
 export interface VaultApiDeps {
   config: VaultConfig;
@@ -20,12 +21,12 @@ export interface VaultApiDeps {
   signingKeys: SigningKeys;
 }
 
-export async function handleVaultRequest(request: Request, deps: VaultApiDeps): Promise<Response> {
+export async function handleVaultRequest(request: Request, deps: VaultApiDeps, peerCredentials?: PeerCredentials): Promise<Response> {
   const url = new URL(request.url);
   try {
     if (request.method === 'GET' && url.pathname === '/health') return json({ ok: true, machine_id: deps.config.machineId });
 
-    const auth = deps.auth.authenticate(request);
+    const auth = deps.auth.authenticate(request, peerCredentials);
     const secretMatch = url.pathname.match(/^\/secret\/([^/]+\/[^/]+)(?:\/([^/]+))?$/);
     if (secretMatch) {
       const namespace = decodeURIComponent(secretMatch[1]);
@@ -90,14 +91,17 @@ export async function handleVaultRequest(request: Request, deps: VaultApiDeps): 
     if (url.pathname === '/replicate/pull' && request.method === 'GET') {
       requireAdmin(auth.principal);
       const rows = deps.db.rows();
+      const state = deps.db.manifestState(deps.config.machineId);
       const manifest = buildSignedManifest({
         machineId: deps.config.machineId,
         rows,
         recipients: await deps.recipients.list(),
-        version: Math.max(1, ...rows.map((row) => row.version)),
+        version: state.seq + 1,
+        prevManifestHash: state.head_hash,
         privateKeyPem: deps.signingKeys.privateKeyPem,
         publicKeyPem: deps.signingKeys.publicKeyPem,
       });
+      deps.db.updateManifestState(deps.config.machineId, manifest.manifest.version, manifestHeadHash(manifest));
       return json({ source_machine_id: deps.config.machineId, manifest, rows });
     }
     if (url.pathname === '/replicate/push' && request.method === 'POST') {

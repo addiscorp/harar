@@ -1,6 +1,6 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import fs from 'fs/promises';
-import type { Principal, TokenRecord } from '../types.js';
+import type { PeerCredentials, Principal, TokenRecord } from '../types.js';
 import { PLATFORM_NAMESPACE_PREFIX } from '../types.js';
 
 export interface AuthContext {
@@ -20,17 +20,17 @@ export class VaultAuth {
     return new VaultAuth(records);
   }
 
-  authenticate(request: Request): AuthContext {
+  authenticate(request: Request, peerCredentials?: PeerCredentials): AuthContext {
     const token = bearerToken(request);
     if (!token) throw authError('missing bearer token', 401);
     const tokenHash = hashToken(token);
     const record = this.records.find((candidate) => safeCompare(candidate.token_hash, tokenHash));
     if (!record) throw authError('invalid bearer token', 401);
-    const peerUid = peerUidFromRequest(request);
+    const peerUid = peerCredentials?.uid;
     if (record.uid !== undefined && peerUid !== undefined && record.uid !== peerUid) {
       throw authError('peer uid does not match token principal', 403);
     }
-    if (record.uid !== undefined && peerUid === undefined && process.env.GILD_VAULT_ALLOW_MISSING_PEERCRED !== '1') {
+    if (record.uid !== undefined && peerUid === undefined) {
       throw authError('peer credentials unavailable', 403);
     }
     return {
@@ -95,13 +95,4 @@ function safeCompare(a: string, b: string): boolean {
   const ab = Buffer.from(a);
   const bb = Buffer.from(b);
   return ab.length === bb.length && timingSafeEqual(ab, bb);
-}
-
-function peerUidFromRequest(request: Request): number | undefined {
-  const testUid = request.headers.get('x-gild-peer-uid');
-  if (testUid !== null && process.env.NODE_ENV === 'test') {
-    const parsed = Number(testUid);
-    return Number.isInteger(parsed) ? parsed : undefined;
-  }
-  return undefined;
 }

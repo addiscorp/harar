@@ -41,6 +41,14 @@ export function verifySignedManifest(signed: SignedManifest, expectedPublicKey?:
   return verifyBytes(signed.signature_public_key, canonicalManifestBytes(signed.manifest), signed.signature);
 }
 
+export function manifestHeadHash(signed: SignedManifest): string {
+  return sha256Base64(JSON.stringify({
+    manifest: sortObject(signed.manifest),
+    signature: signed.signature,
+    signature_public_key: signed.signature_public_key,
+  }));
+}
+
 export function verifyManifestRows(signed: SignedManifest, rows: SecretRow[]): boolean {
   const expected = new Map(signed.manifest.secrets.map((entry) => [`${entry.namespace}/${entry.key}`, entry]));
   for (const row of rows) {

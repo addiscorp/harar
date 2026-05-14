@@ -73,6 +73,22 @@ export class VaultDatabase {
     return Number(row?.version ?? 0);
   }
 
+  manifestState(sourceMachineId: string): { seq: number; head_hash: string | null } {
+    const row = this.db.query('SELECT seq, head_hash FROM manifest_state WHERE source_machine_id = ?').get(sourceMachineId) as any;
+    return { seq: Number(row?.seq ?? 0), head_hash: row?.head_hash ?? null };
+  }
+
+  updateManifestState(sourceMachineId: string, seq: number, headHash: string): void {
+    this.db.query(`
+      INSERT INTO manifest_state (source_machine_id, seq, head_hash, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(source_machine_id) DO UPDATE SET
+        seq = excluded.seq,
+        head_hash = excluded.head_hash,
+        updated_at = excluded.updated_at
+    `).run(sourceMachineId, seq, headHash, new Date().toISOString());
+  }
+
   transaction<T>(fn: () => T): T {
     return this.db.transaction(fn)();
   }
@@ -89,6 +105,14 @@ export class VaultDatabase {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         PRIMARY KEY (namespace, key)
+      )
+    `);
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS manifest_state (
+        source_machine_id TEXT PRIMARY KEY,
+        seq INTEGER NOT NULL,
+        head_hash TEXT NOT NULL,
+        updated_at TEXT NOT NULL
       )
     `);
   }

@@ -32,6 +32,12 @@ export interface Principal {
   namespaces: string[];
 }
 
+export interface PeerCredentials {
+  uid: number;
+  gid: number;
+  pid?: number;
+}
+
 export interface SecretRow {
   namespace: string;
   key: string;
@@ -76,6 +82,7 @@ export interface ReplicaBundle {
   source_machine_id: string;
   manifest: SignedManifest;
   rows: SecretRow[];
+  allow_admin_rollback?: boolean;
 }
 
 export interface VaultAuditEvent {

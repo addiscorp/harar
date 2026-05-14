@@ -9,12 +9,13 @@ import { generateDbKey } from '../crypto/aead.js';
 import { loadOrCreateSigningKeys } from '../crypto/signing.js';
 import { VaultDatabase } from '../db/index.js';
 import { handleVaultRequest, type VaultApiDeps } from './index.js';
+import { manifestHeadHash } from '../manifest/index.js';
 import { RecipientStore } from '../recipients/index.js';
 import { ReplicaStore } from '../replication/index.js';
+import type { PeerCredentials } from '../types.js';
 
 describe('vault API lifecycle', () => {
   test('write -> list -> read -> rotate -> recipient-add -> replicate-to-peer', async () => {
-    process.env.GILD_VAULT_ALLOW_MISSING_PEERCRED = '1';
     const source = await deps('phobos');
     const peer = await deps('bugsy', source.signingKeys.publicKeyPem);
 
@@ -31,11 +32,20 @@ describe('vault API lifecycle', () => {
 
     const bundle = await expectJson(source, 'GET', '/replicate/pull', 'admin-token', undefined, 200);
     await expectJson(peer, 'POST', '/replicate/push', 'admin-token', bundle, 200);
+    const nextBundle = await expectJson(source, 'GET', '/replicate/pull', 'admin-token', undefined, 200);
+    expect(nextBundle.manifest.manifest.version).toBe(bundle.manifest.manifest.version + 1);
+    expect(nextBundle.manifest.manifest.prev_manifest_hash).toBe(manifestHeadHash(bundle.manifest));
+    await expectJson(peer, 'POST', '/replicate/push', 'admin-token', nextBundle, 200);
     const replicaRows = JSON.parse(await fs.readFile(path.join(peer.config.dataDir, 'replicas', 'phobos', 'secrets.rows.json'), 'utf8'));
     expect(replicaRows[0].ciphertext).toBeString();
     expect(JSON.stringify(replicaRows)).not.toContain('secret-value');
+  });
 
-    delete process.env.GILD_VAULT_ALLOW_MISSING_PEERCRED;
+  test('uid-bound bearer rejects mismatched or missing peer credentials', async () => {
+    const api = await deps('phobos');
+
+    await expectJson(api, 'GET', '/secret/platform/deka', 'uid-token', undefined, 403, { uid: 502, gid: 20, pid: 123 });
+    await expectJson(api, 'GET', '/secret/platform/deka', 'uid-token', undefined, 403);
   });
 });
 
@@ -56,6 +66,7 @@ async function deps(machineId: string, phobosSigPub?: string): Promise<VaultApiD
     auth: VaultAuth.fromRecords([
       { principal: 'admin', token_hash: hashToken('admin-token'), admin: true, namespaces: ['platform/*'] },
       { principal: 'svc:deka', token_hash: hashToken('svc-token'), namespaces: ['platform/deka'] },
+      { principal: 'svc:uid', token_hash: hashToken('uid-token'), uid: 501, namespaces: ['platform/deka'] },
     ]),
     acl: new VaultAcl(),
     db: VaultDatabase.openInMemory(generateDbKey()),
@@ -72,13 +83,14 @@ async function expectJson(
   pathname: string,
   token: string,
   body: unknown,
-  status: number
+  status: number,
+  peerCredentials?: PeerCredentials
 ): Promise<any> {
   const response = await handleVaultRequest(new Request(`http://vault${pathname}`, {
     method,
     headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
-  }), deps);
+  }), deps, peerCredentials);
   expect(response.status).toBe(status);
   return response.json();
 }

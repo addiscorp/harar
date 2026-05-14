@@ -2,6 +2,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { generateDbKey, zeroBuffer } from '../crypto/aead.js';
 import type { AgeRunner } from '../crypto/age.js';
+import { lockMemory, unlockMemory } from '../memory-lock.js';
 import type { RecipientStore } from '../recipients/index.js';
 
 export class VaultKeyring {
@@ -15,9 +16,9 @@ export class VaultKeyring {
     const wrappedPath = path.join(this.dataDir, 'recipients', 'db-key.age');
     try {
       const wrapped = await fs.readFile(wrappedPath);
-      if (options.recoveryPassphrase) return this.age.unwrapPassphrase(wrapped, options.recoveryPassphrase);
+      if (options.recoveryPassphrase) return this.lock(await this.age.unwrapPassphrase(wrapped, options.recoveryPassphrase));
       if (!options.identityPath) throw new Error('missing SEP identity path for vault unseal');
-      return this.age.unwrap(wrapped, options.identityPath);
+      return this.lock(await this.age.unwrap(wrapped, options.identityPath));
     } catch (error: any) {
       if (error?.code !== 'ENOENT') throw error;
     }
@@ -32,10 +33,16 @@ export class VaultKeyring {
     if (options.recoveryPassphrase) {
       await fs.writeFile(path.join(this.dataDir, 'recipients', 'recovery.age'), await this.age.wrapPassphrase(dbKey, options.recoveryPassphrase), { mode: 0o600 });
     }
-    return dbKey;
+    return this.lock(dbKey);
   }
 
   zero(key: Uint8Array): void {
+    unlockMemory(key);
     zeroBuffer(key);
+  }
+
+  private lock(key: Uint8Array): Uint8Array {
+    lockMemory(key);
+    return key;
   }
 }
