@@ -1,7 +1,9 @@
 import path from 'path';
+import jwt from 'jsonwebtoken';
 import { VaultAcl } from '../acl/index.js';
 import { anchorAuditHead, VaultAuditLog } from '../audit/index.js';
 import { assertPathPrincipalMatch, requireAdmin, requireNamespaceAccess, VaultAuth } from '../auth/index.js';
+import { VaultJwtVerifier } from '../auth/jwt.js';
 import type { SigningKeys } from '../crypto/signing.js';
 import type { VaultDatabase } from '../db/index.js';
 import { buildSignedManifest } from '../manifest/index.js';
@@ -13,6 +15,7 @@ import type { PeerCredentials, ReplicaBundle, VaultConfig } from '../types.js';
 export interface VaultApiDeps {
   config: VaultConfig;
   auth: VaultAuth;
+  jwtVerifier: VaultJwtVerifier;
   acl: VaultAcl;
   db: VaultDatabase;
   audit: VaultAuditLog;
@@ -26,6 +29,20 @@ export async function handleVaultRequest(request: Request, deps: VaultApiDeps, p
   const url = new URL(request.url);
   try {
     if (request.method === 'GET' && url.pathname === '/health') return json({ ok: true, machine_id: deps.config.machineId });
+
+    const jwtSecretMatch = url.pathname.match(/^\/v1\/secret\/([^/]+)$/);
+    if (jwtSecretMatch) {
+      if (request.method !== 'GET') return json({ error: 'method_not_allowed' }, 405);
+      const key = decodeURIComponent(jwtSecretMatch[1]);
+      const auth = await deps.jwtVerifier.verify(request).catch((error: any) => {
+        recordJwtVerifyFailure(deps.audit, request, error);
+        throw error;
+      });
+      const secret = deps.db.read(auth.namespace, key);
+      deps.audit.append({ principal: `${auth.issuer}:${auth.subject}`, op: secret ? 'jwt_read' : 'jwt_read_missing', namespace: auth.namespace, key });
+      if (!secret) return json({ error: 'not_found' }, 404);
+      return json({ value: secret.value, version: secret.version });
+    }
 
     const auth = deps.auth.authenticate(request, peerCredentials);
     if (auth.principal.keyType === 'breakglass') {
@@ -118,8 +135,62 @@ export async function handleVaultRequest(request: Request, deps: VaultApiDeps, p
     return json({ error: 'not_found' }, 404);
   } catch (error: any) {
     const status = error?.status ?? 500;
+    if (status === 401) {
+      console.warn(`vault auth failure: ${error?.message ?? String(error)}`);
+    }
     return json({ error: status === 500 ? 'internal_error' : 'request_error', message: error?.message ?? String(error) }, status);
   }
+}
+
+function recordJwtVerifyFailure(audit: VaultAuditLog, request: Request, error: any): void {
+  const reason = error?.message ?? String(error);
+  const claims = unverifiedJwtClaims(request);
+  recordAuditEntry(audit, {
+    kind: 'verify_fail',
+    reason,
+    iss: claims.iss,
+    sub: claims.sub,
+    aud: claims.aud,
+    alg: claims.alg,
+  });
+}
+
+function recordAuditEntry(audit: VaultAuditLog, entry: {
+  kind: 'verify_fail';
+  reason: string;
+  iss?: unknown;
+  sub?: unknown;
+  aud?: unknown;
+  alg?: unknown;
+}): void {
+  const issuer = typeof entry.iss === 'string' && entry.iss.length > 0 ? entry.iss : 'unknown';
+  const subject = typeof entry.sub === 'string' && entry.sub.length > 0 ? entry.sub : 'unknown';
+  audit.append({
+    principal: `${issuer}:${subject}`,
+    op: entry.kind,
+    tag: entry.reason,
+    details: entry,
+  });
+}
+
+function unverifiedJwtClaims(request: Request): { iss?: unknown; sub?: unknown; aud?: unknown; alg?: unknown } {
+  const token = bearerToken(request);
+  if (!token) return {};
+  const decoded = jwt.decode(token, { complete: true });
+  if (!decoded || typeof decoded === 'string') return {};
+  const payload = decoded.payload && typeof decoded.payload === 'object' ? decoded.payload as jwt.JwtPayload : {};
+  return {
+    iss: payload.iss,
+    sub: payload.sub,
+    aud: payload.aud,
+    alg: decoded.header?.alg,
+  };
+}
+
+function bearerToken(request: Request): string | null {
+  const auth = request.headers.get('authorization');
+  const prefix = 'Bearer ';
+  return auth?.startsWith(prefix) ? auth.slice(prefix.length) : null;
 }
 
 async function optionalJson(request: Request): Promise<any | undefined> {

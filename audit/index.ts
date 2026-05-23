@@ -26,7 +26,8 @@ export class VaultAuditLog {
     const previous = this.head();
     const seq = (previous?.seq ?? 0) + 1;
     const createdAt = new Date().toISOString();
-    const rowHash = auditHash({
+    const details = event.details ? JSON.stringify(event.details) : '';
+    const hashInput: Record<string, unknown> = {
       seq,
       created_at: createdAt,
       principal: event.principal,
@@ -35,11 +36,13 @@ export class VaultAuditLog {
       key: event.key ?? '',
       tag: event.tag ?? '',
       prev_hash: previous?.row_hash ?? '',
-    });
+    };
+    if (details) hashInput.details = details;
+    const rowHash = auditHash(hashInput);
     this.db.query(`
-      INSERT INTO audit_events (seq, created_at, principal, op, namespace, key, tag, prev_hash, row_hash)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(seq, createdAt, event.principal, event.op, event.namespace ?? null, event.key ?? null, event.tag ?? null, previous?.row_hash ?? null, rowHash);
+      INSERT INTO audit_events (seq, created_at, principal, op, namespace, key, tag, details, prev_hash, row_hash)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(seq, createdAt, event.principal, event.op, event.namespace ?? null, event.key ?? null, event.tag ?? null, details || null, previous?.row_hash ?? null, rowHash);
     return { seq, row_hash: rowHash };
   }
 
@@ -55,7 +58,7 @@ export class VaultAuditLog {
     const rows = this.db.query('SELECT * FROM audit_events ORDER BY seq ASC').all() as any[];
     let prev = '';
     for (const row of rows) {
-      const expected = auditHash({
+      const hashInput: Record<string, unknown> = {
         seq: row.seq,
         created_at: row.created_at,
         principal: row.principal,
@@ -64,7 +67,9 @@ export class VaultAuditLog {
         key: row.key ?? '',
         tag: row.tag ?? '',
         prev_hash: prev,
-      });
+      };
+      if (row.details) hashInput.details = row.details;
+      const expected = auditHash(hashInput);
       if (expected !== row.row_hash || (row.prev_hash ?? '') !== prev) return false;
       prev = row.row_hash;
     }
@@ -81,10 +86,15 @@ export class VaultAuditLog {
         namespace TEXT,
         key TEXT,
         tag TEXT,
+        details TEXT,
         prev_hash TEXT,
         row_hash TEXT NOT NULL
       )
     `);
+    const columns = this.db.query('PRAGMA table_info(audit_events)').all() as Array<{ name: string }>;
+    if (!columns.some((column) => column.name === 'details')) {
+      this.db.run('ALTER TABLE audit_events ADD COLUMN details TEXT');
+    }
   }
 }
 

@@ -1,10 +1,12 @@
 import { describe, expect, test } from 'bun:test';
 import fs from 'fs/promises';
+import jwt from 'jsonwebtoken';
 import os from 'os';
 import path from 'path';
 import { VaultAcl } from '../acl/index.js';
 import { VaultAuditLog } from '../audit/index.js';
 import { hashToken, VaultAuth } from '../auth/index.js';
+import { VaultJwtVerifier } from '../auth/jwt.js';
 import { generateDbKey } from '../crypto/aead.js';
 import { loadOrCreateSigningKeys } from '../crypto/signing.js';
 import { VaultDatabase } from '../db/index.js';
@@ -53,10 +55,71 @@ describe('vault API lifecycle', () => {
     await expectJson(api, 'GET', '/audit', 'breakglass-token', undefined, 200);
     expect(api.audit.query().some((row) => row.principal === 'breakglass:root' && row.op === 'breakglass_auth')).toBe(true);
   });
+
+  test('valid HS256 JWT can read /v1/secret from the mapped workload namespace', async () => {
+    const api = await deps('phobos');
+    api.db.write('platform/deka', 'API_KEY', 'secret-value');
+
+    const body = await expectJwtJson(api, jwtFor(api, {}), 200);
+
+    expect(body).toEqual({ value: 'secret-value', version: 1 });
+    expect(api.audit.query().some((row) => row.principal === 'vault-agent@phobos:deka-platform' && row.op === 'jwt_read')).toBe(true);
+  });
+
+  test('HS256 JWT with wrong signature is rejected', async () => {
+    const api = await deps('phobos');
+    api.db.write('platform/deka', 'API_KEY', 'secret-value');
+
+    await expectJwtJson(api, jwtFor(api, {}, 'wrong-secret'), 401);
+    expectVerifyFailAudit(api, {
+      reason: 'JWT verification failed: invalid signature',
+      iss: 'vault-agent@phobos',
+      sub: 'deka-platform',
+      aud: 'vault.tana.gg',
+    });
+  });
+
+  test('expired HS256 JWT is rejected', async () => {
+    const api = await deps('phobos');
+
+    await expectJwtJson(api, jwtFor(api, { exp: 1 }), 401);
+    expectVerifyFailAudit(api, {
+      reason: 'JWT verification failed: jwt expired',
+      iss: 'vault-agent@phobos',
+      sub: 'deka-platform',
+      aud: 'vault.tana.gg',
+    });
+  });
+
+  test('HS256 JWT with wrong audience is rejected', async () => {
+    const api = await deps('phobos');
+
+    await expectJwtJson(api, jwtFor(api, { aud: 'not-vault.tana.gg' }), 401);
+    expectVerifyFailAudit(api, {
+      reason: 'JWT verification failed: jwt audience invalid. expected: vault.tana.gg',
+      iss: 'vault-agent@phobos',
+      sub: 'deka-platform',
+      aud: 'not-vault.tana.gg',
+    });
+  });
+
+  test('HS256 JWT with unknown issuer is rejected', async () => {
+    const api = await deps('phobos');
+
+    await expectJwtJson(api, jwtFor(api, { iss: 'vault-agent@unknown' }), 401);
+    expectVerifyFailAudit(api, {
+      reason: 'unknown JWT issuer',
+      iss: 'vault-agent@unknown',
+      sub: 'deka-platform',
+      aud: 'vault.tana.gg',
+    });
+  });
 });
 
 async function deps(machineId: string, phobosSigPub?: string): Promise<VaultApiDeps> {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), `vault-${machineId}-`));
+  const devKeyPath = path.join(dataDir, 'dev-key');
+  await fs.writeFile(devKeyPath, 'dev-secret');
   const recipients = new RecipientStore(path.join(dataDir, 'recipients', 'recipients.json'), 2);
   await recipients.add({ id: 'self-sep', type: 'sep', public_key: `age1${machineId}` });
   await recipients.add({ id: 'recovery', type: 'passphrase', public_key: 'recovery.age' });
@@ -68,6 +131,12 @@ async function deps(machineId: string, phobosSigPub?: string): Promise<VaultApiD
       machineId,
       minRecipients: 2,
       peers: phobosSigPub ? [{ id: 'phobos', url: 'unix://phobos', ageRecipient: 'age1phobos', signaturePublicKey: phobosSigPub }] : [],
+      jwt: {
+        audience: 'vault.tana.gg',
+        devKeyPath,
+        agents: [{ issuer: 'vault-agent@phobos', provider: 'hs256-dev' }],
+        workloads: [{ subject: 'deka-platform', namespace: 'platform/deka' }],
+      },
     },
     auth: VaultAuth.fromRecords([
       { principal: 'admin', token_hash: hashToken('admin-token'), uid: 500, admin: true, namespaces: ['platform/*'] },
@@ -75,6 +144,20 @@ async function deps(machineId: string, phobosSigPub?: string): Promise<VaultApiD
       { principal: 'svc:uid', token_hash: hashToken('uid-token'), uid: 501, namespaces: ['platform/deka'] },
       { principal: 'breakglass:root', token_hash: hashToken('breakglass-token'), key_type: 'breakglass', admin: true, namespaces: ['platform/*'] },
     ]),
+    jwtVerifier: VaultJwtVerifier.fromConfig({
+      dataDir,
+      socketPath: path.join(dataDir, 'sock'),
+      tokensPath: path.join(dataDir, 'tokens.json'),
+      machineId,
+      minRecipients: 2,
+      peers: [],
+      jwt: {
+        audience: 'vault.tana.gg',
+        devKeyPath,
+        agents: [{ issuer: 'vault-agent@phobos', provider: 'hs256-dev' }],
+        workloads: [{ subject: 'deka-platform', namespace: 'platform/deka' }],
+      },
+    }),
     acl: new VaultAcl(),
     db: VaultDatabase.openInMemory(generateDbKey()),
     audit: VaultAuditLog.openInMemory(),
@@ -104,4 +187,40 @@ async function expectJson(
   }), deps, peerCredentials);
   expect(response.status).toBe(status);
   return response.json();
+}
+
+async function expectJwtJson(deps: VaultApiDeps, token: string, status: number): Promise<any> {
+  const response = await handleVaultRequest(new Request('http://vault/v1/secret/API_KEY', {
+    method: 'GET',
+    headers: { authorization: `Bearer ${token}` },
+  }), deps);
+  expect(response.status).toBe(status);
+  return response.json();
+}
+
+function expectVerifyFailAudit(deps: VaultApiDeps, expected: { reason: string; iss: string; sub: string; aud: string }): void {
+  const rows = deps.audit.query();
+  const matching = rows.find((row) => {
+    if (row.op !== 'verify_fail' || row.tag !== expected.reason) return false;
+    const details = JSON.parse(row.details);
+    return details.kind === 'verify_fail'
+      && details.reason === expected.reason
+      && details.iss === expected.iss
+      && details.sub === expected.sub
+      && details.aud === expected.aud;
+  });
+  expect(matching).toBeTruthy();
+}
+
+function jwtFor(deps: VaultApiDeps, overrides: Record<string, unknown>, secret = 'dev-secret'): string {
+  const now = Math.floor(Date.now() / 1000);
+  return jwt.sign({
+    iss: 'vault-agent@phobos',
+    sub: 'deka-platform',
+    aud: deps.config.jwt.audience,
+    scope: 'vault:read:platform/deka/*',
+    iat: now,
+    exp: now + 60,
+    ...overrides,
+  }, secret, { algorithm: 'HS256' });
 }

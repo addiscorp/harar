@@ -2,6 +2,7 @@ import fs from 'fs/promises';
 import { VaultAcl } from '../acl/index.js';
 import { VaultAuditLog } from '../audit/index.js';
 import { VaultAuth } from '../auth/index.js';
+import { VaultJwtVerifier } from '../auth/jwt.js';
 import { ensureVaultDirs, loadVaultConfig } from '../config.js';
 import { SubprocessAgeRunner } from '../crypto/age.js';
 import { loadOrCreateSigningKeys } from '../crypto/signing.js';
@@ -75,6 +76,7 @@ export async function startVaultDaemon(options: VaultDaemonOptions = {}): Promis
   const deps = {
     config,
     auth: await VaultAuth.fromFile(config.tokensPath),
+    jwtVerifier: VaultJwtVerifier.fromConfig(config),
     acl: new VaultAcl(),
     db: await VaultDatabase.open(paths.secretsDb, dbKey),
     audit: await VaultAuditLog.open(paths.auditDb),

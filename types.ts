@@ -8,6 +8,7 @@ export interface VaultConfig {
   peers: VaultPeer[];
   minRecipients: number;
   auditAnchorUrl?: string;
+  jwt: VaultJwtConfig;
 }
 
 export interface VaultPeer {
@@ -25,6 +26,26 @@ export interface TokenRecord {
   gid?: number;
   admin?: boolean;
   namespaces: string[];
+}
+
+export interface VaultJwtConfig {
+  audience: string;
+  devKeyPath: string;
+  agents: VaultJwtAgent[];
+  workloads: VaultJwtWorkload[];
+}
+
+export interface VaultJwtAgent {
+  issuer: string;
+  provider: 'hs256-dev' | 'tpm';
+  devKeyPath?: string;
+  publicKeyPem?: string;
+  publicKeyUrl?: string;
+}
+
+export interface VaultJwtWorkload {
+  subject: string;
+  namespace: string;
 }
 
 export interface Principal {
@@ -95,4 +116,5 @@ export interface VaultAuditEvent {
   namespace?: string;
   key?: string;
   tag?: string;
+  details?: Record<string, unknown>;
 }
