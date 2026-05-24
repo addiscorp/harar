@@ -543,7 +543,11 @@ fn key_shop_id(key: &str) -> Option<&str> {
 fn is_runtime(peer: &PeerCred) -> bool {
     matches!(
         peer.username.as_deref(),
-        Some("gild-runtime") | Some("deka") | Some("deka-platform") | Some("tana-deka-platform")
+        Some("gild-runtime")
+            | Some("deka")
+            | Some("deka-platform")
+            | Some("tana-deka-platform")
+            | Some("gild-vault-proxy")
     )
 }
 
@@ -996,6 +1000,90 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.keys, Some(vec!["shops/shop_a/SECRET".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn proxy_runtime_peer_can_manage_scoped_shop_keys() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path());
+        let proxy = peer(2001, "gild-vault-proxy");
+
+        let put = handle_request(
+            &state,
+            &proxy,
+            VaultRequest::Put {
+                key: "shops/shop_alpha/STRIPE_SECRET".to_string(),
+                value: "sk-alpha".to_string(),
+                shop_id: Some("shop_alpha".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(put.ok);
+
+        let get = handle_request(
+            &state,
+            &proxy,
+            VaultRequest::Get {
+                key: "shops/shop_alpha/STRIPE_SECRET".to_string(),
+                shop_id: Some("shop_alpha".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(get.value.as_deref(), Some("sk-alpha"));
+
+        let list = handle_request(
+            &state,
+            &proxy,
+            VaultRequest::List {
+                shop_id: Some("shop_alpha".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            list.keys,
+            Some(vec!["shops/shop_alpha/STRIPE_SECRET".to_string()])
+        );
+
+        let delete = handle_request(
+            &state,
+            &proxy,
+            VaultRequest::Delete {
+                key: "shops/shop_alpha/STRIPE_SECRET".to_string(),
+                shop_id: Some("shop_alpha".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(delete.ok);
+    }
+
+    #[test]
+    fn policy_scopes_proxy_runtime_peer_to_request_shop_id() {
+        let proxy = peer(2001, "gild-vault-proxy");
+        assert_eq!(
+            authorize(
+                &proxy,
+                &VaultRequest::Put {
+                    key: "shops/shop_alpha/STRIPE_SECRET".to_string(),
+                    value: "sk-alpha".to_string(),
+                    shop_id: Some("shop_alpha".to_string()),
+                }
+            ),
+            Decision::Allow
+        );
+        assert_eq!(
+            authorize(
+                &proxy,
+                &VaultRequest::Delete {
+                    key: "shops/shop_beta/STRIPE_SECRET".to_string(),
+                    shop_id: Some("shop_alpha".to_string()),
+                }
+            ),
+            Decision::Deny("forbidden")
+        );
     }
 
     #[test]

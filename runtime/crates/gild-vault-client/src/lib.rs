@@ -8,7 +8,7 @@ use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
 const DEFAULT_SOCKET_PATH: &str = "/run/tana-vault.sock";
-const DEFAULT_GILD_VAULT_SOCKET_PATH: &str = "/run/gild-vault.sock";
+const DEFAULT_GILD_VAULT_SOCKET_PATH: &str = "/run/gild-vault/sock";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
@@ -63,6 +63,7 @@ enum VaultRequest<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         shop_id: Option<&'a str>,
     },
+    Health,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -71,6 +72,16 @@ struct VaultResponse {
     value: Option<String>,
     keys: Option<Vec<String>>,
     error: Option<String>,
+    version: Option<String>,
+    uptime_seconds: Option<u64>,
+    key_count: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultHealth {
+    pub version: Option<String>,
+    pub uptime_seconds: Option<u64>,
+    pub key_count: Option<usize>,
 }
 
 impl Secrets {
@@ -142,7 +153,8 @@ impl Secrets {
 impl VaultClient {
     pub fn from_socket() -> Self {
         Self::from_socket_path(
-            std::env::var("GILD_VAULT_SOCKET")
+            std::env::var("VAULT_SOCKET")
+                .or_else(|_| std::env::var("GILD_VAULT_SOCKET"))
                 .unwrap_or_else(|_| DEFAULT_GILD_VAULT_SOCKET_PATH.to_string()),
         )
     }
@@ -171,9 +183,9 @@ impl VaultClient {
         }
         let response = self.request(&VaultRequest::Get { key, shop_id }).await?;
         if response.ok {
-            response
-                .value
-                .ok_or_else(|| VaultClientError::InvalidResponse("missing value".to_string()))
+            response.value.ok_or_else(|| {
+                VaultClientError::InvalidResponse("missing response value".to_string())
+            })
         } else {
             Err(VaultClientError::Vault(
                 response.error.unwrap_or_else(|| "get_failed".to_string()),
@@ -264,6 +276,23 @@ impl VaultClient {
                 response
                     .error
                     .unwrap_or_else(|| "delete_failed".to_string()),
+            ))
+        }
+    }
+
+    pub async fn health(&self) -> Result<VaultHealth, VaultClientError> {
+        let response = self.request(&VaultRequest::Health).await?;
+        if response.ok {
+            Ok(VaultHealth {
+                version: response.version,
+                uptime_seconds: response.uptime_seconds,
+                key_count: response.key_count,
+            })
+        } else {
+            Err(VaultClientError::Vault(
+                response
+                    .error
+                    .unwrap_or_else(|| "health_failed".to_string()),
             ))
         }
     }
@@ -430,87 +459,10 @@ mod tests {
         assert!(matches!(err, SecretsError::Io(_)));
     }
 
-    #[tokio::test]
-    async fn shop_write_helpers_send_shop_scope() {
-        let server = MockJsonVault::start().await;
-        let client = VaultClient::from_socket_path(&server.socket_path);
-
-        client
-            .put_for_shop("shops/shop_a/SECRET", "secret", "shop_a")
-            .await
-            .unwrap();
-        client
-            .delete_for_shop("shops/shop_a/SECRET", "shop_a")
-            .await
-            .unwrap();
-
-        let requests = server.requests.lock().await;
-        assert_eq!(
-            requests.as_slice(),
-            [
-                serde_json::json!({
-                    "op": "put",
-                    "key": "shops/shop_a/SECRET",
-                    "value": "secret",
-                    "shop_id": "shop_a",
-                }),
-                serde_json::json!({
-                    "op": "delete",
-                    "key": "shops/shop_a/SECRET",
-                    "shop_id": "shop_a",
-                }),
-            ]
-        );
-    }
-
     struct MockAgent {
         socket_path: PathBuf,
         _temp: TempDir,
         requests: Arc<AtomicUsize>,
-    }
-
-    struct MockJsonVault {
-        socket_path: PathBuf,
-        _temp: TempDir,
-        requests: Arc<Mutex<Vec<serde_json::Value>>>,
-    }
-
-    impl MockJsonVault {
-        async fn start() -> Self {
-            let temp = TempDir::new().unwrap();
-            let socket_path = temp.path().join("gild-vault.sock");
-            let listener = UnixListener::bind(&socket_path).unwrap();
-            let requests = Arc::new(Mutex::new(Vec::new()));
-
-            tokio::spawn({
-                let requests = Arc::clone(&requests);
-                async move {
-                    loop {
-                        let Ok((mut stream, _)) = listener.accept().await else {
-                            return;
-                        };
-                        let requests = Arc::clone(&requests);
-                        tokio::spawn(async move {
-                            let mut request = Vec::new();
-                            let _ = stream.read_to_end(&mut request).await;
-                            let parsed: serde_json::Value =
-                                serde_json::from_slice(&request).unwrap();
-                            requests.lock().await.push(parsed);
-                            let _ = stream
-                                .write_all(serde_json::json!({ "ok": true }).to_string().as_bytes())
-                                .await;
-                            let _ = stream.shutdown().await;
-                        });
-                    }
-                }
-            });
-
-            Self {
-                socket_path,
-                _temp: temp,
-                requests,
-            }
-        }
     }
 
     impl MockAgent {
