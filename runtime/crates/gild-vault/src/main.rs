@@ -371,6 +371,13 @@ async fn read_request_bytes(stream: &mut UnixStream) -> Result<Vec<u8>> {
         if request_bytes.len() > MAX_REQUEST_BYTES {
             break;
         }
+        // Bun and node:net clients do not reliably half-close Unix sockets, so
+        // process complete JSON requests without waiting for EOF.
+        if !is_http_request(&request_bytes)
+            && serde_json::from_slice::<serde_json::Value>(&request_bytes).is_ok()
+        {
+            break;
+        }
     }
     Ok(request_bytes)
 }
@@ -398,12 +405,18 @@ impl HttpReply {
 }
 
 fn is_http_request(request_bytes: &[u8]) -> bool {
-    request_bytes.starts_with(b"GET ")
-        || request_bytes.starts_with(b"POST ")
-        || request_bytes.starts_with(b"PUT ")
-        || request_bytes.starts_with(b"DELETE ")
-        || request_bytes.starts_with(b"HEAD ")
-        || request_bytes.starts_with(b"OPTIONS ")
+    [
+        b"GET ".as_slice(),
+        b"POST ".as_slice(),
+        b"PUT ".as_slice(),
+        b"PATCH ".as_slice(),
+        b"DELETE ".as_slice(),
+        b"HEAD ".as_slice(),
+        b"OPTIONS ".as_slice(),
+        b"TRACE ".as_slice(),
+    ]
+    .iter()
+    .any(|prefix| request_bytes.starts_with(prefix))
 }
 
 fn parse_http_request(request_bytes: &[u8]) -> Result<HttpRequest> {
@@ -888,7 +901,6 @@ mod tests {
     async fn socket_put_preserves_state_dir_permissions() {
         let dir = tempdir().unwrap();
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o750)).unwrap();
-
         let socket_path = dir.path().join("gild-vault.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
         let state = Arc::new(test_state(dir.path()));
@@ -917,5 +929,35 @@ mod tests {
 
         let mode = fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o750);
+    }
+
+    #[tokio::test]
+    async fn socket_health_flow_responds_without_client_half_close() {
+        let dir = tempdir().unwrap();
+        let socket_path = dir.path().join("gild-vault.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let state = Arc::new(test_state(dir.path()));
+
+        let server = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                handle_connection(stream, state).await.unwrap();
+            }
+        });
+
+        let mut client = UnixStream::connect(&socket_path).await.unwrap();
+        client.write_all(br#"{"op":"health"}"#).await.unwrap();
+
+        let mut bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut bytes))
+            .await
+            .expect("daemon should respond without waiting for EOF")
+            .unwrap();
+        let response: VaultResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(response.ok);
+        assert_eq!(response.version.as_deref(), Some("0.1.0"));
+
+        server.await.unwrap();
     }
 }
