@@ -43,10 +43,22 @@ pub enum VaultClientError {
 #[derive(Debug, serde::Serialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 enum VaultRequest<'a> {
-    Get { key: &'a str },
-    Put { key: &'a str, value: &'a str },
-    List,
-    Delete { key: &'a str },
+    Get {
+        key: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        shop_id: Option<&'a str>,
+    },
+    Put {
+        key: &'a str,
+        value: &'a str,
+    },
+    List {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        shop_id: Option<&'a str>,
+    },
+    Delete {
+        key: &'a str,
+    },
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -138,10 +150,22 @@ impl VaultClient {
     }
 
     pub async fn get(&self, key: &str) -> Result<String, VaultClientError> {
+        self.get_scoped(key, None).await
+    }
+
+    pub async fn get_for_shop(&self, key: &str, shop_id: &str) -> Result<String, VaultClientError> {
+        self.get_scoped(key, Some(shop_id)).await
+    }
+
+    async fn get_scoped(
+        &self,
+        key: &str,
+        shop_id: Option<&str>,
+    ) -> Result<String, VaultClientError> {
         if key.is_empty() {
             return Err(VaultClientError::EmptyKey);
         }
-        let response = self.request(&VaultRequest::Get { key }).await?;
+        let response = self.request(&VaultRequest::Get { key, shop_id }).await?;
         if response.ok {
             response
                 .value
@@ -168,7 +192,15 @@ impl VaultClient {
     }
 
     pub async fn list(&self) -> Result<Vec<String>, VaultClientError> {
-        let response = self.request(&VaultRequest::List).await?;
+        self.list_scoped(None).await
+    }
+
+    pub async fn list_for_shop(&self, shop_id: &str) -> Result<Vec<String>, VaultClientError> {
+        self.list_scoped(Some(shop_id)).await
+    }
+
+    async fn list_scoped(&self, shop_id: Option<&str>) -> Result<Vec<String>, VaultClientError> {
+        let response = self.request(&VaultRequest::List { shop_id }).await?;
         if response.ok {
             let mut keys = response.keys.unwrap_or_default();
             keys.sort();
