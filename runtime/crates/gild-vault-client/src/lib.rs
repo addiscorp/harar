@@ -43,10 +43,26 @@ pub enum VaultClientError {
 #[derive(Debug, serde::Serialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 enum VaultRequest<'a> {
-    Get { key: &'a str },
-    Put { key: &'a str, value: &'a str },
-    List,
-    Delete { key: &'a str },
+    Get {
+        key: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        shop_id: Option<&'a str>,
+    },
+    Put {
+        key: &'a str,
+        value: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        shop_id: Option<&'a str>,
+    },
+    List {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        shop_id: Option<&'a str>,
+    },
+    Delete {
+        key: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        shop_id: Option<&'a str>,
+    },
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -138,10 +154,22 @@ impl VaultClient {
     }
 
     pub async fn get(&self, key: &str) -> Result<String, VaultClientError> {
+        self.get_scoped(key, None).await
+    }
+
+    pub async fn get_for_shop(&self, key: &str, shop_id: &str) -> Result<String, VaultClientError> {
+        self.get_scoped(key, Some(shop_id)).await
+    }
+
+    async fn get_scoped(
+        &self,
+        key: &str,
+        shop_id: Option<&str>,
+    ) -> Result<String, VaultClientError> {
         if key.is_empty() {
             return Err(VaultClientError::EmptyKey);
         }
-        let response = self.request(&VaultRequest::Get { key }).await?;
+        let response = self.request(&VaultRequest::Get { key, shop_id }).await?;
         if response.ok {
             response
                 .value
@@ -154,10 +182,34 @@ impl VaultClient {
     }
 
     pub async fn put(&self, key: &str, value: &str) -> Result<(), VaultClientError> {
+        self.put_scoped(key, value, None).await
+    }
+
+    pub async fn put_for_shop(
+        &self,
+        key: &str,
+        value: &str,
+        shop_id: &str,
+    ) -> Result<(), VaultClientError> {
+        self.put_scoped(key, value, Some(shop_id)).await
+    }
+
+    async fn put_scoped(
+        &self,
+        key: &str,
+        value: &str,
+        shop_id: Option<&str>,
+    ) -> Result<(), VaultClientError> {
         if key.is_empty() {
             return Err(VaultClientError::EmptyKey);
         }
-        let response = self.request(&VaultRequest::Put { key, value }).await?;
+        let response = self
+            .request(&VaultRequest::Put {
+                key,
+                value,
+                shop_id,
+            })
+            .await?;
         if response.ok {
             Ok(())
         } else {
@@ -168,7 +220,15 @@ impl VaultClient {
     }
 
     pub async fn list(&self) -> Result<Vec<String>, VaultClientError> {
-        let response = self.request(&VaultRequest::List).await?;
+        self.list_scoped(None).await
+    }
+
+    pub async fn list_for_shop(&self, shop_id: &str) -> Result<Vec<String>, VaultClientError> {
+        self.list_scoped(Some(shop_id)).await
+    }
+
+    async fn list_scoped(&self, shop_id: Option<&str>) -> Result<Vec<String>, VaultClientError> {
+        let response = self.request(&VaultRequest::List { shop_id }).await?;
         if response.ok {
             let mut keys = response.keys.unwrap_or_default();
             keys.sort();
@@ -181,10 +241,22 @@ impl VaultClient {
     }
 
     pub async fn delete(&self, key: &str) -> Result<(), VaultClientError> {
+        self.delete_scoped(key, None).await
+    }
+
+    pub async fn delete_for_shop(&self, key: &str, shop_id: &str) -> Result<(), VaultClientError> {
+        self.delete_scoped(key, Some(shop_id)).await
+    }
+
+    async fn delete_scoped(
+        &self,
+        key: &str,
+        shop_id: Option<&str>,
+    ) -> Result<(), VaultClientError> {
         if key.is_empty() {
             return Err(VaultClientError::EmptyKey);
         }
-        let response = self.request(&VaultRequest::Delete { key }).await?;
+        let response = self.request(&VaultRequest::Delete { key, shop_id }).await?;
         if response.ok {
             Ok(())
         } else {
@@ -358,10 +430,87 @@ mod tests {
         assert!(matches!(err, SecretsError::Io(_)));
     }
 
+    #[tokio::test]
+    async fn shop_write_helpers_send_shop_scope() {
+        let server = MockJsonVault::start().await;
+        let client = VaultClient::from_socket_path(&server.socket_path);
+
+        client
+            .put_for_shop("shops/shop_a/SECRET", "secret", "shop_a")
+            .await
+            .unwrap();
+        client
+            .delete_for_shop("shops/shop_a/SECRET", "shop_a")
+            .await
+            .unwrap();
+
+        let requests = server.requests.lock().await;
+        assert_eq!(
+            requests.as_slice(),
+            [
+                serde_json::json!({
+                    "op": "put",
+                    "key": "shops/shop_a/SECRET",
+                    "value": "secret",
+                    "shop_id": "shop_a",
+                }),
+                serde_json::json!({
+                    "op": "delete",
+                    "key": "shops/shop_a/SECRET",
+                    "shop_id": "shop_a",
+                }),
+            ]
+        );
+    }
+
     struct MockAgent {
         socket_path: PathBuf,
         _temp: TempDir,
         requests: Arc<AtomicUsize>,
+    }
+
+    struct MockJsonVault {
+        socket_path: PathBuf,
+        _temp: TempDir,
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl MockJsonVault {
+        async fn start() -> Self {
+            let temp = TempDir::new().unwrap();
+            let socket_path = temp.path().join("gild-vault.sock");
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+
+            tokio::spawn({
+                let requests = Arc::clone(&requests);
+                async move {
+                    loop {
+                        let Ok((mut stream, _)) = listener.accept().await else {
+                            return;
+                        };
+                        let requests = Arc::clone(&requests);
+                        tokio::spawn(async move {
+                            let mut request = Vec::new();
+                            let _ = stream.read_to_end(&mut request).await;
+                            let parsed: serde_json::Value =
+                                serde_json::from_slice(&request).unwrap();
+                            requests.lock().await.push(parsed);
+                            let _ = stream
+                                .write_all(serde_json::json!({ "ok": true }).to_string().as_bytes())
+                                .await;
+                            let _ = stream.shutdown().await;
+                        });
+                    }
+                }
+            });
+
+            Self {
+                socket_path,
+                _temp: temp,
+                requests,
+            }
+        }
     }
 
     impl MockAgent {
