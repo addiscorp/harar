@@ -111,12 +111,19 @@ async fn proxy_binary_uses_vault_socket_env_and_checks_health_before_binding() {
 }
 
 #[test]
-fn proxy_binary_falls_back_to_production_socket_path_and_refuses_to_bind() {
+fn proxy_binary_refuses_to_bind_when_configured_socket_is_unreachable() {
+    let missing_socket = std::env::temp_dir().join(format!(
+        "missing-gild-vault-{}-{}.sock",
+        std::process::id(),
+        unused_local_port()
+    ));
     let output = Command::new(gild_vault_proxy_binary())
         .arg("--bind")
         .arg("127.0.0.1")
         .arg("--port")
         .arg(unused_local_port().to_string())
+        .arg("--socket")
+        .arg(&missing_socket)
         .env("VAULT_PROXY_TOKEN", TOKEN)
         .env_remove("VAULT_SOCKET")
         .env_remove("GILD_VAULT_SOCKET")
@@ -126,8 +133,11 @@ fn proxy_binary_falls_back_to_production_socket_path_and_refuses_to_bind() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("gild-vault health check failed on socket /run/gild-vault/sock"),
-        "stderr did not include production socket path: {stderr}"
+        stderr.contains(&format!(
+            "gild-vault health check failed on socket {}",
+            missing_socket.display()
+        )),
+        "stderr did not include configured socket path: {stderr}"
     );
     assert!(
         stderr.contains("refusing to bind"),
@@ -216,10 +226,6 @@ fn workspace_binary(name: &str) -> PathBuf {
         .unwrap()
         .to_path_buf();
     let binary = target_dir.join(name);
-    if binary.exists() {
-        return binary;
-    }
-
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let mut command = Command::new(cargo);
     command.args(["build", "--quiet", "-p", name]);

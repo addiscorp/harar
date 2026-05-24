@@ -43,10 +43,26 @@ pub enum VaultClientError {
 #[derive(Debug, serde::Serialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 enum VaultRequest<'a> {
-    Get { key: &'a str },
-    Put { key: &'a str, value: &'a str },
-    List,
-    Delete { key: &'a str },
+    Get {
+        key: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        shop_id: Option<&'a str>,
+    },
+    Put {
+        key: &'a str,
+        value: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        shop_id: Option<&'a str>,
+    },
+    List {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        shop_id: Option<&'a str>,
+    },
+    Delete {
+        key: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        shop_id: Option<&'a str>,
+    },
     Health,
 }
 
@@ -150,10 +166,22 @@ impl VaultClient {
     }
 
     pub async fn get(&self, key: &str) -> Result<String, VaultClientError> {
+        self.get_scoped(key, None).await
+    }
+
+    pub async fn get_for_shop(&self, key: &str, shop_id: &str) -> Result<String, VaultClientError> {
+        self.get_scoped(key, Some(shop_id)).await
+    }
+
+    async fn get_scoped(
+        &self,
+        key: &str,
+        shop_id: Option<&str>,
+    ) -> Result<String, VaultClientError> {
         if key.is_empty() {
             return Err(VaultClientError::EmptyKey);
         }
-        let response = self.request(&VaultRequest::Get { key }).await?;
+        let response = self.request(&VaultRequest::Get { key, shop_id }).await?;
         if response.ok {
             response.value.ok_or_else(|| {
                 VaultClientError::InvalidResponse("missing response value".to_string())
@@ -166,10 +194,34 @@ impl VaultClient {
     }
 
     pub async fn put(&self, key: &str, value: &str) -> Result<(), VaultClientError> {
+        self.put_scoped(key, value, None).await
+    }
+
+    pub async fn put_for_shop(
+        &self,
+        key: &str,
+        value: &str,
+        shop_id: &str,
+    ) -> Result<(), VaultClientError> {
+        self.put_scoped(key, value, Some(shop_id)).await
+    }
+
+    async fn put_scoped(
+        &self,
+        key: &str,
+        value: &str,
+        shop_id: Option<&str>,
+    ) -> Result<(), VaultClientError> {
         if key.is_empty() {
             return Err(VaultClientError::EmptyKey);
         }
-        let response = self.request(&VaultRequest::Put { key, value }).await?;
+        let response = self
+            .request(&VaultRequest::Put {
+                key,
+                value,
+                shop_id,
+            })
+            .await?;
         if response.ok {
             Ok(())
         } else {
@@ -180,7 +232,15 @@ impl VaultClient {
     }
 
     pub async fn list(&self) -> Result<Vec<String>, VaultClientError> {
-        let response = self.request(&VaultRequest::List).await?;
+        self.list_scoped(None).await
+    }
+
+    pub async fn list_for_shop(&self, shop_id: &str) -> Result<Vec<String>, VaultClientError> {
+        self.list_scoped(Some(shop_id)).await
+    }
+
+    async fn list_scoped(&self, shop_id: Option<&str>) -> Result<Vec<String>, VaultClientError> {
+        let response = self.request(&VaultRequest::List { shop_id }).await?;
         if response.ok {
             let mut keys = response.keys.unwrap_or_default();
             keys.sort();
@@ -193,10 +253,22 @@ impl VaultClient {
     }
 
     pub async fn delete(&self, key: &str) -> Result<(), VaultClientError> {
+        self.delete_scoped(key, None).await
+    }
+
+    pub async fn delete_for_shop(&self, key: &str, shop_id: &str) -> Result<(), VaultClientError> {
+        self.delete_scoped(key, Some(shop_id)).await
+    }
+
+    async fn delete_scoped(
+        &self,
+        key: &str,
+        shop_id: Option<&str>,
+    ) -> Result<(), VaultClientError> {
         if key.is_empty() {
             return Err(VaultClientError::EmptyKey);
         }
-        let response = self.request(&VaultRequest::Delete { key }).await?;
+        let response = self.request(&VaultRequest::Delete { key, shop_id }).await?;
         if response.ok {
             Ok(())
         } else {
@@ -225,36 +297,6 @@ impl VaultClient {
         }
     }
 
-    pub async fn get_for_shop(&self, shop_id: &str, key: &str) -> Result<String, VaultClientError> {
-        self.get(&shop_key(shop_id, key)?).await
-    }
-
-    pub async fn put_for_shop(
-        &self,
-        shop_id: &str,
-        key: &str,
-        value: &str,
-    ) -> Result<(), VaultClientError> {
-        self.put(&shop_key(shop_id, key)?, value).await
-    }
-
-    pub async fn delete_for_shop(&self, shop_id: &str, key: &str) -> Result<(), VaultClientError> {
-        self.delete(&shop_key(shop_id, key)?).await
-    }
-
-    pub async fn list_for_shop(&self, shop_id: &str) -> Result<Vec<String>, VaultClientError> {
-        validate_shop_id(shop_id)?;
-        let prefix = format!("shops/{shop_id}/");
-        let mut keys = self
-            .list()
-            .await?
-            .into_iter()
-            .filter_map(|key| key.strip_prefix(&prefix).map(ToOwned::to_owned))
-            .collect::<Vec<_>>();
-        keys.sort();
-        Ok(keys)
-    }
-
     async fn request(&self, request: &VaultRequest<'_>) -> Result<VaultResponse, VaultClientError> {
         let mut stream = UnixStream::connect(&self.socket_path)
             .await
@@ -278,12 +320,6 @@ impl VaultClient {
 
         serde_json::from_slice(&response).map_err(VaultClientError::Json)
     }
-}
-
-fn shop_key(shop_id: &str, key: &str) -> Result<String, VaultClientError> {
-    validate_shop_id(shop_id)?;
-    validate_shop_key(key)?;
-    Ok(format!("shops/{shop_id}/{key}"))
 }
 
 fn validate_shop_id(shop_id: &str) -> Result<(), VaultClientError> {

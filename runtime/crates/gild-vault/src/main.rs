@@ -543,7 +543,11 @@ fn key_shop_id(key: &str) -> Option<&str> {
 fn is_runtime(peer: &PeerCred) -> bool {
     matches!(
         peer.username.as_deref(),
-        Some("gild-runtime") | Some("deka") | Some("deka-platform") | Some("tana-deka-platform")
+        Some("gild-runtime")
+            | Some("deka")
+            | Some("deka-platform")
+            | Some("tana-deka-platform")
+            | Some("gild-vault-proxy")
     )
 }
 
