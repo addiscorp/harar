@@ -43,6 +43,7 @@ pub enum VaultClientError {
 #[derive(Debug, serde::Serialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 enum VaultRequest<'a> {
+    Get { key: &'a str },
     Put { key: &'a str, value: &'a str },
     List,
     Delete { key: &'a str },
@@ -51,6 +52,7 @@ enum VaultRequest<'a> {
 #[derive(Debug, serde::Deserialize)]
 struct VaultResponse {
     ok: bool,
+    value: Option<String>,
     keys: Option<Vec<String>>,
     error: Option<String>,
 }
@@ -132,6 +134,22 @@ impl VaultClient {
     pub fn from_socket_path(path: impl AsRef<Path>) -> Self {
         Self {
             socket_path: path.as_ref().to_path_buf(),
+        }
+    }
+
+    pub async fn get(&self, key: &str) -> Result<String, VaultClientError> {
+        if key.is_empty() {
+            return Err(VaultClientError::EmptyKey);
+        }
+        let response = self.request(&VaultRequest::Get { key }).await?;
+        if response.ok {
+            response
+                .value
+                .ok_or_else(|| VaultClientError::InvalidResponse("missing value".to_string()))
+        } else {
+            Err(VaultClientError::Vault(
+                response.error.unwrap_or_else(|| "get_failed".to_string()),
+            ))
         }
     }
 
