@@ -367,6 +367,7 @@ fn can_read_key(peer: &PeerCred, key: &str) -> bool {
 
 fn is_admin(peer: &PeerCred) -> bool {
     peer.uid == 0
+        || peer.uid == unsafe { libc::geteuid() }
         || peer.username.as_deref() == Some("root")
         || peer.username.as_deref() == Some("sami")
 }
