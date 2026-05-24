@@ -208,7 +208,33 @@ async fn handle_connection(mut stream: UnixStream, state: Arc<AppState>) -> Resu
     let peer = peer_credentials(&stream).context("read SO_PEERCRED")?;
     let request_bytes = read_request_bytes(&mut stream).await?;
     if request_bytes.len() > MAX_REQUEST_BYTES {
+        if is_http_request(&request_bytes) {
+            write_http_json(
+                &mut stream,
+                413,
+                serde_json::json!({ "error": "request too large" }),
+            )
+            .await?;
+            return Ok(());
+        }
         write_json(&mut stream, &VaultResponse::error("request_too_large")).await?;
+        return Ok(());
+    }
+
+    if is_http_request(&request_bytes) {
+        let response = handle_http_request(&state, &peer, &request_bytes).await;
+        match response {
+            Ok(reply) => write_http_json(&mut stream, reply.status, reply.body).await?,
+            Err(err) => {
+                eprintln!("gild-vault HTTP request error: {err:#}");
+                write_http_json(
+                    &mut stream,
+                    400,
+                    serde_json::json!({ "error": "bad request" }),
+                )
+                .await?;
+            }
+        }
         return Ok(());
     }
 
@@ -223,6 +249,45 @@ async fn handle_connection(mut stream: UnixStream, state: Arc<AppState>) -> Resu
     let response = handle_request(&state, &peer, request).await?;
     write_json(&mut stream, &response).await?;
     Ok(())
+}
+
+async fn handle_http_request(
+    state: &AppState,
+    peer: &PeerCred,
+    request_bytes: &[u8],
+) -> Result<HttpReply> {
+    let request = parse_http_request(request_bytes)?;
+    if request.method != "GET" {
+        return Ok(HttpReply::json(405, "method not allowed"));
+    }
+
+    let Some(key) = request
+        .path
+        .strip_prefix("/v1/secret/")
+        .filter(|key| !key.is_empty())
+    else {
+        return Ok(HttpReply::json(404, "not found"));
+    };
+
+    let response = handle_request(
+        state,
+        peer,
+        VaultRequest::Get {
+            key: key.to_string(),
+        },
+    )
+    .await?;
+
+    match (response.ok, response.value, response.error.as_deref()) {
+        (true, Some(value), _) => Ok(HttpReply::json_value(
+            200,
+            serde_json::json!({ "value": value }),
+        )),
+        (false, _, Some("not_found")) => Ok(HttpReply::json(404, "secret not found")),
+        (false, _, Some("forbidden")) => Ok(HttpReply::json(403, "forbidden")),
+        (false, _, Some(error)) => Ok(HttpReply::json(500, error)),
+        _ => Ok(HttpReply::json(500, "invalid response")),
+    }
 }
 
 async fn handle_request(
@@ -308,6 +373,55 @@ async fn read_request_bytes(stream: &mut UnixStream) -> Result<Vec<u8>> {
         }
     }
     Ok(request_bytes)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct HttpRequest {
+    method: String,
+    path: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct HttpReply {
+    status: u16,
+    body: serde_json::Value,
+}
+
+impl HttpReply {
+    fn json(status: u16, error: &str) -> Self {
+        Self::json_value(status, serde_json::json!({ "error": error }))
+    }
+
+    fn json_value(status: u16, body: serde_json::Value) -> Self {
+        Self { status, body }
+    }
+}
+
+fn is_http_request(request_bytes: &[u8]) -> bool {
+    request_bytes.starts_with(b"GET ")
+        || request_bytes.starts_with(b"POST ")
+        || request_bytes.starts_with(b"PUT ")
+        || request_bytes.starts_with(b"DELETE ")
+        || request_bytes.starts_with(b"HEAD ")
+        || request_bytes.starts_with(b"OPTIONS ")
+}
+
+fn parse_http_request(request_bytes: &[u8]) -> Result<HttpRequest> {
+    let raw = std::str::from_utf8(request_bytes).context("HTTP request is not UTF-8")?;
+    let request_line = raw
+        .lines()
+        .next()
+        .ok_or_else(|| anyhow!("empty HTTP request"))?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts
+        .next()
+        .ok_or_else(|| anyhow!("missing HTTP method"))?
+        .to_string();
+    let path = parts
+        .next()
+        .ok_or_else(|| anyhow!("missing HTTP path"))?
+        .to_string();
+    Ok(HttpRequest { method, path })
 }
 
 impl VaultRequest {
@@ -487,6 +601,33 @@ async fn write_json(stream: &mut UnixStream, response: &VaultResponse) -> Result
     let mut bytes = serde_json::to_vec(response).context("encode response")?;
     bytes.push(b'\n');
     stream.write_all(&bytes).await.context("write response")?;
+    Ok(())
+}
+
+async fn write_http_json(
+    stream: &mut UnixStream,
+    status: u16,
+    body: serde_json::Value,
+) -> Result<()> {
+    let body = body.to_string();
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        413 => "Payload Too Large",
+        500 => "Internal Server Error",
+        _ => "OK",
+    };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\ncache-control: no-store\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .context("write HTTP response")?;
     Ok(())
 }
 
@@ -678,6 +819,41 @@ mod tests {
         assert_eq!(response.version.as_deref(), Some("0.1.0"));
         assert_eq!(response.key_count, Some(3));
         assert!(response.uptime_seconds.unwrap() >= 5);
+    }
+
+    #[tokio::test]
+    async fn http_get_missing_secret_returns_404() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path());
+        let reply = handle_http_request(
+            &state,
+            &peer(0, "root"),
+            b"GET /v1/secret/MISSING_SECRET HTTP/1.1\r\nHost: gild-vault\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reply.status, 404);
+        assert_eq!(
+            reply.body,
+            serde_json::json!({ "error": "secret not found" })
+        );
+    }
+
+    #[tokio::test]
+    async fn http_get_existing_secret_returns_value() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path());
+        let reply = handle_http_request(
+            &state,
+            &peer(0, "root"),
+            b"GET /v1/secret/ANTHROPIC_API_KEY HTTP/1.1\r\nHost: gild-vault\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.body, serde_json::json!({ "value": "sk-test" }));
     }
 
     #[tokio::test]
