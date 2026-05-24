@@ -541,8 +541,6 @@ fn persist_keys(path: &Path, keys: &HashMap<String, String>) -> Result<()> {
         return Err(anyhow!("state path must have a parent"));
     };
     fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("chmod 0700 {}", parent.display()))?;
 
     let tmp_path = path.with_extension("json.tmp");
     let mut file = OpenOptions::new()
@@ -884,5 +882,40 @@ mod tests {
         assert_eq!(response.version.as_deref(), Some("0.1.0"));
 
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn socket_put_preserves_state_dir_permissions() {
+        let dir = tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o750)).unwrap();
+
+        let socket_path = dir.path().join("gild-vault.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let state = Arc::new(test_state(dir.path()));
+
+        let server = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                handle_connection(stream, state).await.unwrap();
+            }
+        });
+
+        let mut client = UnixStream::connect(&socket_path).await.unwrap();
+        client
+            .write_all(br#"{"op":"put","key":"FOO","value":"bar"}"#)
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).await.unwrap();
+        let response: VaultResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(response.ok);
+
+        server.await.unwrap();
+
+        let mode = fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o750);
     }
 }
