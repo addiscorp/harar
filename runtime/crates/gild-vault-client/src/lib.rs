@@ -8,6 +8,7 @@ use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
 const DEFAULT_SOCKET_PATH: &str = "/run/tana-vault.sock";
+const DEFAULT_GILD_VAULT_SOCKET_PATH: &str = "/run/gild-vault.sock";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
@@ -23,6 +24,35 @@ pub enum SecretsError {
     InvalidResponse(String),
     AgentStatus { status: u16, body: String },
     Json(serde_json::Error),
+}
+
+#[derive(Clone, Debug)]
+pub struct VaultClient {
+    pub socket_path: PathBuf,
+}
+
+#[derive(Debug)]
+pub enum VaultClientError {
+    EmptyKey,
+    Io(std::io::Error),
+    InvalidResponse(String),
+    Vault(String),
+    Json(serde_json::Error),
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "op", rename_all = "lowercase")]
+enum VaultRequest<'a> {
+    Put { key: &'a str, value: &'a str },
+    List,
+    Delete { key: &'a str },
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct VaultResponse {
+    ok: bool,
+    keys: Option<Vec<String>>,
+    error: Option<String>,
 }
 
 impl Secrets {
@@ -91,6 +121,88 @@ impl Secrets {
     }
 }
 
+impl VaultClient {
+    pub fn from_socket() -> Self {
+        Self::from_socket_path(
+            std::env::var("GILD_VAULT_SOCKET")
+                .unwrap_or_else(|_| DEFAULT_GILD_VAULT_SOCKET_PATH.to_string()),
+        )
+    }
+
+    pub fn from_socket_path(path: impl AsRef<Path>) -> Self {
+        Self {
+            socket_path: path.as_ref().to_path_buf(),
+        }
+    }
+
+    pub async fn put(&self, key: &str, value: &str) -> Result<(), VaultClientError> {
+        if key.is_empty() {
+            return Err(VaultClientError::EmptyKey);
+        }
+        let response = self.request(&VaultRequest::Put { key, value }).await?;
+        if response.ok {
+            Ok(())
+        } else {
+            Err(VaultClientError::Vault(
+                response.error.unwrap_or_else(|| "put_failed".to_string()),
+            ))
+        }
+    }
+
+    pub async fn list(&self) -> Result<Vec<String>, VaultClientError> {
+        let response = self.request(&VaultRequest::List).await?;
+        if response.ok {
+            let mut keys = response.keys.unwrap_or_default();
+            keys.sort();
+            Ok(keys)
+        } else {
+            Err(VaultClientError::Vault(
+                response.error.unwrap_or_else(|| "list_failed".to_string()),
+            ))
+        }
+    }
+
+    pub async fn delete(&self, key: &str) -> Result<(), VaultClientError> {
+        if key.is_empty() {
+            return Err(VaultClientError::EmptyKey);
+        }
+        let response = self.request(&VaultRequest::Delete { key }).await?;
+        if response.ok {
+            Ok(())
+        } else {
+            Err(VaultClientError::Vault(
+                response
+                    .error
+                    .unwrap_or_else(|| "delete_failed".to_string()),
+            ))
+        }
+    }
+
+    async fn request(&self, request: &VaultRequest<'_>) -> Result<VaultResponse, VaultClientError> {
+        let mut stream = UnixStream::connect(&self.socket_path)
+            .await
+            .map_err(VaultClientError::Io)?;
+        let bytes = serde_json::to_vec(request).map_err(VaultClientError::Json)?;
+        stream
+            .write_all(&bytes)
+            .await
+            .map_err(VaultClientError::Io)?;
+        stream.shutdown().await.map_err(VaultClientError::Io)?;
+
+        let mut response = Vec::new();
+        stream
+            .take(MAX_RESPONSE_BYTES as u64)
+            .read_to_end(&mut response)
+            .await
+            .map_err(VaultClientError::Io)?;
+        if response.is_empty() {
+            return Err(VaultClientError::InvalidResponse("empty response".into()));
+        }
+
+        serde_json::from_slice(&response).map_err(VaultClientError::Json)
+    }
+}
+
 impl fmt::Display for SecretsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -103,6 +215,30 @@ impl fmt::Display for SecretsError {
                 write!(f, "vault agent returned HTTP {status}: {body}")
             }
             SecretsError::Json(err) => write!(f, "vault agent JSON error: {err}"),
+        }
+    }
+}
+
+impl fmt::Display for VaultClientError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            VaultClientError::EmptyKey => write!(f, "vault key cannot be empty"),
+            VaultClientError::Io(err) => write!(f, "gild-vault I/O error: {err}"),
+            VaultClientError::InvalidResponse(message) => {
+                write!(f, "gild-vault returned an invalid response: {message}")
+            }
+            VaultClientError::Vault(err) => write!(f, "gild-vault rejected request: {err}"),
+            VaultClientError::Json(err) => write!(f, "gild-vault JSON error: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for VaultClientError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            VaultClientError::Io(err) => Some(err),
+            VaultClientError::Json(err) => Some(err),
+            _ => None,
         }
     }
 }
