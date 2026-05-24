@@ -6,7 +6,8 @@ Requires=gg.tana.gild-vault.socket
 [Service]
 Type=simple
 User=gild-vault
-Group=gild-orchestrator
+Group=gild-vault
+SupplementaryGroups=gild
 RuntimeDirectory=gild-vault
 RuntimeDirectoryMode=0700
 ExecStart=/usr/local/bin/gild-vault --state-path /run/gild-vault/keys.json --audit-log /var/log/gild-vault.log

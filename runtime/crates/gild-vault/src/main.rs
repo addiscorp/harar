@@ -167,7 +167,7 @@ async fn serve(config: Config, state: Arc<AppState>) -> Result<()> {
                 .with_context(|| format!("bind {}", config.socket_path.display()))?;
             fs::set_permissions(&config.socket_path, fs::Permissions::from_mode(0o660))
                 .with_context(|| format!("chmod 0660 {}", config.socket_path.display()))?;
-            try_chgrp(&config.socket_path, "gild-orchestrator");
+            try_chgrp(&config.socket_path, "gild");
             listener
         }
     };
