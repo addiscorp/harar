@@ -5,7 +5,7 @@ Description=Tana Gild Vault socket
 ListenStream=/run/gild-vault.sock
 SocketMode=0660
 SocketUser=gild-vault
-SocketGroup=gild-orchestrator
+SocketGroup=gild
 RemoveOnStop=true
 
 [Install]
