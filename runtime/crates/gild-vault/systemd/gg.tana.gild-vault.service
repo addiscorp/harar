@@ -1,0 +1,33 @@
+[Unit]
+Description=Tana Gild Vault daemon
+After=network.target
+Requires=gg.tana.gild-vault.socket
+
+[Service]
+Type=simple
+User=gild-vault
+Group=gild-orchestrator
+RuntimeDirectory=gild-vault
+RuntimeDirectoryMode=0700
+ExecStart=/usr/local/bin/gild-vault --state-path /run/gild-vault/keys.json --audit-log /var/log/gild-vault.log
+UMask=0007
+Restart=on-failure
+RestartSec=2s
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictRealtime=true
+ReadWritePaths=/run/gild-vault /run/gild-vault.sock /var/log/gild-vault.log
+StandardOutput=append:/var/log/gild-vault.log
+StandardError=append:/var/log/gild-vault.log
+
+[Install]
+WantedBy=multi-user.target
