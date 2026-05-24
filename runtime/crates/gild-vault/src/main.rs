@@ -79,6 +79,8 @@ enum VaultRequest {
     Put {
         key: String,
         value: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shop_id: Option<String>,
     },
     List {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -86,6 +88,8 @@ enum VaultRequest {
     },
     Delete {
         key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shop_id: Option<String>,
     },
     Health,
 }
@@ -327,7 +331,7 @@ async fn handle_request(
                 None => VaultResponse::error("not_found"),
             }
         }
-        VaultRequest::Put { key, value } => {
+        VaultRequest::Put { key, value, .. } => {
             let mut keys = state.keys.lock().await;
             keys.insert(key, value);
             persist_keys(&state.state_path, &keys)?;
@@ -346,7 +350,7 @@ async fn handle_request(
                 ..VaultResponse::ok()
             }
         }
-        VaultRequest::Delete { key } => {
+        VaultRequest::Delete { key, .. } => {
             let mut keys = state.keys.lock().await;
             keys.remove(&key);
             persist_keys(&state.state_path, &keys)?;
@@ -463,7 +467,7 @@ impl VaultRequest {
 
     fn key(&self) -> Option<&str> {
         match self {
-            Self::Get { key, .. } | Self::Put { key, .. } | Self::Delete { key } => Some(key),
+            Self::Get { key, .. } | Self::Put { key, .. } | Self::Delete { key, .. } => Some(key),
             Self::List { .. } | Self::Health => None,
         }
     }
@@ -480,8 +484,12 @@ fn authorize(peer: &PeerCred, request: &VaultRequest) -> Decision {
             }
         }
         VaultRequest::List { .. } => Decision::Allow,
-        VaultRequest::Put { key, .. } | VaultRequest::Delete { key } => {
-            if is_admin(peer) || (is_shop_key(key) && is_runtime(peer)) {
+        VaultRequest::Put { key, shop_id, .. } | VaultRequest::Delete { key, shop_id } => {
+            if is_admin(peer)
+                || (is_shop_key(key)
+                    && is_runtime(peer)
+                    && runtime_shop_scope_allows(key, shop_id.as_deref()))
+            {
                 Decision::Allow
             } else {
                 Decision::Deny("forbidden")
@@ -797,7 +805,19 @@ mod tests {
                 .unwrap(),
             VaultRequest::Put {
                 key: "FOO".to_string(),
-                value: "bar".to_string()
+                value: "bar".to_string(),
+                shop_id: None,
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<VaultRequest>(
+                r#"{"op":"put","key":"shops/shop_a/SECRET","value":"bar","shop_id":"shop_a"}"#
+            )
+            .unwrap(),
+            VaultRequest::Put {
+                key: "shops/shop_a/SECRET".to_string(),
+                value: "bar".to_string(),
+                shop_id: Some("shop_a".to_string()),
             }
         );
         assert_eq!(
@@ -813,7 +833,18 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<VaultRequest>(r#"{"op":"delete","key":"FOO"}"#).unwrap(),
             VaultRequest::Delete {
-                key: "FOO".to_string()
+                key: "FOO".to_string(),
+                shop_id: None,
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<VaultRequest>(
+                r#"{"op":"delete","key":"shops/shop_a/SECRET","shop_id":"shop_a"}"#
+            )
+            .unwrap(),
+            VaultRequest::Delete {
+                key: "shops/shop_a/SECRET".to_string(),
+                shop_id: Some("shop_a".to_string()),
             }
         );
         assert_eq!(
@@ -857,7 +888,8 @@ mod tests {
                 &peer(501, "sami"),
                 &VaultRequest::Put {
                     key: "FOO".to_string(),
-                    value: "bar".to_string()
+                    value: "bar".to_string(),
+                    shop_id: None,
                 }
             ),
             Decision::Allow
@@ -875,7 +907,8 @@ mod tests {
                 &amina,
                 &VaultRequest::Put {
                     key: "AGENT_AMINA_API_KEY".to_string(),
-                    value: "secret".to_string()
+                    value: "secret".to_string(),
+                    shop_id: None,
                 }
             ),
             Decision::Deny("forbidden")
@@ -973,7 +1006,8 @@ mod tests {
                 &runtime,
                 &VaultRequest::Put {
                     key: "shops/shop_alpha/STRIPE_SECRET_KEY".to_string(),
-                    value: "sk-test".to_string()
+                    value: "sk-test".to_string(),
+                    shop_id: None,
                 }
             ),
             Decision::Allow
@@ -982,7 +1016,81 @@ mod tests {
             authorize(
                 &runtime,
                 &VaultRequest::Delete {
-                    key: "shops/shop_alpha/STRIPE_SECRET_KEY".to_string()
+                    key: "shops/shop_alpha/STRIPE_SECRET_KEY".to_string(),
+                    shop_id: None,
+                }
+            ),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn policy_scopes_runtime_write_to_request_shop_id() {
+        let runtime = peer(1002, "gild-runtime");
+        assert_eq!(
+            authorize(
+                &runtime,
+                &VaultRequest::Put {
+                    key: "shops/shop_a/SECRET".to_string(),
+                    value: "a".to_string(),
+                    shop_id: Some("shop_a".to_string()),
+                }
+            ),
+            Decision::Allow
+        );
+        assert_eq!(
+            authorize(
+                &runtime,
+                &VaultRequest::Delete {
+                    key: "shops/shop_a/SECRET".to_string(),
+                    shop_id: Some("shop_a".to_string()),
+                }
+            ),
+            Decision::Allow
+        );
+        assert_eq!(
+            authorize(
+                &runtime,
+                &VaultRequest::Put {
+                    key: "shops/shop_b/SECRET".to_string(),
+                    value: "b".to_string(),
+                    shop_id: Some("shop_a".to_string()),
+                }
+            ),
+            Decision::Deny("forbidden")
+        );
+        assert_eq!(
+            authorize(
+                &runtime,
+                &VaultRequest::Delete {
+                    key: "shops/shop_b/SECRET".to_string(),
+                    shop_id: Some("shop_a".to_string()),
+                }
+            ),
+            Decision::Deny("forbidden")
+        );
+    }
+
+    #[test]
+    fn policy_keeps_admin_write_access_with_shop_scope() {
+        let admin = peer(501, "sami");
+        assert_eq!(
+            authorize(
+                &admin,
+                &VaultRequest::Put {
+                    key: "shops/shop_b/SECRET".to_string(),
+                    value: "b".to_string(),
+                    shop_id: Some("shop_a".to_string()),
+                }
+            ),
+            Decision::Allow
+        );
+        assert_eq!(
+            authorize(
+                &admin,
+                &VaultRequest::Delete {
+                    key: "shops/shop_b/SECRET".to_string(),
+                    shop_id: Some("shop_a".to_string()),
                 }
             ),
             Decision::Allow
@@ -1012,7 +1120,8 @@ mod tests {
                 &amina,
                 &VaultRequest::Put {
                     key: "shops/shop_alpha/STRIPE_SECRET_KEY".to_string(),
-                    value: "sk-test".to_string()
+                    value: "sk-test".to_string(),
+                    shop_id: None,
                 }
             ),
             Decision::Deny("forbidden")
