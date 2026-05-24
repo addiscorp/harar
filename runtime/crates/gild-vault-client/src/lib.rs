@@ -322,34 +322,6 @@ impl VaultClient {
     }
 }
 
-fn validate_shop_id(shop_id: &str) -> Result<(), VaultClientError> {
-    if shop_id.is_empty()
-        || shop_id.len() > 128
-        || !shop_id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    {
-        Err(VaultClientError::Vault("invalid_shop_id".to_string()))
-    } else {
-        Ok(())
-    }
-}
-
-fn validate_shop_key(key: &str) -> Result<(), VaultClientError> {
-    if key.is_empty()
-        || key.len() > 256
-        || key == "."
-        || key == ".."
-        || key.contains('/')
-        || key.contains('\\')
-        || key.bytes().any(|b| b.is_ascii_control())
-    {
-        Err(VaultClientError::Vault("invalid_key".to_string()))
-    } else {
-        Ok(())
-    }
-}
-
 impl fmt::Display for SecretsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

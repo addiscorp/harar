@@ -41,10 +41,14 @@ async fn list(
     Json(request): Json<VaultRequestBody>,
 ) -> Response {
     match authorize(&headers, &state.token).and_then(|_| validate_shop_id(&request.shop_id)) {
-        Ok(()) => json_result(
-            state.vault.list_for_shop(&request.shop_id).await,
-            |keys| serde_json::json!({ "ok": true, "keys": keys }),
-        ),
+        Ok(()) => json_result(state.vault.list_for_shop(&request.shop_id).await, |keys| {
+            let prefix = shop_prefix(&request.shop_id);
+            let keys = keys
+                .into_iter()
+                .filter_map(|key| key.strip_prefix(&prefix).map(ToOwned::to_owned))
+                .collect::<Vec<_>>();
+            serde_json::json!({ "ok": true, "keys": keys })
+        }),
         Err(err) => err.into_response(),
     }
 }
@@ -63,7 +67,10 @@ async fn get_secret(
     };
 
     json_result(
-        state.vault.get_for_shop(&request.shop_id, key).await,
+        state
+            .vault
+            .get_for_shop(&shop_key(&request.shop_id, key), &request.shop_id)
+            .await,
         |value| serde_json::json!({ "ok": true, "value": value }),
     )
 }
@@ -83,7 +90,10 @@ async fn put_secret(
     };
 
     json_result(
-        state.vault.put_for_shop(&request.shop_id, key, value).await,
+        state
+            .vault
+            .put_for_shop(&shop_key(&request.shop_id, key), value, &request.shop_id)
+            .await,
         |_| serde_json::json!({ "ok": true }),
     )
 }
@@ -102,7 +112,10 @@ async fn delete_secret(
     };
 
     json_result(
-        state.vault.delete_for_shop(&request.shop_id, key).await,
+        state
+            .vault
+            .delete_for_shop(&shop_key(&request.shop_id, key), &request.shop_id)
+            .await,
         |_| serde_json::json!({ "ok": true }),
     )
 }
@@ -165,6 +178,14 @@ fn validate_key(key: &str) -> Result<(), ProxyError> {
     } else {
         Ok(())
     }
+}
+
+fn shop_key(shop_id: &str, key: &str) -> String {
+    format!("{}{key}", shop_prefix(shop_id))
+}
+
+fn shop_prefix(shop_id: &str) -> String {
+    format!("shops/{shop_id}/")
 }
 
 fn json_result<T>(
