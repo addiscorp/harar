@@ -467,8 +467,8 @@ fn authorize(peer: &PeerCred, request: &VaultRequest) -> Decision {
             }
         }
         VaultRequest::List => Decision::Allow,
-        VaultRequest::Put { .. } | VaultRequest::Delete { .. } => {
-            if is_admin(peer) {
+        VaultRequest::Put { key, .. } | VaultRequest::Delete { key } => {
+            if is_admin(peer) || (is_shop_key(key) && is_runtime(peer)) {
                 Decision::Allow
             } else {
                 Decision::Deny("forbidden")
@@ -482,6 +482,10 @@ fn can_read_key(peer: &PeerCred, key: &str) -> bool {
         return true;
     }
 
+    if is_shop_key(key) && is_runtime(peer) {
+        return true;
+    }
+
     let Some(username) = peer.username.as_deref() else {
         return false;
     };
@@ -490,6 +494,17 @@ fn can_read_key(peer: &PeerCred, key: &str) -> bool {
     };
     let prefix = format!("AGENT_{}_", slug.replace('-', "_").to_ascii_uppercase());
     key.starts_with(&prefix)
+}
+
+fn is_shop_key(key: &str) -> bool {
+    key.starts_with("shops/")
+}
+
+fn is_runtime(peer: &PeerCred) -> bool {
+    matches!(
+        peer.username.as_deref(),
+        Some("gild-runtime") | Some("deka") | Some("deka-platform") | Some("tana-deka-platform")
+    )
 }
 
 fn is_admin(peer: &PeerCred) -> bool {
@@ -812,6 +827,71 @@ mod tests {
                 &VaultRequest::Put {
                     key: "AGENT_AMINA_API_KEY".to_string(),
                     value: "secret".to_string()
+                }
+            ),
+            Decision::Deny("forbidden")
+        );
+    }
+
+    #[test]
+    fn policy_allows_runtime_to_read_shop_keys() {
+        let runtime = peer(1002, "gild-runtime");
+        assert!(can_read_key(&runtime, "shops/shop_alpha/STRIPE_SECRET_KEY"));
+        assert!(!can_read_key(&runtime, "AGENT_AMINA_API_KEY"));
+        assert_eq!(
+            authorize(
+                &runtime,
+                &VaultRequest::Get {
+                    key: "shops/shop_alpha/STRIPE_SECRET_KEY".to_string()
+                }
+            ),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn policy_allows_runtime_to_write_shop_keys() {
+        let runtime = peer(1002, "gild-runtime");
+        assert_eq!(
+            authorize(
+                &runtime,
+                &VaultRequest::Put {
+                    key: "shops/shop_alpha/STRIPE_SECRET_KEY".to_string(),
+                    value: "sk-test".to_string()
+                }
+            ),
+            Decision::Allow
+        );
+        assert_eq!(
+            authorize(
+                &runtime,
+                &VaultRequest::Delete {
+                    key: "shops/shop_alpha/STRIPE_SECRET_KEY".to_string()
+                }
+            ),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn policy_blocks_agent_from_shop_keys() {
+        let amina = peer(1001, "agent-amina");
+        assert!(!can_read_key(&amina, "shops/shop_alpha/STRIPE_SECRET_KEY"));
+        assert_eq!(
+            authorize(
+                &amina,
+                &VaultRequest::Get {
+                    key: "shops/shop_alpha/STRIPE_SECRET_KEY".to_string()
+                }
+            ),
+            Decision::Deny("forbidden")
+        );
+        assert_eq!(
+            authorize(
+                &amina,
+                &VaultRequest::Put {
+                    key: "shops/shop_alpha/STRIPE_SECRET_KEY".to_string(),
+                    value: "sk-test".to_string()
                 }
             ),
             Decision::Deny("forbidden")
