@@ -8,7 +8,7 @@ use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
 const DEFAULT_SOCKET_PATH: &str = "/run/tana-vault.sock";
-const DEFAULT_GILD_VAULT_SOCKET_PATH: &str = "/run/gild-vault.sock";
+const DEFAULT_GILD_VAULT_SOCKET_PATH: &str = "/run/gild-vault/sock";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
@@ -47,6 +47,7 @@ enum VaultRequest<'a> {
     Put { key: &'a str, value: &'a str },
     List,
     Delete { key: &'a str },
+    Health,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -55,6 +56,16 @@ struct VaultResponse {
     value: Option<String>,
     keys: Option<Vec<String>>,
     error: Option<String>,
+    version: Option<String>,
+    uptime_seconds: Option<u64>,
+    key_count: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultHealth {
+    pub version: Option<String>,
+    pub uptime_seconds: Option<u64>,
+    pub key_count: Option<usize>,
 }
 
 impl Secrets {
@@ -126,7 +137,8 @@ impl Secrets {
 impl VaultClient {
     pub fn from_socket() -> Self {
         Self::from_socket_path(
-            std::env::var("GILD_VAULT_SOCKET")
+            std::env::var("VAULT_SOCKET")
+                .or_else(|_| std::env::var("GILD_VAULT_SOCKET"))
                 .unwrap_or_else(|_| DEFAULT_GILD_VAULT_SOCKET_PATH.to_string()),
         )
     }
@@ -192,6 +204,23 @@ impl VaultClient {
                 response
                     .error
                     .unwrap_or_else(|| "delete_failed".to_string()),
+            ))
+        }
+    }
+
+    pub async fn health(&self) -> Result<VaultHealth, VaultClientError> {
+        let response = self.request(&VaultRequest::Health).await?;
+        if response.ok {
+            Ok(VaultHealth {
+                version: response.version,
+                uptime_seconds: response.uptime_seconds,
+                key_count: response.key_count,
+            })
+        } else {
+            Err(VaultClientError::Vault(
+                response
+                    .error
+                    .unwrap_or_else(|| "health_failed".to_string()),
             ))
         }
     }

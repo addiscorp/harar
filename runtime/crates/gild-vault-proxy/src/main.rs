@@ -1,5 +1,6 @@
+use std::ffi::OsString;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow};
@@ -7,22 +8,32 @@ use gild_vault_client::VaultClient;
 use gild_vault_proxy::{AppState, app};
 
 const DEFAULT_PORT: u16 = 9444;
-const DEFAULT_SOCKET_PATH: &str = "/run/gild-vault/sock";
+pub const DEFAULT_SOCKET_PATH: &str = "/run/gild-vault/sock";
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::from_env_and_args()?;
+    let vault = VaultClient::from_socket_path(&config.socket_path);
+    smoke_check_vault(&vault, &config.socket_path).await?;
+
     let listener = tokio::net::TcpListener::bind(config.addr)
         .await
         .with_context(|| format!("bind {}", config.addr))?;
-    let state = AppState::new(
-        config.token,
-        VaultClient::from_socket_path(config.socket_path),
-    );
+    let state = AppState::new(config.token, vault);
 
     axum::serve(listener, app(state))
         .await
         .context("serve gild-vault-proxy")
+}
+
+async fn smoke_check_vault(vault: &VaultClient, socket_path: &Path) -> Result<()> {
+    vault.health().await.with_context(|| {
+        format!(
+            "gild-vault health check failed on socket {}; refusing to bind",
+            socket_path.display()
+        )
+    })?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -36,9 +47,7 @@ impl Config {
     fn from_env_and_args() -> Result<Self> {
         let mut port = env_u16("VAULT_PROXY_PORT").unwrap_or(DEFAULT_PORT);
         let mut bind = std::env::var("VAULT_PROXY_BIND").ok();
-        let mut socket_path = PathBuf::from(
-            std::env::var("GILD_VAULT_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string()),
-        );
+        let mut socket_path = vault_socket_path_from_env();
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -76,6 +85,23 @@ impl Config {
             token: load_token()?,
         })
     }
+}
+
+pub fn vault_socket_path_from_env() -> PathBuf {
+    vault_socket_path_from_env_vars(
+        std::env::var_os("VAULT_SOCKET"),
+        std::env::var_os("GILD_VAULT_SOCKET"),
+    )
+}
+
+pub fn vault_socket_path_from_env_vars(
+    vault_socket: Option<OsString>,
+    gild_vault_socket: Option<OsString>,
+) -> PathBuf {
+    vault_socket
+        .or(gild_vault_socket)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET_PATH))
 }
 
 fn load_token() -> Result<String> {

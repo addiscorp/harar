@@ -84,6 +84,57 @@ async fn real_vault_round_trip_and_cross_shop_keys_stay_scoped() {
     assert_eq!(get_deleted, json!({"ok": false, "error": "not_found"}));
 }
 
+#[tokio::test]
+async fn proxy_binary_uses_vault_socket_env_and_checks_health_before_binding() {
+    let vault = RealVault::start();
+    let port = unused_local_port();
+    let mut proxy = Command::new(gild_vault_proxy_binary())
+        .arg("--bind")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(port.to_string())
+        .env("VAULT_PROXY_TOKEN", TOKEN)
+        .env("VAULT_SOCKET", &vault.socket_path)
+        .env_remove("GILD_VAULT_SOCKET")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let base_url = format!("http://127.0.0.1:{port}");
+    wait_for_proxy(&base_url).await;
+    let response = reqwest::get(format!("{base_url}/health")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let _ = proxy.kill();
+    let _ = proxy.wait();
+}
+
+#[test]
+fn proxy_binary_falls_back_to_production_socket_path_and_refuses_to_bind() {
+    let output = Command::new(gild_vault_proxy_binary())
+        .arg("--bind")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(unused_local_port().to_string())
+        .env("VAULT_PROXY_TOKEN", TOKEN)
+        .env_remove("VAULT_SOCKET")
+        .env_remove("GILD_VAULT_SOCKET")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("gild-vault health check failed on socket /run/gild-vault/sock"),
+        "stderr did not include production socket path: {stderr}"
+    );
+    assert!(
+        stderr.contains("refusing to bind"),
+        "stderr did not explain bind refusal: {stderr}"
+    );
+}
+
 async fn start_proxy(app: Router) -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -114,7 +165,8 @@ struct RealVault {
 impl RealVault {
     fn start() -> Self {
         let temp = tempfile::tempdir().unwrap();
-        let socket_path = temp.path().join("gild-vault.sock");
+        let socket_path = temp.path().join("run/gild-vault/sock");
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
         let state_path = temp.path().join("keys.json");
         let audit_log = temp.path().join("audit.log");
         let binary = gild_vault_binary();
@@ -148,6 +200,14 @@ impl Drop for RealVault {
 }
 
 fn gild_vault_binary() -> PathBuf {
+    workspace_binary("gild-vault")
+}
+
+fn gild_vault_proxy_binary() -> PathBuf {
+    workspace_binary("gild-vault-proxy")
+}
+
+fn workspace_binary(name: &str) -> PathBuf {
     let target_dir = std::env::current_exe()
         .unwrap()
         .parent()
@@ -155,21 +215,42 @@ fn gild_vault_binary() -> PathBuf {
         .parent()
         .unwrap()
         .to_path_buf();
-    let binary = target_dir.join("gild-vault");
+    let binary = target_dir.join(name);
     if binary.exists() {
         return binary;
     }
 
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let mut command = Command::new(cargo);
-    command.args(["build", "--quiet", "-p", "gild-vault"]);
+    command.args(["build", "--quiet", "-p", name]);
     if !cfg!(debug_assertions) {
         command.arg("--release");
     }
     let status = command.status().unwrap();
-    assert!(status.success(), "failed to build gild-vault test binary");
+    assert!(status.success(), "failed to build {name} test binary");
     assert!(binary.exists(), "{} was not built", binary.display());
     binary
+}
+
+fn unused_local_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+async fn wait_for_proxy(base_url: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if let Ok(response) = reqwest::get(format!("{base_url}/health")).await
+            && response.status() == StatusCode::OK
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("timed out waiting for proxy at {base_url}");
 }
 
 fn wait_for_socket(path: &Path) {
