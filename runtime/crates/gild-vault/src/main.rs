@@ -18,6 +18,7 @@ mod master_key;
 const DEFAULT_SOCKET_PATH: &str = "/run/gild-vault.sock";
 const DEFAULT_STATE_PATH: &str = "/var/lib/gild-vault/keys.age";
 const DEFAULT_AUDIT_LOG_PATH: &str = "/var/log/gild-vault.log";
+const DEFAULT_REPLICATION_TOKEN_PATH: &str = "/etc/gild/vault-replication-token";
 const DEFAULT_HEARTBEAT_INTERVAL_SECONDS: u64 = 5;
 const DEFAULT_SYNC_INTERVAL_SECONDS: u64 = 30;
 const DEFAULT_PROMOTE_AFTER_FAILURES: u32 = 5;
@@ -33,6 +34,7 @@ struct Config {
     audit_log_path: PathBuf,
     mode: Mode,
     upstream_url: Option<String>,
+    replication_token_path: PathBuf,
     heartbeat_interval: Duration,
     sync_interval: Duration,
     promote_after_failures: u32,
@@ -46,6 +48,10 @@ impl Config {
             audit_log_path: env_path("GILD_VAULT_AUDIT_LOG", DEFAULT_AUDIT_LOG_PATH),
             mode: env_mode("GILD_VAULT_MODE").unwrap_or(Mode::Authoritative),
             upstream_url: std::env::var("GILD_VAULT_UPSTREAM").ok(),
+            replication_token_path: env_path(
+                "GILD_VAULT_REPLICATION_TOKEN_FILE",
+                DEFAULT_REPLICATION_TOKEN_PATH,
+            ),
             heartbeat_interval: Duration::from_secs(env_u64(
                 "GILD_VAULT_HEARTBEAT_SECONDS",
                 DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
@@ -86,6 +92,11 @@ impl Config {
                 "--upstream-url" => {
                     if let Some(value) = args.next() {
                         config.upstream_url = Some(value);
+                    }
+                }
+                "--replication-token-file" => {
+                    if let Some(value) = args.next() {
+                        config.replication_token_path = PathBuf::from(value);
                     }
                 }
                 "--heartbeat-seconds" => {
@@ -139,6 +150,7 @@ struct AppState {
     version: Mutex<u64>,
     fenced: Mutex<bool>,
     replication_log: Mutex<Vec<ReplicationLogEntry>>,
+    replication_token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -281,6 +293,7 @@ async fn main() -> Result<()> {
     let replication_log_path = replication_log_path(&config.state_path);
     let meta = load_replication_meta(&replication_meta_path)?;
     let replication_log = load_replication_log(&replication_log_path)?;
+    let replication_token = load_replication_token(&config.replication_token_path)?;
     let state = Arc::new(AppState {
         keys: Mutex::new(keys),
         started_at: Instant::now(),
@@ -295,6 +308,7 @@ async fn main() -> Result<()> {
         version: Mutex::new(meta.version),
         fenced: Mutex::new(meta.fenced),
         replication_log: Mutex::new(replication_log),
+        replication_token,
     });
 
     if config.mode == Mode::Replica {
@@ -460,6 +474,9 @@ async fn handle_replication_http_request(
         return Ok(HttpReply::json_error(405, "method not allowed"));
     }
     if !is_replica(peer) {
+        return Ok(HttpReply::json_error(403, "forbidden"));
+    }
+    if !replication_authorization_matches(request, &state.replication_token) {
         return Ok(HttpReply::json_error(403, "forbidden"));
     }
     if *state.mode.lock().await != Mode::Authoritative {
@@ -632,6 +649,7 @@ async fn read_request_bytes(stream: &mut UnixStream) -> Result<Vec<u8>> {
 struct HttpRequest {
     method: String,
     path: String,
+    headers: HashMap<String, String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -692,9 +710,10 @@ async fn snapshot_response(state: &AppState) -> Result<SnapshotResponse> {
 }
 
 async fn attach_replica(state: &AppState, upstream_url: &str) -> Result<()> {
-    let snapshot: SnapshotResponse = replication_post_json(upstream_url, "/snapshot")
-        .await
-        .context("fetch replication snapshot")?;
+    let snapshot: SnapshotResponse =
+        replication_post_json(upstream_url, "/snapshot", &state.replication_token)
+            .await
+            .context("fetch replication snapshot")?;
     apply_snapshot(state, snapshot).await
 }
 
@@ -762,7 +781,13 @@ async fn heartbeat_loop(
         if *state.mode.lock().await == Mode::Authoritative {
             return;
         }
-        match replication_post_json::<HeartbeatResponse>(&upstream_url, "/heartbeat").await {
+        match replication_post_json::<HeartbeatResponse>(
+            &upstream_url,
+            "/heartbeat",
+            &state.replication_token,
+        )
+        .await
+        {
             Ok(response) => {
                 failures = 0;
                 if let Err(err) =
@@ -793,7 +818,13 @@ async fn sync_loop(state: Arc<AppState>, upstream_url: String, interval: Duratio
         }
         let version = *state.version.lock().await;
         let endpoint = format!("/since/{version}");
-        match replication_post_json::<SinceResponse>(&upstream_url, &endpoint).await {
+        match replication_post_json::<SinceResponse>(
+            &upstream_url,
+            &endpoint,
+            &state.replication_token,
+        )
+        .await
+        {
             Ok(response) if response.entries.is_empty() => {
                 if let Err(err) =
                     adopt_higher_epoch_if_needed(&state, response.epoch, &upstream_url).await
@@ -844,9 +875,10 @@ async fn promote_replica(state: &AppState) -> Result<()> {
 }
 
 async fn reconcile_authoritative_with_upstream(state: &AppState, upstream_url: &str) -> Result<()> {
-    let response: HeartbeatResponse = replication_post_json(upstream_url, "/heartbeat")
-        .await
-        .context("fetch upstream heartbeat for fencing reconciliation")?;
+    let response: HeartbeatResponse =
+        replication_post_json(upstream_url, "/heartbeat", &state.replication_token)
+            .await
+            .context("fetch upstream heartbeat for fencing reconciliation")?;
     let local_epoch = *state.epoch.lock().await;
     if response.epoch > local_epoch {
         attach_replica(state, upstream_url).await?;
@@ -916,8 +948,9 @@ async fn apply_replication_entries(state: &AppState, response: SinceResponse) ->
 async fn replication_post_json<T: for<'de> Deserialize<'de>>(
     upstream_url: &str,
     endpoint: &str,
+    token: &str,
 ) -> Result<T> {
-    let response = http_post(upstream_url, endpoint).await?;
+    let response = http_post(upstream_url, endpoint, token).await?;
     if response.status != 200 {
         return Err(anyhow!(
             "replication upstream returned HTTP {}: {}",
@@ -934,11 +967,11 @@ struct RawHttpResponse {
     body: String,
 }
 
-async fn http_post(upstream_url: &str, endpoint: &str) -> Result<RawHttpResponse> {
+async fn http_post(upstream_url: &str, endpoint: &str, token: &str) -> Result<RawHttpResponse> {
     let upstream = Upstream::parse(upstream_url)?;
     let path = upstream.path(endpoint);
     let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: gild-vault\r\nAccept: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        "POST {path} HTTP/1.1\r\nHost: gild-vault\r\nAccept: application/json\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     );
     let mut response = Vec::new();
     match upstream {
@@ -1071,10 +1104,8 @@ fn is_http_request(request_bytes: &[u8]) -> bool {
 
 fn parse_http_request(request_bytes: &[u8]) -> Result<HttpRequest> {
     let raw = std::str::from_utf8(request_bytes).context("HTTP request is not UTF-8")?;
-    let request_line = raw
-        .lines()
-        .next()
-        .ok_or_else(|| anyhow!("empty HTTP request"))?;
+    let mut lines = raw.lines();
+    let request_line = lines.next().ok_or_else(|| anyhow!("empty HTTP request"))?;
     let mut parts = request_line.split_whitespace();
     let method = parts
         .next()
@@ -1084,7 +1115,38 @@ fn parse_http_request(request_bytes: &[u8]) -> Result<HttpRequest> {
         .next()
         .ok_or_else(|| anyhow!("missing HTTP path"))?
         .to_string();
-    Ok(HttpRequest { method, path })
+    let headers = lines
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some((name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        })
+        .collect();
+    Ok(HttpRequest {
+        method,
+        path,
+        headers,
+    })
+}
+
+fn replication_authorization_matches(request: &HttpRequest, expected_token: &str) -> bool {
+    let Some(header) = request.headers.get("authorization") else {
+        return false;
+    };
+    let Some(token) = header.trim().strip_prefix("Bearer ") else {
+        return false;
+    };
+    constant_time_eq(token.as_bytes(), expected_token.as_bytes())
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    for idx in 0..a.len().max(b.len()) {
+        let left = a.get(idx).copied().unwrap_or(0);
+        let right = b.get(idx).copied().unwrap_or(0);
+        diff |= usize::from(left ^ right);
+    }
+    diff == 0
 }
 
 impl VaultRequest {
@@ -1268,6 +1330,16 @@ fn replication_meta_path(state_path: &Path) -> PathBuf {
 
 fn replication_log_path(state_path: &Path) -> PathBuf {
     state_path.with_extension("replication.log")
+}
+
+fn load_replication_token(path: &Path) -> Result<String> {
+    let token = fs::read_to_string(path)
+        .with_context(|| format!("read replication token from {}", path.display()))?;
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        return Err(anyhow!("replication token at {} is empty", path.display()));
+    }
+    Ok(token)
 }
 
 fn load_replication_meta(path: &Path) -> Result<ReplicationMeta> {
@@ -1590,6 +1662,18 @@ mod tests {
         }
     }
 
+    fn replication_request(path: &str, token: Option<&str>) -> HttpRequest {
+        let mut headers = HashMap::new();
+        if let Some(token) = token {
+            headers.insert("authorization".to_string(), format!("Bearer {token}"));
+        }
+        HttpRequest {
+            method: "POST".to_string(),
+            path: path.to_string(),
+            headers,
+        }
+    }
+
     fn test_state(dir: &Path) -> AppState {
         let master_key = age::x25519::Identity::generate();
         let state_path = dir.join("keys.age");
@@ -1611,6 +1695,7 @@ mod tests {
             version: Mutex::new(0),
             fenced: Mutex::new(false),
             replication_log: Mutex::new(Vec::new()),
+            replication_token: "test-replication-token".to_string(),
         }
     }
 
@@ -1627,6 +1712,7 @@ mod tests {
             audit_log_path: dir.join(format!("{socket_name}.audit.log")),
             mode: Mode::Authoritative,
             upstream_url: None,
+            replication_token_path: dir.join("vault-replication-token"),
             heartbeat_interval: Duration::from_millis(10),
             sync_interval: Duration::from_millis(10),
             promote_after_failures: 2,
@@ -1649,6 +1735,7 @@ mod tests {
             version: Mutex::new(0),
             fenced: Mutex::new(false),
             replication_log: Mutex::new(Vec::new()),
+            replication_token: "test-replication-token".to_string(),
         }
     }
 
@@ -1946,6 +2033,7 @@ mod tests {
             version: Mutex::new(0),
             fenced: Mutex::new(false),
             replication_log: Mutex::new(Vec::new()),
+            replication_token: "test-replication-token".to_string(),
         };
 
         let response = handle_request(
@@ -2242,6 +2330,7 @@ mod tests {
             version: Mutex::new(0),
             fenced: Mutex::new(false),
             replication_log: Mutex::new(Vec::new()),
+            replication_token: "test-replication-token".to_string(),
         });
         attach_replica(
             &replica_state,
@@ -2359,10 +2448,7 @@ mod tests {
         let reply = handle_replication_http_request(
             &state,
             &peer(2000, "gild-vault-replica"),
-            &HttpRequest {
-                method: "POST".to_string(),
-                path: "/replication/since/4".to_string(),
-            },
+            &replication_request("/replication/since/4", Some("test-replication-token")),
         )
         .await
         .unwrap();
@@ -2476,30 +2562,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replication_endpoints_authorize_only_replica_user() {
+    async fn replication_endpoints_require_replica_user_and_token() {
         let dir = tempdir().unwrap();
         let state = test_state(dir.path());
+        let missing_token = handle_replication_http_request(
+            &state,
+            &peer(2000, "gild-vault-replica"),
+            &replication_request("/replication/heartbeat", None),
+        )
+        .await
+        .unwrap();
+        let wrong_token = handle_replication_http_request(
+            &state,
+            &peer(2000, "gild-vault-replica"),
+            &replication_request("/replication/heartbeat", Some("wrong")),
+        )
+        .await
+        .unwrap();
         let allowed = handle_replication_http_request(
             &state,
             &peer(2000, "gild-vault-replica"),
-            &HttpRequest {
-                method: "POST".to_string(),
-                path: "/replication/heartbeat".to_string(),
-            },
+            &replication_request("/replication/heartbeat", Some("test-replication-token")),
         )
         .await
         .unwrap();
         let denied = handle_replication_http_request(
             &state,
             &peer(1001, "agent-amina"),
-            &HttpRequest {
-                method: "POST".to_string(),
-                path: "/replication/heartbeat".to_string(),
-            },
+            &replication_request("/replication/heartbeat", Some("test-replication-token")),
         )
         .await
         .unwrap();
 
+        assert_eq!(missing_token.status, 403);
+        assert_eq!(wrong_token.status, 403);
         assert_eq!(allowed.status, 200);
         assert_eq!(denied.status, 403);
     }
