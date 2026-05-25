@@ -8,6 +8,21 @@ state to `/var/lib/gild-vault/keys.age`. The file-backed master identity lives
 at `/etc/gild/vault-master.key`; initialize it with `gild vault init` before
 starting the daemon.
 
+Replication endpoints also require a shared bearer token in
+`/etc/gild/vault-replication-token` by default. The daemon reads
+`GILD_VAULT_REPLICATION_TOKEN_FILE` to override that path. Initialize the
+authoritative node with:
+
+```bash
+gild vault init-replication-token
+```
+
+The token file is mode `0400` and owned by `gild-vault` on the authoritative.
+Copy the same file to each replica during provisioning, then set owner
+`gild-vault-replica` and mode `0400` on the replica. Every `/replication/*`
+request must come from the `gild-vault-replica` Unix peer and include
+`Authorization: Bearer <token>`.
+
 Replication metadata is persisted beside the encrypted key envelope:
 `keys.replication.json` stores the fencing epoch, monotonic version, and
 demoted/fenced state; `keys.replication.log` stores durable put entries and
