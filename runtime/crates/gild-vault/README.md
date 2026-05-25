@@ -3,9 +3,10 @@
 Privileged host-local secret daemon for Gild workloads.
 
 The daemon listens on a Unix socket, authorizes each connection with
-`SO_PEERCRED`, stores secrets in memory, and writes a tmpfs mirror to
-`/run/gild-vault/keys.json`. The tmpfs mirror is intentionally not persistent
-storage; TPM-sealed storage and lease lifetimes are future work.
+`SO_PEERCRED`, stores secrets in memory, and writes age-encrypted persistent
+state to `/var/lib/gild-vault/keys.age`. The file-backed master identity lives
+at `/etc/gild/vault-master.key`; initialize it with `gild vault init` before
+starting the daemon.
 
 ## Protocol
 
