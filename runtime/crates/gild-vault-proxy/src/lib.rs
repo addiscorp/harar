@@ -1,8 +1,15 @@
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use gild_vault_client::{VaultClient, VaultClientError};
 use serde::{Deserialize, Serialize};
 
@@ -10,6 +17,7 @@ use serde::{Deserialize, Serialize};
 pub struct AppState {
     token: String,
     vault: VaultClient,
+    audit_log_path: Option<PathBuf>,
 }
 
 impl AppState {
@@ -17,7 +25,13 @@ impl AppState {
         Self {
             token: token.into(),
             vault,
+            audit_log_path: None,
         }
+    }
+
+    pub fn with_audit_log_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.audit_log_path = Some(path.into());
+        self
     }
 }
 
@@ -28,11 +42,68 @@ pub fn app(state: AppState) -> Router {
         .route("/api/vault/get", post(get_secret))
         .route("/api/vault/put", post(put_secret))
         .route("/api/vault/delete", post(delete_secret))
+        .layer(middleware::from_fn_with_state(state.clone(), audit_request))
         .with_state(state)
 }
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { ok: true })
+}
+
+async fn audit_request(
+    State(state): State<AppState>,
+    peer: Option<Extension<RequestPeer>>,
+    request: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let method = request.method().to_string();
+    let path = request.uri().path().to_string();
+    let peer = peer.map(|Extension(peer)| peer);
+    let response = next.run(request).await;
+    if let Some(path_buf) = state.audit_log_path.as_ref() {
+        let peer_addr = peer.as_ref().and_then(|peer| peer.remote_addr);
+        let event = AuditEvent {
+            ts_unix_ms: now_unix_ms(),
+            method: &method,
+            path: &path,
+            status: response.status().as_u16(),
+            peer_addr: peer_addr.as_ref(),
+            tls_client_cn: peer.as_ref().and_then(|peer| peer.tls_client_cn.as_deref()),
+        };
+        if let Err(err) = append_audit(path_buf, &event) {
+            eprintln!("gild-vault-proxy audit write failed: {err}");
+        }
+    }
+    response
+}
+
+fn append_audit(path: &PathBuf, event: &AuditEvent<'_>) -> std::io::Result<()> {
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    serde_json::to_writer(&mut file, event)?;
+    file.write_all(b"\n")
+}
+
+fn now_unix_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestPeer {
+    pub remote_addr: Option<SocketAddr>,
+    pub tls_client_cn: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AuditEvent<'a> {
+    ts_unix_ms: u128,
+    method: &'a str,
+    path: &'a str,
+    status: u16,
+    peer_addr: Option<&'a SocketAddr>,
+    tls_client_cn: Option<&'a str>,
 }
 
 async fn list(
