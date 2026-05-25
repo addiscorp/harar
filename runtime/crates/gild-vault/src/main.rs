@@ -24,6 +24,7 @@ const DEFAULT_PROMOTE_AFTER_FAILURES: u32 = 5;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_HTTP_RESPONSE_BYTES: usize = 1024 * 1024;
+const PROMOTION_EPOCH_BUMP: u64 = 1000;
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -128,11 +129,15 @@ struct AppState {
     keys: Mutex<HashMap<String, String>>,
     started_at: Instant,
     state_path: PathBuf,
+    replication_meta_path: PathBuf,
+    replication_log_path: PathBuf,
     audit_log_path: PathBuf,
     master_recipient: age::x25519::Recipient,
     master_identity: age::x25519::Identity,
     mode: Mutex<Mode>,
+    epoch: Mutex<u64>,
     version: Mutex<u64>,
+    fenced: Mutex<bool>,
     replication_log: Mutex<Vec<ReplicationLogEntry>>,
 }
 
@@ -142,22 +147,34 @@ struct ReplicationLogEntry {
     timestamp: u64,
     op: String,
     key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ReplicationMeta {
+    epoch: u64,
+    version: u64,
+    fenced: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct SnapshotResponse {
+    epoch: u64,
     version: u64,
     snapshot: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct SinceResponse {
+    epoch: u64,
     version: u64,
     entries: Vec<ReplicationLogEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct HeartbeatResponse {
+    epoch: u64,
     version: u64,
     uptime_seconds: u64,
 }
@@ -260,16 +277,24 @@ async fn main() -> Result<()> {
     let master_key = master_key::load_master_key()?;
     let master_recipient = master_key.to_public();
     let keys = load_keys(&config.state_path, &master_key)?;
+    let replication_meta_path = replication_meta_path(&config.state_path);
+    let replication_log_path = replication_log_path(&config.state_path);
+    let meta = load_replication_meta(&replication_meta_path)?;
+    let replication_log = load_replication_log(&replication_log_path)?;
     let state = Arc::new(AppState {
         keys: Mutex::new(keys),
         started_at: Instant::now(),
         state_path: config.state_path.clone(),
+        replication_meta_path,
+        replication_log_path,
         audit_log_path: config.audit_log_path.clone(),
         master_recipient,
         master_identity: master_key,
         mode: Mutex::new(config.mode),
-        version: Mutex::new(0),
-        replication_log: Mutex::new(Vec::new()),
+        epoch: Mutex::new(meta.epoch),
+        version: Mutex::new(meta.version),
+        fenced: Mutex::new(meta.fenced),
+        replication_log: Mutex::new(replication_log),
     });
 
     if config.mode == Mode::Replica {
@@ -278,6 +303,8 @@ async fn main() -> Result<()> {
         })?;
         attach_replica(&state, &upstream_url).await?;
         spawn_replica_loops(&config, Arc::clone(&state), upstream_url);
+    } else if let Some(upstream_url) = config.upstream_url.clone() {
+        reconcile_authoritative_with_upstream(&state, &upstream_url).await?;
     }
 
     serve(config, state).await
@@ -446,6 +473,7 @@ async fn handle_replication_http_request(
         }
         "/replication/heartbeat" => {
             let response = HeartbeatResponse {
+                epoch: *state.epoch.lock().await,
                 version: *state.version.lock().await,
                 uptime_seconds: state.started_at.elapsed().as_secs(),
             };
@@ -460,6 +488,12 @@ async fn handle_replication_http_request(
                 Err(_) => return Ok(HttpReply::json_error(400, "bad version")),
             };
             let version = *state.version.lock().await;
+            if since > version {
+                return Ok(HttpReply::json_error(
+                    409,
+                    "replica version is ahead of authoritative",
+                ));
+            }
             let entries = state
                 .replication_log
                 .lock()
@@ -470,7 +504,11 @@ async fn handle_replication_http_request(
                 .collect::<Vec<_>>();
             Ok(HttpReply::json_value(
                 200,
-                serde_json::to_value(SinceResponse { version, entries })?,
+                serde_json::to_value(SinceResponse {
+                    epoch: *state.epoch.lock().await,
+                    version,
+                    entries,
+                })?,
             ))
         }
     }
@@ -492,16 +530,21 @@ async fn handle_request(
     if matches!(
         request,
         VaultRequest::Put { .. } | VaultRequest::Delete { .. }
-    ) && *state.mode.lock().await == Mode::Replica
-    {
-        audit(
-            state,
-            op,
-            key_for_audit.as_deref(),
-            peer,
-            "replica_read_only",
-        )?;
-        return Ok(VaultResponse::error("replica_read_only"));
+    ) {
+        if *state.mode.lock().await == Mode::Replica {
+            audit(
+                state,
+                op,
+                key_for_audit.as_deref(),
+                peer,
+                "replica_read_only",
+            )?;
+            return Ok(VaultResponse::error("replica_read_only"));
+        }
+        if *state.fenced.lock().await {
+            audit(state, op, key_for_audit.as_deref(), peer, "demoted_fenced")?;
+            return Ok(VaultResponse::error("demoted_fenced"));
+        }
     }
 
     let response = match request {
@@ -519,7 +562,7 @@ async fn handle_request(
             let mut keys = state.keys.lock().await;
             keys.insert(key.clone(), value);
             persist_keys(&state.state_path, &state.master_recipient, &keys)?;
-            append_replication_log(state, "put", &key).await?;
+            append_replication_log(state, "put", &key, keys.get(&key).cloned()).await?;
             VaultResponse::ok()
         }
         VaultRequest::List { shop_id } => {
@@ -539,7 +582,7 @@ async fn handle_request(
             let mut keys = state.keys.lock().await;
             keys.remove(&key);
             persist_keys(&state.state_path, &state.master_recipient, &keys)?;
-            append_replication_log(state, "delete", &key).await?;
+            append_replication_log(state, "delete", &key, None).await?;
             VaultResponse::ok()
         }
         VaultRequest::Health => {
@@ -607,19 +650,31 @@ impl HttpReply {
     }
 }
 
-async fn append_replication_log(state: &AppState, op: &str, key: &str) -> Result<()> {
+async fn append_replication_log(
+    state: &AppState,
+    op: &str,
+    key: &str,
+    value: Option<String>,
+) -> Result<()> {
     let mut version = state.version.lock().await;
     *version += 1;
-    state
-        .replication_log
-        .lock()
-        .await
-        .push(ReplicationLogEntry {
+    let entry = ReplicationLogEntry {
+        version: *version,
+        timestamp: now_epoch_seconds()?,
+        op: op.to_string(),
+        key: key.to_string(),
+        value,
+    };
+    append_persistent_replication_log(&state.replication_log_path, &entry)?;
+    state.replication_log.lock().await.push(entry);
+    persist_replication_meta(
+        &state.replication_meta_path,
+        ReplicationMeta {
+            epoch: *state.epoch.lock().await,
             version: *version,
-            timestamp: now_epoch_seconds()?,
-            op: op.to_string(),
-            key: key.to_string(),
-        });
+            fenced: *state.fenced.lock().await,
+        },
+    )?;
     Ok(())
 }
 
@@ -629,6 +684,7 @@ async fn snapshot_response(state: &AppState) -> Result<SnapshotResponse> {
         persist_keys(&state.state_path, &state.master_recipient, &keys)?;
     }
     Ok(SnapshotResponse {
+        epoch: *state.epoch.lock().await,
         version: *state.version.lock().await,
         snapshot: fs::read(&state.state_path)
             .with_context(|| format!("read {}", state.state_path.display()))?,
@@ -663,8 +719,13 @@ async fn apply_snapshot(state: &AppState, snapshot: SnapshotResponse) -> Result<
 
     let keys = load_keys(&state.state_path, &state.master_identity)?;
     *state.keys.lock().await = keys;
+    *state.epoch.lock().await = snapshot.epoch;
     *state.version.lock().await = snapshot.version;
+    *state.fenced.lock().await = false;
     state.replication_log.lock().await.clear();
+    fs::write(&state.replication_log_path, b"")
+        .with_context(|| format!("truncate {}", state.replication_log_path.display()))?;
+    persist_current_replication_meta(state).await?;
     Ok(())
 }
 
@@ -702,7 +763,14 @@ async fn heartbeat_loop(
             return;
         }
         match replication_post_json::<HeartbeatResponse>(&upstream_url, "/heartbeat").await {
-            Ok(_) => failures = 0,
+            Ok(response) => {
+                failures = 0;
+                if let Err(err) =
+                    adopt_higher_epoch_if_needed(&state, response.epoch, &upstream_url).await
+                {
+                    eprintln!("gild-vault replica epoch reconciliation failed: {err:#}");
+                }
+            }
             Err(err) => {
                 failures += 1;
                 eprintln!("gild-vault replica heartbeat failed ({failures}): {err:#}");
@@ -727,11 +795,26 @@ async fn sync_loop(state: Arc<AppState>, upstream_url: String, interval: Duratio
         let endpoint = format!("/since/{version}");
         match replication_post_json::<SinceResponse>(&upstream_url, &endpoint).await {
             Ok(response) if response.entries.is_empty() => {
+                if let Err(err) =
+                    adopt_higher_epoch_if_needed(&state, response.epoch, &upstream_url).await
+                {
+                    eprintln!("gild-vault replica epoch reconciliation failed: {err:#}");
+                    continue;
+                }
                 *state.version.lock().await = response.version;
+                if let Err(err) = persist_current_replication_meta(&state).await {
+                    eprintln!("gild-vault replica metadata persist failed: {err:#}");
+                }
             }
-            Ok(_) => {
-                if let Err(err) = attach_replica(&state, &upstream_url).await {
-                    eprintln!("gild-vault replica snapshot refresh failed: {err:#}");
+            Ok(response) => {
+                if let Err(err) =
+                    adopt_higher_epoch_if_needed(&state, response.epoch, &upstream_url).await
+                {
+                    eprintln!("gild-vault replica epoch reconciliation failed: {err:#}");
+                    continue;
+                }
+                if let Err(err) = apply_replication_entries(&state, response).await {
+                    eprintln!("gild-vault replica log apply failed: {err:#}");
                 }
             }
             Err(err) => eprintln!("gild-vault replica sync failed: {err:#}"),
@@ -741,6 +824,12 @@ async fn sync_loop(state: Arc<AppState>, upstream_url: String, interval: Duratio
 
 async fn promote_replica(state: &AppState) -> Result<()> {
     *state.mode.lock().await = Mode::Authoritative;
+    {
+        let mut epoch = state.epoch.lock().await;
+        *epoch += PROMOTION_EPOCH_BUMP;
+    }
+    *state.fenced.lock().await = false;
+    persist_current_replication_meta(state).await?;
     append_audit(
         &state.audit_log_path,
         &AuditEvent {
@@ -752,6 +841,76 @@ async fn promote_replica(state: &AppState) -> Result<()> {
             result: "PROMOTED",
         },
     )
+}
+
+async fn reconcile_authoritative_with_upstream(state: &AppState, upstream_url: &str) -> Result<()> {
+    let response: HeartbeatResponse = replication_post_json(upstream_url, "/heartbeat")
+        .await
+        .context("fetch upstream heartbeat for fencing reconciliation")?;
+    let local_epoch = *state.epoch.lock().await;
+    if response.epoch > local_epoch {
+        attach_replica(state, upstream_url).await?;
+        demote_for_higher_epoch(state, response.epoch).await?;
+    }
+    Ok(())
+}
+
+async fn adopt_higher_epoch_if_needed(
+    state: &AppState,
+    upstream_epoch: u64,
+    upstream_url: &str,
+) -> Result<()> {
+    let local_epoch = *state.epoch.lock().await;
+    if upstream_epoch > local_epoch {
+        demote_for_higher_epoch(state, upstream_epoch).await?;
+        attach_replica(state, upstream_url).await?;
+    }
+    Ok(())
+}
+
+async fn demote_for_higher_epoch(state: &AppState, upstream_epoch: u64) -> Result<()> {
+    *state.mode.lock().await = Mode::Replica;
+    *state.fenced.lock().await = true;
+    *state.epoch.lock().await = upstream_epoch;
+    persist_current_replication_meta(state).await?;
+    append_audit(
+        &state.audit_log_path,
+        &AuditEvent {
+            ts: now_epoch_seconds()?,
+            op: "demote",
+            key: None,
+            peer_uid: unsafe { libc::geteuid() },
+            peer_pid: std::process::id() as i32,
+            result: "DEMOTED_HIGHER_EPOCH",
+        },
+    )
+}
+
+async fn apply_replication_entries(state: &AppState, response: SinceResponse) -> Result<()> {
+    let mut keys = state.keys.lock().await;
+    for entry in &response.entries {
+        match entry.op.as_str() {
+            "put" => {
+                let value = entry
+                    .value
+                    .clone()
+                    .ok_or_else(|| anyhow!("put replication entry missing value"))?;
+                keys.insert(entry.key.clone(), value);
+            }
+            "delete" => {
+                keys.remove(&entry.key);
+            }
+            op => return Err(anyhow!("unknown replication op {op}")),
+        }
+    }
+    persist_keys(&state.state_path, &state.master_recipient, &keys)?;
+    drop(keys);
+
+    *state.epoch.lock().await = response.epoch;
+    *state.version.lock().await = response.version;
+    *state.fenced.lock().await = false;
+    persist_current_replication_meta(state).await?;
+    Ok(())
 }
 
 async fn replication_post_json<T: for<'de> Deserialize<'de>>(
@@ -1099,6 +1258,114 @@ fn load_keys(path: &Path, identity: &age::x25519::Identity) -> Result<HashMap<St
     }
 }
 
+fn replication_meta_path(state_path: &Path) -> PathBuf {
+    state_path.with_extension("replication.json")
+}
+
+fn replication_log_path(state_path: &Path) -> PathBuf {
+    state_path.with_extension("replication.log")
+}
+
+fn load_replication_meta(path: &Path) -> Result<ReplicationMeta> {
+    match fs::read(path) {
+        Ok(bytes) if bytes.is_empty() => Ok(ReplicationMeta {
+            epoch: 0,
+            version: 0,
+            fenced: false,
+        }),
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes).with_context(|| format!("decode {}", path.display()))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(ReplicationMeta {
+            epoch: 0,
+            version: 0,
+            fenced: false,
+        }),
+        Err(err) => Err(err).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+fn persist_replication_meta(path: &Path, meta: ReplicationMeta) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Err(anyhow!("replication metadata path must have a parent"));
+    };
+    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o750))
+        .with_context(|| format!("chmod 0750 {}", parent.display()))?;
+    try_chown(parent, Some("gild-vault"), Some("gild"));
+
+    let tmp_path = path.with_extension(format!("replication.json.tmp.{}", std::process::id()));
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&tmp_path)
+        .with_context(|| format!("open {}", tmp_path.display()))?;
+    try_chown(&tmp_path, Some("gild-vault"), None);
+    serde_json::to_writer(&mut file, &meta).context("encode replication metadata")?;
+    file.write_all(b"\n")
+        .context("write replication metadata newline")?;
+    file.sync_all().context("sync replication metadata")?;
+    fs::rename(&tmp_path, path)
+        .with_context(|| format!("rename {} to {}", tmp_path.display(), path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod 0600 {}", path.display()))?;
+    try_chown(path, Some("gild-vault"), None);
+    fs::File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .with_context(|| format!("sync {}", parent.display()))?;
+    Ok(())
+}
+
+async fn persist_current_replication_meta(state: &AppState) -> Result<()> {
+    persist_replication_meta(
+        &state.replication_meta_path,
+        ReplicationMeta {
+            epoch: *state.epoch.lock().await,
+            version: *state.version.lock().await,
+            fenced: *state.fenced.lock().await,
+        },
+    )
+}
+
+fn load_replication_log(path: &Path) -> Result<Vec<ReplicationLogEntry>> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+    };
+    contents
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str::<ReplicationLogEntry>(line)
+                .with_context(|| format!("decode replication log entry in {}", path.display()))
+        })
+        .collect()
+}
+
+fn append_persistent_replication_log(path: &Path, entry: &ReplicationLogEntry) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o750))
+            .with_context(|| format!("chmod 0750 {}", parent.display()))?;
+        try_chown(parent, Some("gild-vault"), Some("gild"));
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    try_chown(path, Some("gild-vault"), None);
+    serde_json::to_writer(&mut file, entry).context("encode replication log entry")?;
+    file.write_all(b"\n")
+        .context("write replication log newline")?;
+    file.sync_all().context("sync replication log")?;
+    Ok(())
+}
+
 fn persist_keys(
     path: &Path,
     recipient: &age::x25519::Recipient,
@@ -1321,6 +1588,7 @@ mod tests {
 
     fn test_state(dir: &Path) -> AppState {
         let master_key = age::x25519::Identity::generate();
+        let state_path = dir.join("keys.age");
         AppState {
             keys: Mutex::new(HashMap::from([
                 ("ANTHROPIC_API_KEY".to_string(), "sk-test".to_string()),
@@ -1328,12 +1596,16 @@ mod tests {
                 ("AGENT_IDRIS_TOKEN".to_string(), "idris-secret".to_string()),
             ])),
             started_at: Instant::now() - Duration::from_secs(5),
-            state_path: dir.join("keys.age"),
+            replication_meta_path: replication_meta_path(&state_path),
+            replication_log_path: replication_log_path(&state_path),
+            state_path,
             audit_log_path: dir.join("audit.log"),
             master_recipient: master_key.to_public(),
             master_identity: master_key,
             mode: Mutex::new(Mode::Authoritative),
+            epoch: Mutex::new(0),
             version: Mutex::new(0),
+            fenced: Mutex::new(false),
             replication_log: Mutex::new(Vec::new()),
         }
     }
@@ -1358,15 +1630,20 @@ mod tests {
     }
 
     fn state_with_key(dir: &Path, master_key: age::x25519::Identity, key: &str) -> AppState {
+        let state_path = dir.join("keys.age");
         AppState {
             keys: Mutex::new(HashMap::from([(key.to_string(), "secret".to_string())])),
             started_at: Instant::now(),
-            state_path: dir.join("keys.age"),
+            replication_meta_path: replication_meta_path(&state_path),
+            replication_log_path: replication_log_path(&state_path),
+            state_path,
             audit_log_path: dir.join("audit.log"),
             master_recipient: master_key.to_public(),
             master_identity: master_key,
             mode: Mutex::new(Mode::Authoritative),
+            epoch: Mutex::new(0),
             version: Mutex::new(0),
+            fenced: Mutex::new(false),
             replication_log: Mutex::new(Vec::new()),
         }
     }
@@ -1646,6 +1923,7 @@ mod tests {
     async fn runtime_list_with_shop_id_only_returns_that_shop() {
         let dir = tempdir().unwrap();
         let master_key = age::x25519::Identity::generate();
+        let state_path = dir.path().join("keys.age");
         let state = AppState {
             keys: Mutex::new(HashMap::from([
                 ("shops/shop_a/SECRET".to_string(), "a".to_string()),
@@ -1653,12 +1931,16 @@ mod tests {
                 ("AGENT_AMINA_TOKEN".to_string(), "amina".to_string()),
             ])),
             started_at: Instant::now(),
-            state_path: dir.path().join("keys.age"),
+            replication_meta_path: replication_meta_path(&state_path),
+            replication_log_path: replication_log_path(&state_path),
+            state_path,
             audit_log_path: dir.path().join("audit.log"),
             master_recipient: master_key.to_public(),
             master_identity: master_key,
             mode: Mutex::new(Mode::Authoritative),
+            epoch: Mutex::new(0),
             version: Mutex::new(0),
+            fenced: Mutex::new(false),
             replication_log: Mutex::new(Vec::new()),
         };
 
@@ -1857,15 +2139,20 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
+        let replica_state_path = dir.path().join("replica.keys.age");
         let replica_state = Arc::new(AppState {
             keys: Mutex::new(HashMap::new()),
             started_at: Instant::now(),
-            state_path: dir.path().join("replica.keys.age"),
+            replication_meta_path: replication_meta_path(&replica_state_path),
+            replication_log_path: replication_log_path(&replica_state_path),
+            state_path: replica_state_path,
             audit_log_path: dir.path().join("replica.audit.log"),
             master_recipient: master_key.to_public(),
             master_identity: master_key,
             mode: Mutex::new(Mode::Replica),
+            epoch: Mutex::new(0),
             version: Mutex::new(0),
+            fenced: Mutex::new(false),
             replication_log: Mutex::new(Vec::new()),
         });
         attach_replica(
@@ -1892,6 +2179,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let state = Arc::new(test_state(dir.path()));
         *state.mode.lock().await = Mode::Replica;
+        *state.epoch.lock().await = 12;
 
         heartbeat_loop(
             Arc::clone(&state),
@@ -1905,11 +2193,198 @@ mod tests {
         .await;
 
         assert_eq!(*state.mode.lock().await, Mode::Authoritative);
+        assert_eq!(*state.epoch.lock().await, 12 + PROMOTION_EPOCH_BUMP);
         assert!(
             fs::read_to_string(dir.path().join("audit.log"))
                 .unwrap()
                 .contains("PROMOTED")
         );
+    }
+
+    #[tokio::test]
+    async fn replication_version_and_log_persist_across_restart() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path());
+
+        let response = handle_request(
+            &state,
+            &peer(0, "root"),
+            VaultRequest::Put {
+                key: "NEW_SECRET".to_string(),
+                value: "new-value".to_string(),
+                shop_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(response.ok);
+        let meta = load_replication_meta(&state.replication_meta_path).unwrap();
+        let log = load_replication_log(&state.replication_log_path).unwrap();
+        assert_eq!(meta.version, 1);
+        assert_eq!(meta.epoch, 0);
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].version, 1);
+        assert_eq!(log[0].op, "put");
+        assert_eq!(log[0].value.as_deref(), Some("new-value"));
+    }
+
+    #[tokio::test]
+    async fn tombstone_replication_deletes_local_replica_key() {
+        let dir = tempdir().unwrap();
+        let authoritative = test_state(&dir.path().join("authoritative"));
+        let response = handle_request(
+            &authoritative,
+            &peer(0, "root"),
+            VaultRequest::Delete {
+                key: "ANTHROPIC_API_KEY".to_string(),
+                shop_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(response.ok);
+
+        let entries = authoritative.replication_log.lock().await.clone();
+        let replica = test_state(&dir.path().join("replica"));
+        apply_replication_entries(
+            &replica,
+            SinceResponse {
+                epoch: *authoritative.epoch.lock().await,
+                version: *authoritative.version.lock().await,
+                entries,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!replica.keys.lock().await.contains_key("ANTHROPIC_API_KEY"));
+        assert_eq!(*replica.version.lock().await, 1);
+    }
+
+    #[tokio::test]
+    async fn since_refuses_replica_version_ahead_of_authoritative() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path());
+        *state.version.lock().await = 3;
+
+        let reply = handle_replication_http_request(
+            &state,
+            &peer(2000, "gild-vault-replica"),
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: "/replication/since/4".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reply.status, 409);
+        assert_eq!(
+            reply.body,
+            serde_json::json!({ "error": "replica version is ahead of authoritative" })
+        );
+    }
+
+    #[tokio::test]
+    async fn higher_epoch_demotes_and_fences_authoritative() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path());
+        *state.mode.lock().await = Mode::Authoritative;
+        *state.epoch.lock().await = 4;
+
+        demote_for_higher_epoch(&state, 1004).await.unwrap();
+
+        assert_eq!(*state.mode.lock().await, Mode::Replica);
+        assert_eq!(*state.epoch.lock().await, 1004);
+        assert!(*state.fenced.lock().await);
+        let meta = load_replication_meta(&state.replication_meta_path).unwrap();
+        assert_eq!(meta.epoch, 1004);
+        assert!(meta.fenced);
+    }
+
+    #[tokio::test]
+    async fn recovering_authoritative_demotes_after_higher_epoch_snapshot() {
+        let dir = tempdir().unwrap();
+        let master_key = age::x25519::Identity::generate();
+        let canonical = Arc::new(state_with_key(
+            &dir.path().join("canonical"),
+            master_key.clone(),
+            "CANONICAL_ONLY",
+        ));
+        *canonical.epoch.lock().await = 1005;
+        *canonical.version.lock().await = 7;
+        let canonical_keys = canonical.keys.lock().await;
+        persist_keys(
+            &canonical.state_path,
+            &canonical.master_recipient,
+            &canonical_keys,
+        )
+        .unwrap();
+        drop(canonical_keys);
+
+        let mut canonical_config = test_config(dir.path(), "canonical.sock");
+        canonical_config.state_path = canonical.state_path.clone();
+        canonical_config.audit_log_path = canonical.audit_log_path.clone();
+        let server = tokio::spawn({
+            let canonical = Arc::clone(&canonical);
+            async move {
+                serve(canonical_config, canonical).await.unwrap();
+            }
+        });
+
+        for _ in 0..50 {
+            if dir.path().join("canonical.sock").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let recovered = state_with_key(&dir.path().join("recovered"), master_key, "STALE_ONLY");
+        *recovered.mode.lock().await = Mode::Authoritative;
+        *recovered.epoch.lock().await = 5;
+        reconcile_authoritative_with_upstream(
+            &recovered,
+            &format!(
+                "unix://{}:/replication",
+                dir.path().join("canonical.sock").display()
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*recovered.mode.lock().await, Mode::Replica);
+        assert_eq!(*recovered.epoch.lock().await, 1005);
+        assert_eq!(*recovered.version.lock().await, 7);
+        assert!(*recovered.fenced.lock().await);
+        assert!(recovered.keys.lock().await.contains_key("CANONICAL_ONLY"));
+        assert!(!recovered.keys.lock().await.contains_key("STALE_ONLY"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fenced_authoritative_refuses_writes_until_reset() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path());
+        *state.mode.lock().await = Mode::Authoritative;
+        *state.fenced.lock().await = true;
+
+        let response = handle_request(
+            &state,
+            &peer(0, "root"),
+            VaultRequest::Put {
+                key: "FENCED_WRITE".to_string(),
+                value: "nope".to_string(),
+                shop_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!response.ok);
+        assert_eq!(response.error.as_deref(), Some("demoted_fenced"));
+        assert!(!state.keys.lock().await.contains_key("FENCED_WRITE"));
     }
 
     #[tokio::test]
