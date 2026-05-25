@@ -8,9 +8,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::{TcpStream, UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
 mod master_key;
@@ -18,14 +18,23 @@ mod master_key;
 const DEFAULT_SOCKET_PATH: &str = "/run/gild-vault.sock";
 const DEFAULT_STATE_PATH: &str = "/var/lib/gild-vault/keys.age";
 const DEFAULT_AUDIT_LOG_PATH: &str = "/var/log/gild-vault.log";
+const DEFAULT_HEARTBEAT_INTERVAL_SECONDS: u64 = 5;
+const DEFAULT_SYNC_INTERVAL_SECONDS: u64 = 30;
+const DEFAULT_PROMOTE_AFTER_FAILURES: u32 = 5;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
+const MAX_HTTP_RESPONSE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct Config {
     socket_path: PathBuf,
     state_path: PathBuf,
     audit_log_path: PathBuf,
+    mode: Mode,
+    upstream_url: Option<String>,
+    heartbeat_interval: Duration,
+    sync_interval: Duration,
+    promote_after_failures: u32,
 }
 
 impl Config {
@@ -34,6 +43,20 @@ impl Config {
             socket_path: env_path("GILD_VAULT_SOCKET", DEFAULT_SOCKET_PATH),
             state_path: env_path("GILD_VAULT_STATE_PATH", DEFAULT_STATE_PATH),
             audit_log_path: env_path("GILD_VAULT_AUDIT_LOG", DEFAULT_AUDIT_LOG_PATH),
+            mode: env_mode("GILD_VAULT_MODE").unwrap_or(Mode::Authoritative),
+            upstream_url: std::env::var("GILD_VAULT_UPSTREAM").ok(),
+            heartbeat_interval: Duration::from_secs(env_u64(
+                "GILD_VAULT_HEARTBEAT_SECONDS",
+                DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+            )),
+            sync_interval: Duration::from_secs(env_u64(
+                "GILD_VAULT_SYNC_SECONDS",
+                DEFAULT_SYNC_INTERVAL_SECONDS,
+            )),
+            promote_after_failures: env_u64(
+                "GILD_VAULT_PROMOTE_AFTER_FAILURES",
+                DEFAULT_PROMOTE_AFTER_FAILURES as u64,
+            ) as u32,
         };
 
         let mut args = std::env::args().skip(1);
@@ -54,6 +77,31 @@ impl Config {
                         config.audit_log_path = PathBuf::from(value);
                     }
                 }
+                "--mode" => {
+                    if let Some(value) = args.next() {
+                        config.mode = parse_mode(&value).unwrap_or(Mode::Authoritative);
+                    }
+                }
+                "--upstream-url" => {
+                    if let Some(value) = args.next() {
+                        config.upstream_url = Some(value);
+                    }
+                }
+                "--heartbeat-seconds" => {
+                    if let Some(value) = args.next().and_then(|value| value.parse().ok()) {
+                        config.heartbeat_interval = Duration::from_secs(value);
+                    }
+                }
+                "--sync-seconds" => {
+                    if let Some(value) = args.next().and_then(|value| value.parse().ok()) {
+                        config.sync_interval = Duration::from_secs(value);
+                    }
+                }
+                "--promote-after-failures" => {
+                    if let Some(value) = args.next().and_then(|value| value.parse().ok()) {
+                        config.promote_after_failures = value;
+                    }
+                }
                 _ => {}
             }
         }
@@ -62,13 +110,56 @@ impl Config {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Authoritative,
+    Replica,
+}
+
+fn parse_mode(value: &str) -> Option<Mode> {
+    match value {
+        "authoritative" => Some(Mode::Authoritative),
+        "replica" => Some(Mode::Replica),
+        _ => None,
+    }
+}
+
 struct AppState {
     keys: Mutex<HashMap<String, String>>,
     started_at: Instant,
     state_path: PathBuf,
     audit_log_path: PathBuf,
     master_recipient: age::x25519::Recipient,
+    master_identity: age::x25519::Identity,
+    mode: Mutex<Mode>,
+    version: Mutex<u64>,
+    replication_log: Mutex<Vec<ReplicationLogEntry>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ReplicationLogEntry {
+    version: u64,
+    timestamp: u64,
+    op: String,
+    key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SnapshotResponse {
+    version: u64,
+    snapshot: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SinceResponse {
+    version: u64,
+    entries: Vec<ReplicationLogEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct HeartbeatResponse {
+    version: u64,
+    uptime_seconds: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -175,7 +266,19 @@ async fn main() -> Result<()> {
         state_path: config.state_path.clone(),
         audit_log_path: config.audit_log_path.clone(),
         master_recipient,
+        master_identity: master_key,
+        mode: Mutex::new(config.mode),
+        version: Mutex::new(0),
+        replication_log: Mutex::new(Vec::new()),
     });
+
+    if config.mode == Mode::Replica {
+        let upstream_url = config.upstream_url.clone().ok_or_else(|| {
+            anyhow!("--upstream-url or GILD_VAULT_UPSTREAM is required in replica mode")
+        })?;
+        attach_replica(&state, &upstream_url).await?;
+        spawn_replica_loops(&config, Arc::clone(&state), upstream_url);
+    }
 
     serve(config, state).await
 }
@@ -279,8 +382,13 @@ async fn handle_http_request(
     request_bytes: &[u8],
 ) -> Result<HttpReply> {
     let request = parse_http_request(request_bytes)?;
+
+    if request.path.starts_with("/replication/") {
+        return handle_replication_http_request(state, peer, &request).await;
+    }
+
     if request.method != "GET" {
-        return Ok(HttpReply::json(405, "method not allowed"));
+        return Ok(HttpReply::json_error(405, "method not allowed"));
     }
 
     let Some(key) = request
@@ -288,7 +396,7 @@ async fn handle_http_request(
         .strip_prefix("/v1/secret/")
         .filter(|key| !key.is_empty())
     else {
-        return Ok(HttpReply::json(404, "not found"));
+        return Ok(HttpReply::json_error(404, "not found"));
     };
 
     let response = handle_request(
@@ -306,10 +414,65 @@ async fn handle_http_request(
             200,
             serde_json::json!({ "value": value }),
         )),
-        (false, _, Some("not_found")) => Ok(HttpReply::json(404, "secret not found")),
-        (false, _, Some("forbidden")) => Ok(HttpReply::json(403, "forbidden")),
-        (false, _, Some(error)) => Ok(HttpReply::json(500, error)),
-        _ => Ok(HttpReply::json(500, "invalid response")),
+        (false, _, Some("not_found")) => Ok(HttpReply::json_error(404, "secret not found")),
+        (false, _, Some("forbidden")) => Ok(HttpReply::json_error(403, "forbidden")),
+        (false, _, Some("replica_read_only")) => {
+            Ok(HttpReply::json_error(409, "replica read-only"))
+        }
+        (false, _, Some(error)) => Ok(HttpReply::json_error(500, error)),
+        _ => Ok(HttpReply::json_error(500, "invalid response")),
+    }
+}
+
+async fn handle_replication_http_request(
+    state: &AppState,
+    peer: &PeerCred,
+    request: &HttpRequest,
+) -> Result<HttpReply> {
+    if request.method != "POST" {
+        return Ok(HttpReply::json_error(405, "method not allowed"));
+    }
+    if !is_replica(peer) {
+        return Ok(HttpReply::json_error(403, "forbidden"));
+    }
+    if *state.mode.lock().await != Mode::Authoritative {
+        return Ok(HttpReply::json_error(409, "not authoritative"));
+    }
+
+    match request.path.as_str() {
+        "/replication/snapshot" => {
+            let snapshot = snapshot_response(state).await?;
+            Ok(HttpReply::json_value(200, serde_json::to_value(snapshot)?))
+        }
+        "/replication/heartbeat" => {
+            let response = HeartbeatResponse {
+                version: *state.version.lock().await,
+                uptime_seconds: state.started_at.elapsed().as_secs(),
+            };
+            Ok(HttpReply::json_value(200, serde_json::to_value(response)?))
+        }
+        _ => {
+            let Some(raw_version) = request.path.strip_prefix("/replication/since/") else {
+                return Ok(HttpReply::json_error(404, "not found"));
+            };
+            let since = match raw_version.parse::<u64>() {
+                Ok(version) => version,
+                Err(_) => return Ok(HttpReply::json_error(400, "bad version")),
+            };
+            let version = *state.version.lock().await;
+            let entries = state
+                .replication_log
+                .lock()
+                .await
+                .iter()
+                .filter(|entry| entry.version > since)
+                .cloned()
+                .collect::<Vec<_>>();
+            Ok(HttpReply::json_value(
+                200,
+                serde_json::to_value(SinceResponse { version, entries })?,
+            ))
+        }
     }
 }
 
@@ -326,6 +489,21 @@ async fn handle_request(
         return Ok(VaultResponse::error(reason));
     }
 
+    if matches!(
+        request,
+        VaultRequest::Put { .. } | VaultRequest::Delete { .. }
+    ) && *state.mode.lock().await == Mode::Replica
+    {
+        audit(
+            state,
+            op,
+            key_for_audit.as_deref(),
+            peer,
+            "replica_read_only",
+        )?;
+        return Ok(VaultResponse::error("replica_read_only"));
+    }
+
     let response = match request {
         VaultRequest::Get { key, .. } => {
             let keys = state.keys.lock().await;
@@ -339,8 +517,9 @@ async fn handle_request(
         }
         VaultRequest::Put { key, value, .. } => {
             let mut keys = state.keys.lock().await;
-            keys.insert(key, value);
+            keys.insert(key.clone(), value);
             persist_keys(&state.state_path, &state.master_recipient, &keys)?;
+            append_replication_log(state, "put", &key).await?;
             VaultResponse::ok()
         }
         VaultRequest::List { shop_id } => {
@@ -360,6 +539,7 @@ async fn handle_request(
             let mut keys = state.keys.lock().await;
             keys.remove(&key);
             persist_keys(&state.state_path, &state.master_recipient, &keys)?;
+            append_replication_log(state, "delete", &key).await?;
             VaultResponse::ok()
         }
         VaultRequest::Health => {
@@ -418,13 +598,301 @@ struct HttpReply {
 }
 
 impl HttpReply {
-    fn json(status: u16, error: &str) -> Self {
+    fn json_error(status: u16, error: &str) -> Self {
         Self::json_value(status, serde_json::json!({ "error": error }))
     }
 
     fn json_value(status: u16, body: serde_json::Value) -> Self {
         Self { status, body }
     }
+}
+
+async fn append_replication_log(state: &AppState, op: &str, key: &str) -> Result<()> {
+    let mut version = state.version.lock().await;
+    *version += 1;
+    state
+        .replication_log
+        .lock()
+        .await
+        .push(ReplicationLogEntry {
+            version: *version,
+            timestamp: now_epoch_seconds()?,
+            op: op.to_string(),
+            key: key.to_string(),
+        });
+    Ok(())
+}
+
+async fn snapshot_response(state: &AppState) -> Result<SnapshotResponse> {
+    if !state.state_path.exists() {
+        let keys = state.keys.lock().await;
+        persist_keys(&state.state_path, &state.master_recipient, &keys)?;
+    }
+    Ok(SnapshotResponse {
+        version: *state.version.lock().await,
+        snapshot: fs::read(&state.state_path)
+            .with_context(|| format!("read {}", state.state_path.display()))?,
+    })
+}
+
+async fn attach_replica(state: &AppState, upstream_url: &str) -> Result<()> {
+    let snapshot: SnapshotResponse = replication_post_json(upstream_url, "/snapshot")
+        .await
+        .context("fetch replication snapshot")?;
+    apply_snapshot(state, snapshot).await
+}
+
+async fn apply_snapshot(state: &AppState, snapshot: SnapshotResponse) -> Result<()> {
+    if let Some(parent) = state.state_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let tmp_path = state
+        .state_path
+        .with_extension(format!("age.replica.tmp.{}", std::process::id()));
+    fs::write(&tmp_path, &snapshot.snapshot)
+        .with_context(|| format!("write {}", tmp_path.display()))?;
+    fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod 0600 {}", tmp_path.display()))?;
+    fs::rename(&tmp_path, &state.state_path).with_context(|| {
+        format!(
+            "rename {} to {}",
+            tmp_path.display(),
+            state.state_path.display()
+        )
+    })?;
+
+    let keys = load_keys(&state.state_path, &state.master_identity)?;
+    *state.keys.lock().await = keys;
+    *state.version.lock().await = snapshot.version;
+    state.replication_log.lock().await.clear();
+    Ok(())
+}
+
+fn spawn_replica_loops(config: &Config, state: Arc<AppState>, upstream_url: String) {
+    let heartbeat_state = Arc::clone(&state);
+    let heartbeat_url = upstream_url.clone();
+    let heartbeat_interval = config.heartbeat_interval;
+    let promote_after_failures = config.promote_after_failures;
+    tokio::spawn(async move {
+        heartbeat_loop(
+            heartbeat_state,
+            heartbeat_url,
+            heartbeat_interval,
+            promote_after_failures,
+        )
+        .await;
+    });
+
+    let sync_interval = config.sync_interval;
+    tokio::spawn(async move {
+        sync_loop(state, upstream_url, sync_interval).await;
+    });
+}
+
+async fn heartbeat_loop(
+    state: Arc<AppState>,
+    upstream_url: String,
+    interval: Duration,
+    promote_after_failures: u32,
+) {
+    let mut failures = 0_u32;
+    loop {
+        tokio::time::sleep(interval).await;
+        if *state.mode.lock().await == Mode::Authoritative {
+            return;
+        }
+        match replication_post_json::<HeartbeatResponse>(&upstream_url, "/heartbeat").await {
+            Ok(_) => failures = 0,
+            Err(err) => {
+                failures += 1;
+                eprintln!("gild-vault replica heartbeat failed ({failures}): {err:#}");
+                if failures >= promote_after_failures {
+                    if let Err(err) = promote_replica(&state).await {
+                        eprintln!("gild-vault replica promotion audit failed: {err:#}");
+                    }
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn sync_loop(state: Arc<AppState>, upstream_url: String, interval: Duration) {
+    loop {
+        tokio::time::sleep(interval).await;
+        if *state.mode.lock().await == Mode::Authoritative {
+            return;
+        }
+        let version = *state.version.lock().await;
+        let endpoint = format!("/since/{version}");
+        match replication_post_json::<SinceResponse>(&upstream_url, &endpoint).await {
+            Ok(response) if response.entries.is_empty() => {
+                *state.version.lock().await = response.version;
+            }
+            Ok(_) => {
+                if let Err(err) = attach_replica(&state, &upstream_url).await {
+                    eprintln!("gild-vault replica snapshot refresh failed: {err:#}");
+                }
+            }
+            Err(err) => eprintln!("gild-vault replica sync failed: {err:#}"),
+        }
+    }
+}
+
+async fn promote_replica(state: &AppState) -> Result<()> {
+    *state.mode.lock().await = Mode::Authoritative;
+    append_audit(
+        &state.audit_log_path,
+        &AuditEvent {
+            ts: now_epoch_seconds()?,
+            op: "promote",
+            key: None,
+            peer_uid: unsafe { libc::geteuid() },
+            peer_pid: std::process::id() as i32,
+            result: "PROMOTED",
+        },
+    )
+}
+
+async fn replication_post_json<T: for<'de> Deserialize<'de>>(
+    upstream_url: &str,
+    endpoint: &str,
+) -> Result<T> {
+    let response = http_post(upstream_url, endpoint).await?;
+    if response.status != 200 {
+        return Err(anyhow!(
+            "replication upstream returned HTTP {}: {}",
+            response.status,
+            response.body
+        ));
+    }
+    serde_json::from_str(&response.body).context("decode replication response")
+}
+
+#[derive(Debug)]
+struct RawHttpResponse {
+    status: u16,
+    body: String,
+}
+
+async fn http_post(upstream_url: &str, endpoint: &str) -> Result<RawHttpResponse> {
+    let upstream = Upstream::parse(upstream_url)?;
+    let path = upstream.path(endpoint);
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: gild-vault\r\nAccept: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    let mut response = Vec::new();
+    match upstream {
+        Upstream::Tcp { host, port, .. } => {
+            let mut stream = TcpStream::connect((host.as_str(), port))
+                .await
+                .with_context(|| format!("connect {host}:{port}"))?;
+            stream
+                .write_all(request.as_bytes())
+                .await
+                .context("write request")?;
+            stream.shutdown().await.context("shutdown request")?;
+            stream
+                .take(MAX_HTTP_RESPONSE_BYTES as u64)
+                .read_to_end(&mut response)
+                .await
+                .context("read response")?;
+        }
+        Upstream::Unix { socket_path, .. } => {
+            let mut stream = UnixStream::connect(&socket_path)
+                .await
+                .with_context(|| format!("connect {}", socket_path.display()))?;
+            stream
+                .write_all(request.as_bytes())
+                .await
+                .context("write request")?;
+            stream.shutdown().await.context("shutdown request")?;
+            stream
+                .take(MAX_HTTP_RESPONSE_BYTES as u64)
+                .read_to_end(&mut response)
+                .await
+                .context("read response")?;
+        }
+    }
+    parse_raw_http_response(&response)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Upstream {
+    Tcp {
+        host: String,
+        port: u16,
+        base_path: String,
+    },
+    Unix {
+        socket_path: PathBuf,
+        base_path: String,
+    },
+}
+
+impl Upstream {
+    fn parse(raw: &str) -> Result<Self> {
+        if let Some(rest) = raw.strip_prefix("unix://") {
+            let (socket, base_path) = rest
+                .split_once(':')
+                .map(|(socket, base_path)| (socket, base_path.to_string()))
+                .unwrap_or((rest, "/replication".to_string()));
+            return Ok(Self::Unix {
+                socket_path: PathBuf::from(format!("/{}", socket.trim_start_matches('/'))),
+                base_path,
+            });
+        }
+
+        let rest = raw
+            .strip_prefix("http://")
+            .ok_or_else(|| anyhow!("replication upstream must start with http:// or unix://"))?;
+        let (authority, base_path) = rest
+            .split_once('/')
+            .map(|(authority, path)| (authority, format!("/{path}")))
+            .unwrap_or((rest, "/replication".to_string()));
+        let (host, port) = if let Some((host, port)) = authority.rsplit_once(':') {
+            (
+                host.to_string(),
+                port.parse::<u16>().context("parse upstream port")?,
+            )
+        } else {
+            (authority.to_string(), 80)
+        };
+        Ok(Self::Tcp {
+            host,
+            port,
+            base_path,
+        })
+    }
+
+    fn path(&self, endpoint: &str) -> String {
+        let base = match self {
+            Self::Tcp { base_path, .. } | Self::Unix { base_path, .. } => base_path,
+        };
+        format!(
+            "{}/{}",
+            base.trim_end_matches('/'),
+            endpoint.trim_start_matches('/')
+        )
+    }
+}
+
+fn parse_raw_http_response(bytes: &[u8]) -> Result<RawHttpResponse> {
+    let raw = std::str::from_utf8(bytes).context("HTTP response is not UTF-8")?;
+    let (head, body) = raw
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| anyhow!("invalid HTTP response"))?;
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or_else(|| anyhow!("missing HTTP status"))?
+        .parse::<u16>()
+        .context("parse HTTP status")?;
+    Ok(RawHttpResponse {
+        status,
+        body: body.to_string(),
+    })
 }
 
 fn is_http_request(request_bytes: &[u8]) -> bool {
@@ -558,6 +1026,15 @@ fn is_admin(peer: &PeerCred) -> bool {
         || peer.uid == unsafe { libc::geteuid() }
         || peer.username.as_deref() == Some("root")
         || peer.username.as_deref() == Some("sami")
+}
+
+fn is_replica(peer: &PeerCred) -> bool {
+    #[cfg(test)]
+    if peer.uid == unsafe { libc::geteuid() } {
+        return true;
+    }
+
+    peer.username.as_deref() == Some("gild-vault-replica")
 }
 
 fn peer_credentials(stream: &UnixStream) -> Result<PeerCred> {
@@ -716,6 +1193,7 @@ async fn write_http_json(
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
         413 => "Payload Too Large",
         500 => "Internal Server Error",
         _ => "OK",
@@ -806,6 +1284,19 @@ fn env_path(name: &str, default: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(default))
 }
 
+fn env_mode(name: &str) -> Option<Mode> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| parse_mode(&value))
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
 fn now_epoch_seconds() -> Result<u64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -840,6 +1331,10 @@ mod tests {
             state_path: dir.join("keys.age"),
             audit_log_path: dir.join("audit.log"),
             master_recipient: master_key.to_public(),
+            master_identity: master_key,
+            mode: Mutex::new(Mode::Authoritative),
+            version: Mutex::new(0),
+            replication_log: Mutex::new(Vec::new()),
         }
     }
 
@@ -847,6 +1342,33 @@ mod tests {
         (0..10)
             .map(|idx| (format!("KEY_{idx}"), format!("value-{idx}")))
             .collect()
+    }
+
+    fn test_config(dir: &Path, socket_name: &str) -> Config {
+        Config {
+            socket_path: dir.join(socket_name),
+            state_path: dir.join(format!("{socket_name}.age")),
+            audit_log_path: dir.join(format!("{socket_name}.audit.log")),
+            mode: Mode::Authoritative,
+            upstream_url: None,
+            heartbeat_interval: Duration::from_millis(10),
+            sync_interval: Duration::from_millis(10),
+            promote_after_failures: 2,
+        }
+    }
+
+    fn state_with_key(dir: &Path, master_key: age::x25519::Identity, key: &str) -> AppState {
+        AppState {
+            keys: Mutex::new(HashMap::from([(key.to_string(), "secret".to_string())])),
+            started_at: Instant::now(),
+            state_path: dir.join("keys.age"),
+            audit_log_path: dir.join("audit.log"),
+            master_recipient: master_key.to_public(),
+            master_identity: master_key,
+            mode: Mutex::new(Mode::Authoritative),
+            version: Mutex::new(0),
+            replication_log: Mutex::new(Vec::new()),
+        }
     }
 
     #[test]
@@ -1134,6 +1656,10 @@ mod tests {
             state_path: dir.path().join("keys.age"),
             audit_log_path: dir.path().join("audit.log"),
             master_recipient: master_key.to_public(),
+            master_identity: master_key,
+            mode: Mutex::new(Mode::Authoritative),
+            version: Mutex::new(0),
+            replication_log: Mutex::new(Vec::new()),
         };
 
         let response = handle_request(
@@ -1291,6 +1817,128 @@ mod tests {
         assert_eq!(response.version.as_deref(), Some("0.1.0"));
         assert_eq!(response.key_count, Some(3));
         assert!(response.uptime_seconds.unwrap() >= 5);
+    }
+
+    #[tokio::test]
+    async fn replication_snapshot_sync_round_trip_over_unix_http() {
+        let dir = tempdir().unwrap();
+        let master_key = age::x25519::Identity::generate();
+        let authoritative_state = Arc::new(state_with_key(
+            &dir.path().join("authoritative"),
+            master_key.clone(),
+            "ANTHROPIC_API_KEY",
+        ));
+        let authoritative_keys = authoritative_state.keys.lock().await;
+        persist_keys(
+            &authoritative_state.state_path,
+            &authoritative_state.master_recipient,
+            &authoritative_keys,
+        )
+        .unwrap();
+        drop(authoritative_keys);
+        *authoritative_state.version.lock().await = 7;
+
+        let mut authoritative_config = test_config(dir.path(), "authoritative.sock");
+        authoritative_config.state_path = authoritative_state.state_path.clone();
+        authoritative_config.audit_log_path = authoritative_state.audit_log_path.clone();
+        let server = tokio::spawn({
+            let authoritative_state = Arc::clone(&authoritative_state);
+            async move {
+                serve(authoritative_config, authoritative_state)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        for _ in 0..50 {
+            if dir.path().join("authoritative.sock").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let replica_state = Arc::new(AppState {
+            keys: Mutex::new(HashMap::new()),
+            started_at: Instant::now(),
+            state_path: dir.path().join("replica.keys.age"),
+            audit_log_path: dir.path().join("replica.audit.log"),
+            master_recipient: master_key.to_public(),
+            master_identity: master_key,
+            mode: Mutex::new(Mode::Replica),
+            version: Mutex::new(0),
+            replication_log: Mutex::new(Vec::new()),
+        });
+        attach_replica(
+            &replica_state,
+            &format!(
+                "unix://{}:/replication",
+                dir.path().join("authoritative.sock").display()
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*replica_state.version.lock().await, 7);
+        assert_eq!(
+            replica_state.keys.lock().await.get("ANTHROPIC_API_KEY"),
+            Some(&"secret".to_string())
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn heartbeat_failures_promote_replica() {
+        let dir = tempdir().unwrap();
+        let state = Arc::new(test_state(dir.path()));
+        *state.mode.lock().await = Mode::Replica;
+
+        heartbeat_loop(
+            Arc::clone(&state),
+            format!(
+                "unix://{}:/replication",
+                dir.path().join("missing.sock").display()
+            ),
+            Duration::from_millis(5),
+            2,
+        )
+        .await;
+
+        assert_eq!(*state.mode.lock().await, Mode::Authoritative);
+        assert!(
+            fs::read_to_string(dir.path().join("audit.log"))
+                .unwrap()
+                .contains("PROMOTED")
+        );
+    }
+
+    #[tokio::test]
+    async fn replication_endpoints_authorize_only_replica_user() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path());
+        let allowed = handle_replication_http_request(
+            &state,
+            &peer(2000, "gild-vault-replica"),
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: "/replication/heartbeat".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let denied = handle_replication_http_request(
+            &state,
+            &peer(1001, "agent-amina"),
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: "/replication/heartbeat".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(allowed.status, 200);
+        assert_eq!(denied.status, 403);
     }
 
     #[tokio::test]
