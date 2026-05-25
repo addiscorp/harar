@@ -31,9 +31,13 @@ delete tombstones for replica catch-up.
 ## Replication Recovery
 
 Automatic replica promotion bumps the epoch by 1000 before accepting writes.
-If an older authoritative later sees a higher upstream epoch, it demotes,
-sets its fenced flag, and refuses writes until an operator explicitly resets
-the fence.
+When an authoritative node starts with `--upstream-url` or `GILD_VAULT_UPSTREAM`,
+it checks the peer heartbeat before accepting writes. If the peer epoch is
+higher than the local epoch, the node stays up for local reads, sets its fenced
+flag, and refuses put/delete requests until an operator explicitly resets the
+fence. If the peer cannot be reached during this boot-time check, the daemon
+fails open, logs and audits `peer_unreachable_fail_open`, and accepts writes.
+Single-node authoritative mode skips the check when no upstream is configured.
 
 Manual split-brain recovery:
 

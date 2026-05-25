@@ -265,11 +265,21 @@ fn json_result<T>(
 ) -> Response {
     match result {
         Ok(value) => Json(ok(value)).into_response(),
-        Err(VaultClientError::Vault(message)) => {
-            Json(serde_json::json!({ "ok": false, "error": message })).into_response()
-        }
+        Err(VaultClientError::Vault(message)) => vault_error_response(message),
         Err(err) => error(StatusCode::BAD_GATEWAY, &err.to_string()),
     }
+}
+
+fn vault_error_response(message: String) -> Response {
+    let status = match message.as_str() {
+        "demoted_fenced" | "replica_read_only" => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::OK,
+    };
+    (
+        status,
+        Json(serde_json::json!({ "ok": false, "error": message })),
+    )
+        .into_response()
 }
 
 fn error(status: StatusCode, message: &str) -> Response {
@@ -335,7 +345,7 @@ struct HealthResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
+    use axum::body::{self, Body};
     use axum::http::{Request, header};
     use tower::ServiceExt;
 
@@ -371,6 +381,23 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn vault_write_gate_errors_return_503() {
+        for message in ["demoted_fenced", "replica_read_only"] {
+            let response = json_result::<()>(
+                Err(VaultClientError::Vault(message.to_string())),
+                |_| serde_json::json!({ "ok": true }),
+            );
+
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let bytes = body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body, serde_json::json!({ "ok": false, "error": message }));
+        }
     }
 
     fn vault_request(token: Option<&str>) -> Request<Body> {
