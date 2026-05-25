@@ -262,6 +262,7 @@ impl RealVault {
         std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
         let state_path = temp.path().join("keys.age");
         let master_key_path = temp.path().join("vault-master.key");
+        let replication_token_path = temp.path().join("vault-replication-token");
         let identity = age::x25519::Identity::generate();
         std::fs::write(
             &master_key_path,
@@ -269,6 +270,8 @@ impl RealVault {
         )
         .unwrap();
         set_mode(&master_key_path, 0o400);
+        std::fs::write(&replication_token_path, "test-replication-token\n").unwrap();
+        set_mode(&replication_token_path, 0o400);
         let audit_log = temp.path().join("audit.log");
         let binary = gild_vault_binary();
 
@@ -279,6 +282,8 @@ impl RealVault {
             .arg(&state_path)
             .arg("--audit-log")
             .arg(&audit_log)
+            .arg("--replication-token-file")
+            .arg(&replication_token_path)
             .env("GILD_VAULT_MASTER_KEY_PATH", &master_key_path)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -383,6 +388,7 @@ async fn wait_for_tls_proxy(client: &reqwest::Client, base_url: &str) {
 
 fn tls_client(ca_cert_pem: &str, identity_pem: Option<&str>) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
+        .use_rustls_tls()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_cert_pem.as_bytes()).unwrap());
     if let Some(identity_pem) = identity_pem {
         builder = builder.identity(reqwest::Identity::from_pem(identity_pem.as_bytes()).unwrap());
