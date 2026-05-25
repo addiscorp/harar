@@ -605,6 +605,10 @@ fn username_for_uid(uid: u32) -> Option<String> {
 fn load_keys(path: &Path, identity: &age::x25519::Identity) -> Result<HashMap<String, String>> {
     match fs::read(path) {
         Ok(bytes) => {
+            if bytes.is_empty() {
+                return Ok(HashMap::new());
+            }
+
             let plaintext = age::decrypt(identity, &bytes).with_context(|| {
                 format!(
                     "decrypt gild-vault state at {}; refusing to boot because encrypted state could not be read",
@@ -857,6 +861,18 @@ mod tests {
 
         assert_eq!(loaded, keys);
         assert_ne!(fs::read(&path).unwrap(), serde_json::to_vec(&keys).unwrap());
+    }
+
+    #[test]
+    fn empty_state_file_loads_as_empty_key_map() {
+        let dir = tempdir().unwrap();
+        let master_key = age::x25519::Identity::generate();
+        let path = dir.path().join("keys.age");
+        fs::write(&path, []).unwrap();
+
+        let loaded = load_keys(&path, &master_key).unwrap();
+
+        assert!(loaded.is_empty());
     }
 
     #[test]
