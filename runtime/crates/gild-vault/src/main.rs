@@ -13,8 +13,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
+mod master_key;
+
 const DEFAULT_SOCKET_PATH: &str = "/run/gild-vault.sock";
-const DEFAULT_STATE_PATH: &str = "/run/gild-vault/keys.json";
+const DEFAULT_STATE_PATH: &str = "/var/lib/gild-vault/keys.age";
 const DEFAULT_AUDIT_LOG_PATH: &str = "/var/log/gild-vault.log";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -66,6 +68,7 @@ struct AppState {
     started_at: Instant,
     state_path: PathBuf,
     audit_log_path: PathBuf,
+    master_recipient: age::x25519::Recipient,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -163,12 +166,15 @@ struct AuditEvent<'a> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::from_env_and_args();
-    let keys = load_keys(&config.state_path)?;
+    let master_key = master_key::load_master_key()?;
+    let master_recipient = master_key.to_public();
+    let keys = load_keys(&config.state_path, &master_key)?;
     let state = Arc::new(AppState {
         keys: Mutex::new(keys),
         started_at: Instant::now(),
         state_path: config.state_path.clone(),
         audit_log_path: config.audit_log_path.clone(),
+        master_recipient,
     });
 
     serve(config, state).await
@@ -334,7 +340,7 @@ async fn handle_request(
         VaultRequest::Put { key, value, .. } => {
             let mut keys = state.keys.lock().await;
             keys.insert(key, value);
-            persist_keys(&state.state_path, &keys)?;
+            persist_keys(&state.state_path, &state.master_recipient, &keys)?;
             VaultResponse::ok()
         }
         VaultRequest::List { shop_id } => {
@@ -353,7 +359,7 @@ async fn handle_request(
         VaultRequest::Delete { key, .. } => {
             let mut keys = state.keys.lock().await;
             keys.remove(&key);
-            persist_keys(&state.state_path, &keys)?;
+            persist_keys(&state.state_path, &state.master_recipient, &keys)?;
             VaultResponse::ok()
         }
         VaultRequest::Health => {
@@ -596,21 +602,40 @@ fn username_for_uid(uid: u32) -> Option<String> {
     })
 }
 
-fn load_keys(path: &Path) -> Result<HashMap<String, String>> {
+fn load_keys(path: &Path, identity: &age::x25519::Identity) -> Result<HashMap<String, String>> {
     match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).context("decode gild-vault state"),
+        Ok(bytes) => {
+            let plaintext = age::decrypt(identity, &bytes).with_context(|| {
+                format!(
+                    "decrypt gild-vault state at {}; refusing to boot because encrypted state could not be read",
+                    path.display()
+                )
+            })?;
+            serde_json::from_slice(&plaintext).context("decode gild-vault state")
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
         Err(err) => Err(err).with_context(|| format!("read {}", path.display())),
     }
 }
 
-fn persist_keys(path: &Path, keys: &HashMap<String, String>) -> Result<()> {
+fn persist_keys(
+    path: &Path,
+    recipient: &age::x25519::Recipient,
+    keys: &HashMap<String, String>,
+) -> Result<()> {
     let Some(parent) = path.parent() else {
         return Err(anyhow!("state path must have a parent"));
     };
     fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o750))
+        .with_context(|| format!("chmod 0750 {}", parent.display()))?;
+    try_chown(parent, Some("gild-vault"), Some("gild"));
 
-    let tmp_path = path.with_extension("json.tmp");
+    let plaintext = serde_json::to_vec(keys).context("encode gild-vault state")?;
+    let ciphertext =
+        age::encrypt(recipient, &plaintext).context("encrypt gild-vault state with age")?;
+
+    let tmp_path = path.with_extension(format!("age.tmp.{}", std::process::id()));
     let mut file = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -618,13 +643,18 @@ fn persist_keys(path: &Path, keys: &HashMap<String, String>) -> Result<()> {
         .mode(0o600)
         .open(&tmp_path)
         .with_context(|| format!("open {}", tmp_path.display()))?;
-    serde_json::to_writer(&mut file, keys).context("encode gild-vault state")?;
-    file.write_all(b"\n").context("write state newline")?;
+    try_chown(&tmp_path, Some("gild-vault"), None);
+    file.write_all(&ciphertext)
+        .context("write encrypted gild-vault state")?;
     file.sync_all().context("sync gild-vault state")?;
     fs::rename(&tmp_path, path)
         .with_context(|| format!("rename {} to {}", tmp_path.display(), path.display()))?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
         .with_context(|| format!("chmod 0600 {}", path.display()))?;
+    try_chown(path, Some("gild-vault"), None);
+    fs::File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .with_context(|| format!("sync {}", parent.display()))?;
     Ok(())
 }
 
@@ -714,14 +744,41 @@ fn prepare_socket(path: &Path) -> Result<()> {
 
 fn try_chgrp(path: &Path, group: &str) {
     if let Some(gid) = gid_for_group(group) {
-        let bytes = path.as_os_str().as_bytes();
-        let mut c_path = Vec::with_capacity(bytes.len() + 1);
-        c_path.extend_from_slice(bytes);
-        c_path.push(0);
-        unsafe {
-            libc::chown(c_path.as_ptr().cast(), u32::MAX, gid);
-        }
+        chown_raw(path, u32::MAX, gid);
     }
+}
+
+fn try_chown(path: &Path, user: Option<&str>, group: Option<&str>) {
+    let uid = user.and_then(uid_for_user).unwrap_or(u32::MAX);
+    let gid = group.and_then(gid_for_group).unwrap_or(u32::MAX);
+    if uid != u32::MAX || gid != u32::MAX {
+        chown_raw(path, uid, gid);
+    }
+}
+
+fn chown_raw(path: &Path, uid: u32, gid: u32) {
+    let bytes = path.as_os_str().as_bytes();
+    let mut c_path = Vec::with_capacity(bytes.len() + 1);
+    c_path.extend_from_slice(bytes);
+    c_path.push(0);
+    unsafe {
+        libc::chown(c_path.as_ptr().cast(), uid, gid);
+    }
+}
+
+fn uid_for_user(user: &str) -> Option<u32> {
+    let passwd = fs::read_to_string("/etc/passwd").ok()?;
+    passwd.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        let name = fields.next()?;
+        let _password = fields.next()?;
+        let raw_uid = fields.next()?;
+        if name == user {
+            raw_uid.parse::<u32>().ok()
+        } else {
+            None
+        }
+    })
 }
 
 fn gid_for_group(group: &str) -> Option<u32> {
@@ -768,6 +825,7 @@ mod tests {
     }
 
     fn test_state(dir: &Path) -> AppState {
+        let master_key = age::x25519::Identity::generate();
         AppState {
             keys: Mutex::new(HashMap::from([
                 ("ANTHROPIC_API_KEY".to_string(), "sk-test".to_string()),
@@ -775,9 +833,84 @@ mod tests {
                 ("AGENT_IDRIS_TOKEN".to_string(), "idris-secret".to_string()),
             ])),
             started_at: Instant::now() - Duration::from_secs(5),
-            state_path: dir.join("keys.json"),
+            state_path: dir.join("keys.age"),
             audit_log_path: dir.join("audit.log"),
+            master_recipient: master_key.to_public(),
         }
+    }
+
+    fn ten_test_keys() -> HashMap<String, String> {
+        (0..10)
+            .map(|idx| (format!("KEY_{idx}"), format!("value-{idx}")))
+            .collect()
+    }
+
+    #[test]
+    fn encrypted_state_round_trips_ten_keys() {
+        let dir = tempdir().unwrap();
+        let master_key = age::x25519::Identity::generate();
+        let keys = ten_test_keys();
+        let path = dir.path().join("keys.age");
+
+        persist_keys(&path, &master_key.to_public(), &keys).unwrap();
+        let loaded = load_keys(&path, &master_key).unwrap();
+
+        assert_eq!(loaded, keys);
+        assert_ne!(fs::read(&path).unwrap(), serde_json::to_vec(&keys).unwrap());
+    }
+
+    #[test]
+    fn missing_master_key_file_has_operator_error() {
+        let dir = tempdir().unwrap();
+        let err = match master_key::load_master_key_file(&dir.path().join("missing.key")) {
+            Ok(_) => panic!("missing master key should fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("gild vault init"));
+    }
+
+    #[test]
+    fn wrong_master_key_refuses_to_load_existing_state() {
+        let dir = tempdir().unwrap();
+        let correct = age::x25519::Identity::generate();
+        let wrong = age::x25519::Identity::generate();
+        let path = dir.path().join("keys.age");
+        let keys = HashMap::from([("ANTHROPIC_API_KEY".to_string(), "sk-test".to_string())]);
+        persist_keys(&path, &correct.to_public(), &keys).unwrap();
+
+        let err = load_keys(&path, &wrong).unwrap_err();
+
+        assert!(err.to_string().contains("refusing to boot"));
+    }
+
+    #[test]
+    fn persist_then_reload_keeps_all_keys() {
+        let dir = tempdir().unwrap();
+        let master_key = age::x25519::Identity::generate();
+        let path = dir.path().join("state").join("keys.age");
+        let keys = HashMap::from([
+            ("A".to_string(), "one".to_string()),
+            ("B".to_string(), "two".to_string()),
+            ("C".to_string(), "three".to_string()),
+        ]);
+
+        persist_keys(&path, &master_key.to_public(), &keys).unwrap();
+        let loaded = load_keys(&path, &master_key).unwrap();
+
+        assert_eq!(loaded, keys);
+        assert_eq!(
+            fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o750
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
@@ -974,6 +1107,7 @@ mod tests {
     #[tokio::test]
     async fn runtime_list_with_shop_id_only_returns_that_shop() {
         let dir = tempdir().unwrap();
+        let master_key = age::x25519::Identity::generate();
         let state = AppState {
             keys: Mutex::new(HashMap::from([
                 ("shops/shop_a/SECRET".to_string(), "a".to_string()),
@@ -981,8 +1115,9 @@ mod tests {
                 ("AGENT_AMINA_TOKEN".to_string(), "amina".to_string()),
             ])),
             started_at: Instant::now(),
-            state_path: dir.path().join("keys.json"),
+            state_path: dir.path().join("keys.age"),
             audit_log_path: dir.path().join("audit.log"),
+            master_recipient: master_key.to_public(),
         };
 
         let response = handle_request(
