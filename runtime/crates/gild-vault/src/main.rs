@@ -26,6 +26,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_HTTP_RESPONSE_BYTES: usize = 1024 * 1024;
 const PROMOTION_EPOCH_BUMP: u64 = 1000;
+const HIGHER_EPOCH_PEER_RESULT: &str =
+    "detected higher-epoch peer, refusing writes - operator action required";
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -318,7 +320,7 @@ async fn main() -> Result<()> {
         attach_replica(&state, &upstream_url).await?;
         spawn_replica_loops(&config, Arc::clone(&state), upstream_url);
     } else if let Some(upstream_url) = config.upstream_url.clone() {
-        reconcile_authoritative_with_upstream(&state, &upstream_url).await?;
+        check_authoritative_boot_epoch(&state, &upstream_url).await?;
     }
 
     serve(config, state).await
@@ -874,15 +876,50 @@ async fn promote_replica(state: &AppState) -> Result<()> {
     )
 }
 
-async fn reconcile_authoritative_with_upstream(state: &AppState, upstream_url: &str) -> Result<()> {
+async fn check_authoritative_boot_epoch(state: &AppState, upstream_url: &str) -> Result<()> {
     let response: HeartbeatResponse =
-        replication_post_json(upstream_url, "/heartbeat", &state.replication_token)
-            .await
-            .context("fetch upstream heartbeat for fencing reconciliation")?;
+        match replication_post_json(upstream_url, "/heartbeat", &state.replication_token).await {
+            Ok(response) => response,
+            Err(err) => {
+                eprintln!(
+                    "gild-vault authoritative boot epoch check could not reach peer at {upstream_url}; accepting writes fail-open: {err:#}"
+                );
+                if let Err(audit_err) = append_audit(
+                    &state.audit_log_path,
+                    &AuditEvent {
+                        ts: now_epoch_seconds()?,
+                        op: "boot_epoch_check",
+                        key: None,
+                        peer_uid: unsafe { libc::geteuid() },
+                        peer_pid: std::process::id() as i32,
+                        result: "peer_unreachable_fail_open",
+                    },
+                ) {
+                    eprintln!("gild-vault boot epoch check audit failed: {audit_err:#}");
+                }
+                return Ok(());
+            }
+        };
     let local_epoch = *state.epoch.lock().await;
     if response.epoch > local_epoch {
-        attach_replica(state, upstream_url).await?;
-        demote_for_higher_epoch(state, response.epoch).await?;
+        eprintln!(
+            "gild-vault {HIGHER_EPOCH_PEER_RESULT}: local_epoch={local_epoch}, peer_epoch={}",
+            response.epoch
+        );
+        *state.fenced.lock().await = true;
+        *state.epoch.lock().await = response.epoch;
+        persist_current_replication_meta(state).await?;
+        append_audit(
+            &state.audit_log_path,
+            &AuditEvent {
+                ts: now_epoch_seconds()?,
+                op: "boot_epoch_check",
+                key: None,
+                peer_uid: unsafe { libc::geteuid() },
+                peer_pid: std::process::id() as i32,
+                result: HIGHER_EPOCH_PEER_RESULT,
+            },
+        )?;
     }
     Ok(())
 }
@@ -1538,6 +1575,7 @@ async fn write_http_json(
         405 => "Method Not Allowed",
         409 => "Conflict",
         413 => "Payload Too Large",
+        503 => "Service Unavailable",
         500 => "Internal Server Error",
         _ => "OK",
     };
@@ -2478,7 +2516,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovering_authoritative_demotes_after_higher_epoch_snapshot() {
+    async fn recovering_authoritative_refuses_writes_when_peer_epoch_is_higher() {
         let dir = tempdir().unwrap();
         let master_key = age::x25519::Identity::generate();
         let canonical = Arc::new(state_with_key(
@@ -2517,7 +2555,7 @@ mod tests {
         let recovered = state_with_key(&dir.path().join("recovered"), master_key, "STALE_ONLY");
         *recovered.mode.lock().await = Mode::Authoritative;
         *recovered.epoch.lock().await = 5;
-        reconcile_authoritative_with_upstream(
+        check_authoritative_boot_epoch(
             &recovered,
             &format!(
                 "unix://{}:/replication",
@@ -2527,14 +2565,180 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(*recovered.mode.lock().await, Mode::Replica);
+        assert_eq!(*recovered.mode.lock().await, Mode::Authoritative);
         assert_eq!(*recovered.epoch.lock().await, 1005);
-        assert_eq!(*recovered.version.lock().await, 7);
+        assert_eq!(*recovered.version.lock().await, 0);
         assert!(*recovered.fenced.lock().await);
-        assert!(recovered.keys.lock().await.contains_key("CANONICAL_ONLY"));
-        assert!(!recovered.keys.lock().await.contains_key("STALE_ONLY"));
+        let meta = load_replication_meta(&recovered.replication_meta_path).unwrap();
+        assert_eq!(meta.epoch, 1005);
+        assert!(meta.fenced);
+        assert!(!recovered.keys.lock().await.contains_key("CANONICAL_ONLY"));
+        assert!(recovered.keys.lock().await.contains_key("STALE_ONLY"));
+
+        let get = handle_request(
+            &recovered,
+            &peer(0, "root"),
+            VaultRequest::Get {
+                key: "STALE_ONLY".to_string(),
+                shop_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(get.ok);
+
+        let put = handle_request(
+            &recovered,
+            &peer(0, "root"),
+            VaultRequest::Put {
+                key: "BOOT_WINDOW_WRITE".to_string(),
+                value: "lost".to_string(),
+                shop_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!put.ok);
+        assert_eq!(put.error.as_deref(), Some("demoted_fenced"));
+        assert!(
+            !recovered
+                .keys
+                .lock()
+                .await
+                .contains_key("BOOT_WINDOW_WRITE")
+        );
+
+        let audit = fs::read_to_string(&recovered.audit_log_path).unwrap();
+        assert!(audit.contains(HIGHER_EPOCH_PEER_RESULT));
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn recovering_authoritative_accepts_writes_when_peer_epoch_matches() {
+        let dir = tempdir().unwrap();
+        let master_key = age::x25519::Identity::generate();
+        let canonical = Arc::new(state_with_key(
+            &dir.path().join("canonical"),
+            master_key.clone(),
+            "CANONICAL_ONLY",
+        ));
+        *canonical.epoch.lock().await = 5;
+        let canonical_keys = canonical.keys.lock().await;
+        persist_keys(
+            &canonical.state_path,
+            &canonical.master_recipient,
+            &canonical_keys,
+        )
+        .unwrap();
+        drop(canonical_keys);
+
+        let mut canonical_config = test_config(dir.path(), "canonical-matching.sock");
+        canonical_config.state_path = canonical.state_path.clone();
+        canonical_config.audit_log_path = canonical.audit_log_path.clone();
+        let server = tokio::spawn({
+            let canonical = Arc::clone(&canonical);
+            async move {
+                serve(canonical_config, canonical).await.unwrap();
+            }
+        });
+
+        for _ in 0..50 {
+            if dir.path().join("canonical-matching.sock").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let recovered = state_with_key(&dir.path().join("recovered"), master_key, "LOCAL_ONLY");
+        *recovered.mode.lock().await = Mode::Authoritative;
+        *recovered.epoch.lock().await = 5;
+        check_authoritative_boot_epoch(
+            &recovered,
+            &format!(
+                "unix://{}:/replication",
+                dir.path().join("canonical-matching.sock").display()
+            ),
+        )
+        .await
+        .unwrap();
+
+        let put = handle_request(
+            &recovered,
+            &peer(0, "root"),
+            VaultRequest::Put {
+                key: "SAFE_WRITE".to_string(),
+                value: "ok".to_string(),
+                shop_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(put.ok);
+        assert!(!*recovered.fenced.lock().await);
+        assert!(recovered.keys.lock().await.contains_key("SAFE_WRITE"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn recovering_authoritative_accepts_writes_without_upstream_check() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path());
+        *state.mode.lock().await = Mode::Authoritative;
+        *state.epoch.lock().await = 5;
+
+        let put = handle_request(
+            &state,
+            &peer(0, "root"),
+            VaultRequest::Put {
+                key: "SINGLE_NODE_WRITE".to_string(),
+                value: "ok".to_string(),
+                shop_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(put.ok);
+        assert!(state.keys.lock().await.contains_key("SINGLE_NODE_WRITE"));
+    }
+
+    #[tokio::test]
+    async fn recovering_authoritative_accepts_writes_when_peer_unreachable() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path());
+        *state.mode.lock().await = Mode::Authoritative;
+        *state.epoch.lock().await = 5;
+
+        check_authoritative_boot_epoch(
+            &state,
+            &format!(
+                "unix://{}:/replication",
+                dir.path().join("missing-peer.sock").display()
+            ),
+        )
+        .await
+        .unwrap();
+
+        let put = handle_request(
+            &state,
+            &peer(0, "root"),
+            VaultRequest::Put {
+                key: "FAIL_OPEN_WRITE".to_string(),
+                value: "ok".to_string(),
+                shop_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(put.ok);
+        assert!(!*state.fenced.lock().await);
+        assert!(state.keys.lock().await.contains_key("FAIL_OPEN_WRITE"));
+        let audit = fs::read_to_string(&state.audit_log_path).unwrap();
+        assert!(audit.contains("peer_unreachable_fail_open"));
     }
 
     #[tokio::test]
