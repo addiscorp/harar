@@ -9,7 +9,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use axum::Extension;
 use gild_vault_client::VaultClient;
-use gild_vault_proxy::{AppState, RequestPeer, app};
+use gild_vault_proxy::{AppState, RequestPeer, app, parse_peer_upstreams};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as HyperBuilder;
 use hyper_util::service::TowerToHyperService;
@@ -29,10 +29,11 @@ async fn main() -> Result<()> {
     let vault = VaultClient::from_socket_path(&config.socket_path);
     smoke_check_vault(&vault, &config.socket_path).await?;
 
-    let mut state = AppState::new(config.token, vault);
+    let mut state = AppState::new(config.token, vault).with_peers(config.peers);
     if let Some(audit_log_path) = config.audit_log_path {
         state = state.with_audit_log_path(audit_log_path);
     }
+    spawn_failover_monitor(state.clone());
 
     match (config.plain_addr, config.tls) {
         (Some(plain_addr), Some(tls)) => {
@@ -69,6 +70,7 @@ struct Config {
     tls: Option<TlsConfig>,
     socket_path: PathBuf,
     token: String,
+    peers: Vec<gild_vault_proxy::PeerUpstream>,
     audit_log_path: Option<PathBuf>,
 }
 
@@ -90,6 +92,7 @@ impl Config {
         let mut tls_cert = env_path("VAULT_PROXY_TLS_CERT");
         let mut tls_key = env_path("VAULT_PROXY_TLS_KEY");
         let mut socket_path = vault_socket_path_from_env();
+        let mut peers = parse_peer_upstreams(std::env::var("VAULT_PROXY_PEERS").ok().as_deref());
         let mut audit_log_path = env_path("VAULT_PROXY_AUDIT_LOG")
             .or_else(|| Some(PathBuf::from(DEFAULT_AUDIT_LOG_PATH)));
 
@@ -149,6 +152,12 @@ impl Config {
                 "--no-audit-log" => {
                     audit_log_path = None;
                 }
+                "--peer" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("--peer requires a value"))?;
+                    peers.push(gild_vault_proxy::PeerUpstream::new(value));
+                }
                 _ => {}
             }
         }
@@ -179,9 +188,20 @@ impl Config {
             tls,
             socket_path,
             token: load_token()?,
+            peers,
             audit_log_path,
         })
     }
+}
+
+fn spawn_failover_monitor(state: AppState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            state.check_and_failover().await;
+        }
+    });
 }
 
 async fn serve_plain(addr: SocketAddr, state: AppState) -> Result<()> {

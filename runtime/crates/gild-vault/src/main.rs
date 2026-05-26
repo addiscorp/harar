@@ -138,6 +138,15 @@ fn parse_mode(value: &str) -> Option<Mode> {
     }
 }
 
+impl Mode {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Mode::Authoritative => "authoritative",
+            Mode::Replica => "replica",
+        }
+    }
+}
+
 struct AppState {
     keys: Mutex<HashMap<String, String>>,
     started_at: Instant,
@@ -234,6 +243,12 @@ struct VaultResponse {
     uptime_seconds: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     key_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    epoch: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fenced: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
 }
 
 impl VaultResponse {
@@ -246,6 +261,9 @@ impl VaultResponse {
             version: None,
             uptime_seconds: None,
             key_count: None,
+            epoch: None,
+            fenced: None,
+            mode: None,
         }
     }
 
@@ -258,6 +276,9 @@ impl VaultResponse {
             version: None,
             uptime_seconds: None,
             key_count: None,
+            epoch: None,
+            fenced: None,
+            mode: None,
         }
     }
 }
@@ -319,8 +340,10 @@ async fn main() -> Result<()> {
         })?;
         attach_replica(&state, &upstream_url).await?;
         spawn_replica_loops(&config, Arc::clone(&state), upstream_url);
-    } else if let Some(upstream_url) = config.upstream_url.clone() {
-        check_authoritative_boot_epoch(&state, &upstream_url).await?;
+    } else if let Some(upstream_url) = config.upstream_url.clone()
+        && check_authoritative_boot_epoch(&state, &upstream_url).await?
+    {
+        spawn_replica_loops(&config, Arc::clone(&state), upstream_url);
     }
 
     serve(config, state).await
@@ -610,6 +633,9 @@ async fn handle_request(
                 version: Some(VERSION.to_string()),
                 uptime_seconds: Some(state.started_at.elapsed().as_secs()),
                 key_count: Some(keys.len()),
+                epoch: Some(*state.epoch.lock().await),
+                fenced: Some(*state.fenced.lock().await),
+                mode: Some(state.mode.lock().await.as_str().to_string()),
                 ..VaultResponse::ok()
             }
         }
@@ -876,39 +902,49 @@ async fn promote_replica(state: &AppState) -> Result<()> {
     )
 }
 
-async fn check_authoritative_boot_epoch(state: &AppState, upstream_url: &str) -> Result<()> {
-    let response: HeartbeatResponse =
-        match replication_post_json(upstream_url, "/heartbeat", &state.replication_token).await {
-            Ok(response) => response,
-            Err(err) => {
-                eprintln!(
-                    "gild-vault authoritative boot epoch check could not reach peer at {upstream_url}; accepting writes fail-open: {err:#}"
-                );
-                if let Err(audit_err) = append_audit(
-                    &state.audit_log_path,
-                    &AuditEvent {
-                        ts: now_epoch_seconds()?,
-                        op: "boot_epoch_check",
-                        key: None,
-                        peer_uid: unsafe { libc::geteuid() },
-                        peer_pid: std::process::id() as i32,
-                        result: "peer_unreachable_fail_open",
-                    },
-                ) {
-                    eprintln!("gild-vault boot epoch check audit failed: {audit_err:#}");
-                }
-                return Ok(());
+async fn check_authoritative_boot_epoch(state: &AppState, upstream_url: &str) -> Result<bool> {
+    let response: HeartbeatResponse = match replication_post_json(
+        upstream_url,
+        "/heartbeat",
+        &state.replication_token,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            eprintln!(
+                "gild-vault authoritative boot epoch check could not reach peer at {upstream_url}; accepting writes fail-open: {err:#}"
+            );
+            if let Err(audit_err) = append_audit(
+                &state.audit_log_path,
+                &AuditEvent {
+                    ts: now_epoch_seconds()?,
+                    op: "boot_epoch_check",
+                    key: None,
+                    peer_uid: unsafe { libc::geteuid() },
+                    peer_pid: std::process::id() as i32,
+                    result: "peer_unreachable_fail_open",
+                },
+            ) {
+                eprintln!("gild-vault boot epoch check audit failed: {audit_err:#}");
             }
-        };
+            return Ok(false);
+        }
+    };
     let local_epoch = *state.epoch.lock().await;
     if response.epoch > local_epoch {
         eprintln!(
             "gild-vault {HIGHER_EPOCH_PEER_RESULT}: local_epoch={local_epoch}, peer_epoch={}",
             response.epoch
         );
+        demote_for_higher_epoch(state, response.epoch).await?;
+        attach_replica(state, upstream_url).await?;
         *state.fenced.lock().await = true;
-        *state.epoch.lock().await = response.epoch;
         persist_current_replication_meta(state).await?;
+        eprintln!(
+            "gild-vault boot epoch reconciliation attached follower to {upstream_url}: epoch={}",
+            response.epoch
+        );
         append_audit(
             &state.audit_log_path,
             &AuditEvent {
@@ -920,8 +956,9 @@ async fn check_authoritative_boot_epoch(state: &AppState, upstream_url: &str) ->
                 result: HIGHER_EPOCH_PEER_RESULT,
             },
         )?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 async fn adopt_higher_epoch_if_needed(
@@ -2565,15 +2602,15 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(*recovered.mode.lock().await, Mode::Authoritative);
         assert_eq!(*recovered.epoch.lock().await, 1005);
-        assert_eq!(*recovered.version.lock().await, 0);
+        assert_eq!(*recovered.mode.lock().await, Mode::Replica);
+        assert_eq!(*recovered.version.lock().await, 7);
         assert!(*recovered.fenced.lock().await);
         let meta = load_replication_meta(&recovered.replication_meta_path).unwrap();
         assert_eq!(meta.epoch, 1005);
         assert!(meta.fenced);
-        assert!(!recovered.keys.lock().await.contains_key("CANONICAL_ONLY"));
-        assert!(recovered.keys.lock().await.contains_key("STALE_ONLY"));
+        assert!(recovered.keys.lock().await.contains_key("CANONICAL_ONLY"));
+        assert!(!recovered.keys.lock().await.contains_key("STALE_ONLY"));
 
         let get = handle_request(
             &recovered,
@@ -2585,7 +2622,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(get.ok);
+        assert!(!get.ok);
+        assert_eq!(get.error.as_deref(), Some("not_found"));
 
         let put = handle_request(
             &recovered,
@@ -2599,7 +2637,7 @@ mod tests {
         .await
         .unwrap();
         assert!(!put.ok);
-        assert_eq!(put.error.as_deref(), Some("demoted_fenced"));
+        assert_eq!(put.error.as_deref(), Some("replica_read_only"));
         assert!(
             !recovered
                 .keys
