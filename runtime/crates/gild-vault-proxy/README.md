@@ -20,6 +20,10 @@ HTTP proxy for `gild-vault` management calls used by Tana admin tooling.
   Bearer authorization still applies after the mTLS handshake.
 - `VAULT_PROXY_AUDIT_LOG` defaults to `/var/log/gild-vault-proxy-audit.log`.
   TLS audit records include `tls_client_cn`.
+- `VAULT_PROXY_PEERS` is an optional comma-separated list of peer proxy base
+  URLs, also configurable with repeated `--peer <url>`. When the local vault
+  socket becomes unhealthy, the proxy polls peers once per second, selects the
+  healthy peer with the highest vault epoch, and routes vault traffic there.
 
 At startup the proxy calls `gild-vault` health on the configured socket before
 binding its TCP listener. If the daemon is unreachable, startup fails with an

@@ -75,6 +75,9 @@ struct VaultResponse {
     version: Option<String>,
     uptime_seconds: Option<u64>,
     key_count: Option<usize>,
+    epoch: Option<u64>,
+    fenced: Option<bool>,
+    mode: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +85,9 @@ pub struct VaultHealth {
     pub version: Option<String>,
     pub uptime_seconds: Option<u64>,
     pub key_count: Option<usize>,
+    pub epoch: Option<u64>,
+    pub fenced: Option<bool>,
+    pub mode: Option<String>,
 }
 
 impl Secrets {
@@ -287,6 +293,9 @@ impl VaultClient {
                 version: response.version,
                 uptime_seconds: response.uptime_seconds,
                 key_count: response.key_count,
+                epoch: response.epoch,
+                fenced: response.fenced,
+                mode: response.mode,
             })
         } else {
             Err(VaultClientError::Vault(

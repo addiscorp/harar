@@ -13,6 +13,7 @@ axum = { workspace = true }
 gild-vault-client = { path = "../gild-vault-client" }
 hyper = { workspace = true }
 hyper-util = { workspace = true, features = ["server", "http1", "http2", "tokio"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 rustls = "0.23"
 rustls-pemfile = "2"
 rustls-pki-types = "1"
