@@ -58,10 +58,6 @@ export async function vaultCli(argv: string[], options: CliOptions = {}): Promis
     console.log(JSON.stringify(await request(socket, token, 'GET', '/audit'), null, 2));
     return;
   }
-  if (cmd === 'migrate-env') {
-    throw new Error('migrate-env is daemon-side transactional API work; use POST /secret import flow in v1 tests');
-  }
-
   throw new Error(`unknown vault command: ${cmd ?? ''}`);
 }
 
