@@ -1,4 +1,9 @@
 use anyhow::{Context, Result, anyhow};
+use gild_vault_client::{
+    HararTokenTemplate, MintTokenRequest, MintedToken, TokenError, VaultClient,
+    VerifyTokenResponse, generate_signing_key, jwks_for_key, mint_token, signing_key_bytes,
+    signing_key_from_bytes, verify_token,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -19,6 +24,7 @@ const DEFAULT_SOCKET_PATH: &str = "/run/gild-vault.sock";
 const DEFAULT_STATE_PATH: &str = "/var/lib/gild-vault/keys.age";
 const DEFAULT_AUDIT_LOG_PATH: &str = "/var/log/gild-vault.log";
 const DEFAULT_REPLICATION_TOKEN_PATH: &str = "/etc/gild/vault-replication-token";
+const DEFAULT_SIGNING_KEY_PATH: &str = "/var/lib/gild-vault/harar-signing.key";
 const DEFAULT_HEARTBEAT_INTERVAL_SECONDS: u64 = 5;
 const DEFAULT_SYNC_INTERVAL_SECONDS: u64 = 30;
 const DEFAULT_PROMOTE_AFTER_FAILURES: u32 = 5;
@@ -37,6 +43,7 @@ struct Config {
     mode: Mode,
     upstream_url: Option<String>,
     replication_token_path: PathBuf,
+    signing_key_path: PathBuf,
     heartbeat_interval: Duration,
     sync_interval: Duration,
     promote_after_failures: u32,
@@ -54,6 +61,7 @@ impl Config {
                 "GILD_VAULT_REPLICATION_TOKEN_FILE",
                 DEFAULT_REPLICATION_TOKEN_PATH,
             ),
+            signing_key_path: env_path("HARAR_SIGNING_KEY_PATH", DEFAULT_SIGNING_KEY_PATH),
             heartbeat_interval: Duration::from_secs(env_u64(
                 "GILD_VAULT_HEARTBEAT_SECONDS",
                 DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
@@ -99,6 +107,11 @@ impl Config {
                 "--replication-token-file" => {
                     if let Some(value) = args.next() {
                         config.replication_token_path = PathBuf::from(value);
+                    }
+                }
+                "--signing-key-file" => {
+                    if let Some(value) = args.next() {
+                        config.signing_key_path = PathBuf::from(value);
                     }
                 }
                 "--heartbeat-seconds" => {
@@ -162,6 +175,7 @@ struct AppState {
     fenced: Mutex<bool>,
     replication_log: Mutex<Vec<ReplicationLogEntry>>,
     replication_token: String,
+    signing_key: ed25519_dalek::SigningKey,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -225,6 +239,17 @@ enum VaultRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         shop_id: Option<String>,
     },
+    Mint {
+        template: HararTokenTemplate,
+        subject: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        ttl_seconds: u64,
+    },
+    Verify {
+        token: String,
+        audience: String,
+    },
     Health,
 }
 
@@ -249,6 +274,20 @@ struct VaultResponse {
     fenced: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    jti: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exp: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aud: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scopes: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    valid: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sub: Option<String>,
 }
 
 impl VaultResponse {
@@ -264,6 +303,13 @@ impl VaultResponse {
             epoch: None,
             fenced: None,
             mode: None,
+            token: None,
+            jti: None,
+            exp: None,
+            aud: None,
+            scopes: None,
+            valid: None,
+            sub: None,
         }
     }
 
@@ -279,6 +325,13 @@ impl VaultResponse {
             epoch: None,
             fenced: None,
             mode: None,
+            token: None,
+            jti: None,
+            exp: None,
+            aud: None,
+            scopes: None,
+            valid: None,
+            sub: None,
         }
     }
 }
@@ -308,6 +361,13 @@ struct AuditEvent<'a> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if let Some(command) = harar_command() {
+        return run_harar_cli(command).await;
+    }
+    run_daemon().await
+}
+
+async fn run_daemon() -> Result<()> {
     let config = Config::from_env_and_args();
     let master_key = master_key::load_master_key()?;
     let master_recipient = master_key.to_public();
@@ -317,6 +377,7 @@ async fn main() -> Result<()> {
     let meta = load_replication_meta(&replication_meta_path)?;
     let replication_log = load_replication_log(&replication_log_path)?;
     let replication_token = load_replication_token(&config.replication_token_path)?;
+    let signing_key = load_or_create_signing_key(&config.signing_key_path)?;
     let state = Arc::new(AppState {
         keys: Mutex::new(keys),
         started_at: Instant::now(),
@@ -332,6 +393,7 @@ async fn main() -> Result<()> {
         fenced: Mutex::new(meta.fenced),
         replication_log: Mutex::new(replication_log),
         replication_token,
+        signing_key,
     });
 
     if config.mode == Mode::Replica {
@@ -347,6 +409,99 @@ async fn main() -> Result<()> {
     }
 
     serve(config, state).await
+}
+
+fn harar_command() -> Option<String> {
+    let bin = std::env::args().next().unwrap_or_default();
+    if !bin.rsplit('/').next().unwrap_or("").contains("harar") {
+        return None;
+    }
+    let command = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "serve".to_string());
+    match command.as_str() {
+        "mint" | "verify" | "jwks" => Some(command),
+        "serve" => None,
+        _ => None,
+    }
+}
+
+async fn run_harar_cli(command: String) -> Result<()> {
+    let args = std::env::args().skip(2).collect::<Vec<_>>();
+    match command.as_str() {
+        "mint" => cli_mint(&args).await,
+        "verify" => cli_verify(&args).await,
+        "jwks" => cli_jwks(&args).await,
+        _ => Err(anyhow!("unknown harar command {command}")),
+    }
+}
+
+async fn cli_mint(args: &[String]) -> Result<()> {
+    let socket = cli_value(args, "--socket").unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_string());
+    let template = cli_value(args, "--template")
+        .and_then(|value| HararTokenTemplate::parse(&value))
+        .ok_or_else(|| {
+            anyhow!("harar mint requires --template agent-session|run-scoped|service")
+        })?;
+    let subject =
+        cli_value(args, "--subject").ok_or_else(|| anyhow!("harar mint requires --subject"))?;
+    let ttl_seconds = cli_value(args, "--ttl-seconds")
+        .ok_or_else(|| anyhow!("harar mint requires --ttl-seconds"))?
+        .parse::<u64>()
+        .context("parse --ttl-seconds")?;
+    let request = MintTokenRequest {
+        template,
+        subject,
+        run_id: cli_value(args, "--run-id"),
+        ttl_seconds,
+    };
+    let token = VaultClient::from_socket_path(socket)
+        .mint_token(&request)
+        .await?;
+    println!("{}", serde_json::to_string(&token)?);
+    Ok(())
+}
+
+async fn cli_verify(args: &[String]) -> Result<()> {
+    let socket = cli_value(args, "--socket").unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_string());
+    let token =
+        cli_value(args, "--token").ok_or_else(|| anyhow!("harar verify requires --token"))?;
+    let audience = cli_value(args, "--audience")
+        .or_else(|| cli_value(args, "--aud"))
+        .ok_or_else(|| anyhow!("harar verify requires --audience"))?;
+    let client = VaultClient::from_socket_path(socket);
+    let jwks = client.jwks().await?;
+    let response = match verify_token(&jwks, &token, &audience, now_epoch_seconds()?) {
+        Ok(claims) => VerifyTokenResponse {
+            valid: true,
+            sub: Some(claims.sub),
+            jti: Some(claims.jti),
+            exp: Some(claims.exp),
+            error: None,
+        },
+        Err(err) => VerifyTokenResponse {
+            valid: false,
+            sub: None,
+            jti: None,
+            exp: None,
+            error: Some(token_error_code(&err).to_string()),
+        },
+    };
+    println!("{}", serde_json::to_string(&response)?);
+    Ok(())
+}
+
+async fn cli_jwks(args: &[String]) -> Result<()> {
+    let socket = cli_value(args, "--socket").unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_string());
+    let jwks = VaultClient::from_socket_path(socket).jwks().await?;
+    println!("{}", serde_json::to_string(&jwks)?);
+    Ok(())
+}
+
+fn cli_value(args: &[String], name: &str) -> Option<String> {
+    args.windows(2)
+        .find(|window| window[0] == name)
+        .map(|window| window[1].clone())
 }
 
 async fn serve(config: Config, state: Arc<AppState>) -> Result<()> {
@@ -455,6 +610,11 @@ async fn handle_http_request(
 
     if request.method != "GET" {
         return Ok(HttpReply::json_error(405, "method not allowed"));
+    }
+
+    if request.path == "/v1/jwks" {
+        let jwks = jwks_for_key(&state.signing_key.verifying_key());
+        return Ok(HttpReply::json_value(200, serde_json::to_value(jwks)?));
     }
 
     let Some(key) = request
@@ -626,6 +786,54 @@ async fn handle_request(
             persist_keys(&state.state_path, &state.master_recipient, &keys)?;
             append_replication_log(state, "delete", &key, None).await?;
             VaultResponse::ok()
+        }
+        VaultRequest::Mint {
+            template,
+            subject,
+            run_id,
+            ttl_seconds,
+        } => match mint_token(
+            &state.signing_key,
+            &MintTokenRequest {
+                template,
+                subject,
+                run_id,
+                ttl_seconds,
+            },
+            now_epoch_seconds()?,
+        ) {
+            Ok(MintedToken {
+                token,
+                jti,
+                exp,
+                aud,
+                scopes,
+            }) => VaultResponse {
+                token: Some(token),
+                jti: Some(jti),
+                exp: Some(exp),
+                aud: Some(aud),
+                scopes: Some(scopes),
+                ..VaultResponse::ok()
+            },
+            Err(err) => VaultResponse::error(token_error_code(&err)),
+        },
+        VaultRequest::Verify { token, audience } => {
+            let jwks = jwks_for_key(&state.signing_key.verifying_key());
+            match verify_token(&jwks, &token, &audience, now_epoch_seconds()?) {
+                Ok(claims) => VaultResponse {
+                    valid: Some(true),
+                    sub: Some(claims.sub),
+                    jti: Some(claims.jti),
+                    exp: Some(claims.exp),
+                    ..VaultResponse::ok()
+                },
+                Err(err) => VaultResponse {
+                    valid: Some(false),
+                    error: Some(token_error_code(&err).to_string()),
+                    ..VaultResponse::ok()
+                },
+            }
         }
         VaultRequest::Health => {
             let keys = state.keys.lock().await;
@@ -1223,6 +1431,24 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+fn token_error_code(err: &TokenError) -> &'static str {
+    match err {
+        TokenError::UnknownTemplate => "unknown_template",
+        TokenError::MissingRunId => "missing_run_id",
+        TokenError::UnexpectedRunId => "unexpected_run_id",
+        TokenError::EmptySubject => "empty_subject",
+        TokenError::InvalidSubject => "invalid_subject",
+        TokenError::InvalidRunId => "invalid_run_id",
+        TokenError::TtlOutOfBounds { .. } => "ttl_out_of_bounds",
+        TokenError::InvalidToken(_) => "invalid_token",
+        TokenError::KeyNotFound => "key_not_found",
+        TokenError::Expired => "expired",
+        TokenError::WrongAudience => "wrong_audience",
+        TokenError::BadSignature => "bad_signature",
+        TokenError::Json(_) => "bad_json",
+    }
+}
+
 impl VaultRequest {
     fn op_name(&self) -> &'static str {
         match self {
@@ -1230,6 +1456,8 @@ impl VaultRequest {
             Self::Put { .. } => "put",
             Self::List { .. } => "list",
             Self::Delete { .. } => "delete",
+            Self::Mint { .. } => "mint",
+            Self::Verify { .. } => "verify",
             Self::Health => "health",
         }
     }
@@ -1237,14 +1465,21 @@ impl VaultRequest {
     fn key(&self) -> Option<&str> {
         match self {
             Self::Get { key, .. } | Self::Put { key, .. } | Self::Delete { key, .. } => Some(key),
-            Self::List { .. } | Self::Health => None,
+            Self::List { .. } | Self::Mint { .. } | Self::Verify { .. } | Self::Health => None,
         }
     }
 }
 
 fn authorize(peer: &PeerCred, request: &VaultRequest) -> Decision {
     match request {
-        VaultRequest::Health => Decision::Allow,
+        VaultRequest::Health | VaultRequest::Verify { .. } => Decision::Allow,
+        VaultRequest::Mint { .. } => {
+            if is_admin(peer) || is_gild(peer) {
+                Decision::Allow
+            } else {
+                Decision::Deny("forbidden")
+            }
+        }
         VaultRequest::Get { key, shop_id } => {
             if can_read_key(peer, key, shop_id.as_deref()) {
                 Decision::Allow
@@ -1317,6 +1552,13 @@ fn is_runtime(peer: &PeerCred) -> bool {
             | Some("deka-platform")
             | Some("tana-deka-platform")
             | Some("gild-vault-proxy")
+    )
+}
+
+fn is_gild(peer: &PeerCred) -> bool {
+    matches!(
+        peer.username.as_deref(),
+        Some("gild") | Some("gild-agent") | Some("gild-dispatcher")
     )
 }
 
@@ -1414,6 +1656,34 @@ fn load_replication_token(path: &Path) -> Result<String> {
         return Err(anyhow!("replication token at {} is empty", path.display()));
     }
     Ok(token)
+}
+
+fn load_or_create_signing_key(path: &Path) -> Result<ed25519_dalek::SigningKey> {
+    match fs::read(path) {
+        Ok(bytes) => signing_key_from_bytes(&bytes)
+            .map_err(|err| anyhow!("decode harar signing key at {}: {err}", path.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("create {}", parent.display()))?;
+                fs::set_permissions(parent, fs::Permissions::from_mode(0o750))
+                    .with_context(|| format!("chmod 0750 {}", parent.display()))?;
+            }
+            let key = generate_signing_key();
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(path)
+                .with_context(|| format!("create harar signing key {}", path.display()))?;
+            file.write_all(&signing_key_bytes(&key))
+                .with_context(|| format!("write harar signing key {}", path.display()))?;
+            file.sync_all()
+                .with_context(|| format!("sync harar signing key {}", path.display()))?;
+            Ok(key)
+        }
+        Err(err) => Err(err).with_context(|| format!("read {}", path.display())),
+    }
 }
 
 fn load_replication_meta(path: &Path) -> Result<ReplicationMeta> {
@@ -1771,6 +2041,7 @@ mod tests {
             fenced: Mutex::new(false),
             replication_log: Mutex::new(Vec::new()),
             replication_token: "test-replication-token".to_string(),
+            signing_key: generate_signing_key(),
         }
     }
 
@@ -1788,6 +2059,7 @@ mod tests {
             mode: Mode::Authoritative,
             upstream_url: None,
             replication_token_path: dir.join("vault-replication-token"),
+            signing_key_path: dir.join("harar-signing.key"),
             heartbeat_interval: Duration::from_millis(10),
             sync_interval: Duration::from_millis(10),
             promote_after_failures: 2,
@@ -1811,6 +2083,7 @@ mod tests {
             fenced: Mutex::new(false),
             replication_log: Mutex::new(Vec::new()),
             replication_token: "test-replication-token".to_string(),
+            signing_key: generate_signing_key(),
         }
     }
 
@@ -1993,6 +2266,120 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn mint_uses_named_templates_and_verify_checks_audience() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path());
+
+        let minted = handle_request(
+            &state,
+            &peer(0, "root"),
+            VaultRequest::Mint {
+                template: HararTokenTemplate::RunScoped,
+                subject: "agent:khalid".to_string(),
+                run_id: Some("run_707".to_string()),
+                ttl_seconds: 300,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(minted.ok);
+        assert_eq!(minted.aud.as_deref(), Some("linkhash"));
+        assert_eq!(
+            minted.scopes.as_deref(),
+            Some(
+                vec![
+                    "run:run_707:read".to_string(),
+                    "run:run_707:write".to_string()
+                ]
+                .as_slice()
+            )
+        );
+
+        let verified = handle_request(
+            &state,
+            &peer(1001, "agent-amina"),
+            VaultRequest::Verify {
+                token: minted.token.clone().unwrap(),
+                audience: "linkhash".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(verified.valid, Some(true));
+        assert_eq!(verified.sub.as_deref(), Some("agent:khalid"));
+        assert_eq!(verified.jti, minted.jti);
+
+        let wrong_aud = handle_request(
+            &state,
+            &peer(1001, "agent-amina"),
+            VaultRequest::Verify {
+                token: minted.token.unwrap(),
+                audience: "deka".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(wrong_aud.valid, Some(false));
+        assert_eq!(wrong_aud.error.as_deref(), Some("wrong_audience"));
+    }
+
+    #[tokio::test]
+    async fn mint_rejects_over_cap_ttl_and_non_admin_peer() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path());
+
+        let denied = handle_request(
+            &state,
+            &peer(1001, "agent-amina"),
+            VaultRequest::Mint {
+                template: HararTokenTemplate::AgentSession,
+                subject: "agent:amina".to_string(),
+                run_id: None,
+                ttl_seconds: 60,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(denied.error.as_deref(), Some("forbidden"));
+
+        let over_cap = handle_request(
+            &state,
+            &peer(0, "root"),
+            VaultRequest::Mint {
+                template: HararTokenTemplate::Service,
+                subject: "service:gild".to_string(),
+                run_id: None,
+                ttl_seconds: 901,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(over_cap.error.as_deref(), Some("ttl_out_of_bounds"));
+    }
+
+    #[tokio::test]
+    async fn http_jwks_publishes_public_key_only() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path());
+        let reply = handle_http_request(
+            &state,
+            &peer(1001, "agent-amina"),
+            b"GET /v1/jwks HTTP/1.1\r\nHost: harar\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reply.status, 200);
+        assert!(reply.body.get("keys").is_some());
+        let jwk = &reply.body["keys"][0];
+        assert_eq!(jwk["kty"], "OKP");
+        assert!(jwk.get("x").is_some());
+        assert!(jwk.get("d").is_none());
+        let body = reply.body.to_string();
+        assert!(!body.contains("private"));
+    }
+
     #[test]
     fn policy_allows_root_and_sami_to_read_everything() {
         assert!(can_read_key(&peer(0, "root"), "ANTHROPIC_API_KEY", None));
@@ -2109,6 +2496,7 @@ mod tests {
             fenced: Mutex::new(false),
             replication_log: Mutex::new(Vec::new()),
             replication_token: "test-replication-token".to_string(),
+            signing_key: generate_signing_key(),
         };
 
         let response = handle_request(
@@ -2406,6 +2794,7 @@ mod tests {
             fenced: Mutex::new(false),
             replication_log: Mutex::new(Vec::new()),
             replication_token: "test-replication-token".to_string(),
+            signing_key: generate_signing_key(),
         });
         attach_replica(
             &replica_state,

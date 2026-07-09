@@ -5,6 +5,9 @@ edition = "2021"
 description = "Rust SDK for reading secrets from gild-vault"
 
 [dependencies]
+base64 = "0.22"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "net", "sync"] }

@@ -7,9 +7,15 @@ edition = "2024"
 name = "gild-vault"
 path = "src/main.rs"
 
+[[bin]]
+name = "harar"
+path = "src/harar.rs"
+
 [dependencies]
 age = "0.11.3"
 anyhow = "1"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+gild-vault-client = { path = "../gild-vault-client" }
 libc = "0.2"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
