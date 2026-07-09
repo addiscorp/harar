@@ -14,11 +14,13 @@ path = "src/harar.rs"
 [dependencies]
 age = "0.11.3"
 anyhow = "1"
+clap = { version = "4.5", features = ["derive", "env"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 gild-vault-client = { path = "../gild-vault-client" }
 libc = "0.2"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+tana-cli-core = { path = "../tana-cli-core" }
 tokio = { workspace = true, features = ["full"] }
 
 [dev-dependencies]

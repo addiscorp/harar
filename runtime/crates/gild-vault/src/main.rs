@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use gild_vault_client::{
     HararTokenTemplate, MintTokenRequest, MintedToken, TokenError, VaultClient,
     VerifyTokenResponse, default_vault_socket_path, generate_signing_key, jwks_for_key, mint_token,
-    signing_key_bytes, signing_key_from_bytes, verify_token,
+    signing_key_bytes, signing_key_from_bytes, validate_token_bindings, verify_token,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -249,6 +249,13 @@ enum VaultRequest {
     Verify {
         token: String,
         audience: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+    },
+    Revoke {
+        jti: String,
     },
     Health,
 }
@@ -735,7 +742,7 @@ async fn handle_request(
 
     if matches!(
         request,
-        VaultRequest::Put { .. } | VaultRequest::Delete { .. }
+        VaultRequest::Put { .. } | VaultRequest::Delete { .. } | VaultRequest::Revoke { .. }
     ) {
         if *state.mode.lock().await == Mode::Replica {
             audit(
@@ -822,21 +829,53 @@ async fn handle_request(
             },
             Err(err) => VaultResponse::error(token_error_code(&err)),
         },
-        VaultRequest::Verify { token, audience } => {
+        VaultRequest::Verify {
+            token,
+            audience,
+            subject,
+            run_id,
+        } => {
             let jwks = jwks_for_key(&state.signing_key.verifying_key());
             match verify_token(&jwks, &token, &audience, now_epoch_seconds()?) {
-                Ok(claims) => VaultResponse {
-                    valid: Some(true),
-                    sub: Some(claims.sub),
-                    jti: Some(claims.jti),
-                    exp: Some(claims.exp),
-                    ..VaultResponse::ok()
-                },
+                Ok(claims) => {
+                    let validation =
+                        validate_token_bindings(&claims, subject.as_deref(), run_id.as_deref());
+                    let validation = match validation {
+                        Ok(()) => token_not_revoked(state, &claims.jti).await,
+                        Err(err) => Err(err),
+                    };
+                    match validation {
+                        Ok(()) => VaultResponse {
+                            valid: Some(true),
+                            sub: Some(claims.sub),
+                            jti: Some(claims.jti),
+                            exp: Some(claims.exp),
+                            ..VaultResponse::ok()
+                        },
+                        Err(err) => VaultResponse {
+                            valid: Some(false),
+                            error: Some(token_error_code(&err).to_string()),
+                            ..VaultResponse::ok()
+                        },
+                    }
+                }
                 Err(err) => VaultResponse {
                     valid: Some(false),
                     error: Some(token_error_code(&err).to_string()),
                     ..VaultResponse::ok()
                 },
+            }
+        }
+        VaultRequest::Revoke { jti } => {
+            if jti.trim().is_empty() {
+                VaultResponse::error("missing_jti")
+            } else {
+                let key = revoked_jti_key(&jti);
+                let mut keys = state.keys.lock().await;
+                keys.insert(key.clone(), "revoked".to_string());
+                persist_keys(&state.state_path, &state.master_recipient, &keys)?;
+                append_replication_log(state, "put", &key, Some("revoked".to_string())).await?;
+                VaultResponse::ok()
             }
         }
         VaultRequest::Health => {
@@ -1435,6 +1474,18 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+fn revoked_jti_key(jti: &str) -> String {
+    format!("harar:revoked:{jti}")
+}
+
+async fn token_not_revoked(state: &AppState, jti: &str) -> Result<(), TokenError> {
+    if state.keys.lock().await.contains_key(&revoked_jti_key(jti)) {
+        Err(TokenError::Revoked)
+    } else {
+        Ok(())
+    }
+}
+
 fn token_error_code(err: &TokenError) -> &'static str {
     match err {
         TokenError::UnknownTemplate => "unknown_template",
@@ -1449,6 +1500,9 @@ fn token_error_code(err: &TokenError) -> &'static str {
         TokenError::Expired => "expired",
         TokenError::WrongAudience => "wrong_audience",
         TokenError::BadSignature => "bad_signature",
+        TokenError::Revoked => "revoked",
+        TokenError::WrongSubject => "wrong_subject",
+        TokenError::WrongRunId => "wrong_run_id",
         TokenError::Json(_) => "bad_json",
     }
 }
@@ -1462,6 +1516,7 @@ impl VaultRequest {
             Self::Delete { .. } => "delete",
             Self::Mint { .. } => "mint",
             Self::Verify { .. } => "verify",
+            Self::Revoke { .. } => "revoke",
             Self::Health => "health",
         }
     }
@@ -1469,7 +1524,11 @@ impl VaultRequest {
     fn key(&self) -> Option<&str> {
         match self {
             Self::Get { key, .. } | Self::Put { key, .. } | Self::Delete { key, .. } => Some(key),
-            Self::List { .. } | Self::Mint { .. } | Self::Verify { .. } | Self::Health => None,
+            Self::List { .. }
+            | Self::Mint { .. }
+            | Self::Verify { .. }
+            | Self::Revoke { .. }
+            | Self::Health => None,
         }
     }
 }
@@ -1477,7 +1536,7 @@ impl VaultRequest {
 fn authorize(peer: &PeerCred, request: &VaultRequest) -> Decision {
     match request {
         VaultRequest::Health | VaultRequest::Verify { .. } => Decision::Allow,
-        VaultRequest::Mint { .. } => {
+        VaultRequest::Mint { .. } | VaultRequest::Revoke { .. } => {
             if is_admin(peer) || is_gild(peer) {
                 Decision::Allow
             } else {
@@ -2288,6 +2347,33 @@ mod tests {
         let dir = tempdir().unwrap();
         let state = test_state(dir.path());
 
+        let expired = mint_token(
+            &state.signing_key,
+            &MintTokenRequest {
+                template: HararTokenTemplate::Service,
+                subject: "service:gild".to_string(),
+                run_id: None,
+                ttl_seconds: 1,
+            },
+            now_epoch_seconds().unwrap().saturating_sub(2),
+        )
+        .unwrap();
+
+        let expired_verify = handle_request(
+            &state,
+            &peer(1001, "agent-amina"),
+            VaultRequest::Verify {
+                token: expired.token,
+                audience: "linkhash".to_string(),
+                subject: Some("service:gild".to_string()),
+                run_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(expired_verify.valid, Some(false));
+        assert_eq!(expired_verify.error.as_deref(), Some("expired"));
+
         let minted = handle_request(
             &state,
             &peer(0, "root"),
@@ -2319,6 +2405,8 @@ mod tests {
             VaultRequest::Verify {
                 token: minted.token.clone().unwrap(),
                 audience: "linkhash".to_string(),
+                subject: Some("agent:khalid".to_string()),
+                run_id: Some("run_707".to_string()),
             },
         )
         .await
@@ -2327,18 +2415,61 @@ mod tests {
         assert_eq!(verified.sub.as_deref(), Some("agent:khalid"));
         assert_eq!(verified.jti, minted.jti);
 
+        let wrong_sub = handle_request(
+            &state,
+            &peer(1001, "agent-amina"),
+            VaultRequest::Verify {
+                token: minted.token.clone().unwrap(),
+                audience: "linkhash".to_string(),
+                subject: Some("agent:amina".to_string()),
+                run_id: Some("run_707".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(wrong_sub.valid, Some(false));
+        assert_eq!(wrong_sub.error.as_deref(), Some("wrong_subject"));
+
         let wrong_aud = handle_request(
             &state,
             &peer(1001, "agent-amina"),
             VaultRequest::Verify {
-                token: minted.token.unwrap(),
+                token: minted.token.clone().unwrap(),
                 audience: "deka".to_string(),
+                subject: None,
+                run_id: None,
             },
         )
         .await
         .unwrap();
         assert_eq!(wrong_aud.valid, Some(false));
         assert_eq!(wrong_aud.error.as_deref(), Some("wrong_audience"));
+
+        let revoked = handle_request(
+            &state,
+            &peer(0, "root"),
+            VaultRequest::Revoke {
+                jti: minted.jti.clone().unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(revoked.ok);
+
+        let revoked_verify = handle_request(
+            &state,
+            &peer(1001, "agent-amina"),
+            VaultRequest::Verify {
+                token: minted.token.unwrap(),
+                audience: "linkhash".to_string(),
+                subject: Some("agent:khalid".to_string()),
+                run_id: Some("run_707".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(revoked_verify.valid, Some(false));
+        assert_eq!(revoked_verify.error.as_deref(), Some("revoked"));
     }
 
     #[tokio::test]
@@ -2477,6 +2608,8 @@ mod tests {
             .verify_token(&VerifyTokenRequest {
                 token: minted.token,
                 audience: "linkhash".to_string(),
+                subject: Some("service:gild".to_string()),
+                run_id: None,
             })
             .await
             .unwrap();

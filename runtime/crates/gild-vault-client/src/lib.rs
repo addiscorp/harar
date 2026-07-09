@@ -132,6 +132,10 @@ pub struct MintedToken {
 pub struct VerifyTokenRequest {
     pub token: String,
     pub audience: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -145,6 +149,11 @@ pub struct VerifyTokenResponse {
     pub exp: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RevokeTokenRequest {
+    pub jti: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -189,6 +198,9 @@ pub enum TokenError {
     Expired,
     WrongAudience,
     BadSignature,
+    Revoked,
+    WrongSubject,
+    WrongRunId,
     Json(String),
 }
 
@@ -225,6 +237,13 @@ enum VaultRequest<'a> {
     Verify {
         token: &'a str,
         audience: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        subject: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        run_id: Option<&'a str>,
+    },
+    Revoke {
+        jti: &'a str,
     },
     Health,
 }
@@ -517,6 +536,8 @@ impl VaultClient {
             .request(&VaultRequest::Verify {
                 token: &request.token,
                 audience: &request.audience,
+                subject: request.subject.as_deref(),
+                run_id: request.run_id.as_deref(),
             })
             .await?;
         if response.ok {
@@ -532,6 +553,24 @@ impl VaultClient {
                 response
                     .error
                     .unwrap_or_else(|| "verify_failed".to_string()),
+            ))
+        }
+    }
+
+    pub async fn revoke_token(&self, request: &RevokeTokenRequest) -> Result<(), VaultClientError> {
+        if request.jti.is_empty() {
+            return Err(VaultClientError::InvalidResponse("missing jti".to_string()));
+        }
+        let response = self
+            .request(&VaultRequest::Revoke { jti: &request.jti })
+            .await?;
+        if response.ok {
+            Ok(())
+        } else {
+            Err(VaultClientError::Vault(
+                response
+                    .error
+                    .unwrap_or_else(|| "revoke_failed".to_string()),
             ))
         }
     }
@@ -647,6 +686,11 @@ pub fn harar_auth_contract() -> SeamContract {
             response: "HararVerifyTokenResponse".to_string(),
         },
         SeamBoundary {
+            function: "revoke".to_string(),
+            request: "HararRevokeTokenRequest".to_string(),
+            response: "HararOkResponse".to_string(),
+        },
+        SeamBoundary {
             function: "jwks".to_string(),
             request: "HararJwksRequest".to_string(),
             response: "HararJwksResponse".to_string(),
@@ -676,7 +720,12 @@ pub fn harar_auth_contract() -> SeamContract {
         ),
         record(
             "HararVerifyTokenRequest",
-            &[("token", string()), ("audience", string())],
+            &[
+                ("token", string()),
+                ("audience", string()),
+                ("subject", option(string())),
+                ("run_id", option(string())),
+            ],
         ),
         record(
             "HararVerifyTokenResponse",
@@ -689,6 +738,8 @@ pub fn harar_auth_contract() -> SeamContract {
                 ("error", option(string())),
             ],
         ),
+        record("HararRevokeTokenRequest", &[("jti", string())]),
+        record("HararOkResponse", &[("ok", bool_type())]),
         record("HararJwksRequest", &[]),
         record(
             "HararJwk",
@@ -847,6 +898,24 @@ pub fn verify_token(
     Ok(claims)
 }
 
+pub fn validate_token_bindings(
+    claims: &TokenClaims,
+    expected_subject: Option<&str>,
+    expected_run_id: Option<&str>,
+) -> Result<(), TokenError> {
+    if let Some(expected_subject) = expected_subject {
+        if claims.sub != expected_subject {
+            return Err(TokenError::WrongSubject);
+        }
+    }
+    if let Some(expected_run_id) = expected_run_id {
+        if claims.run_id.as_deref() != Some(expected_run_id) {
+            return Err(TokenError::WrongRunId);
+        }
+    }
+    Ok(())
+}
+
 fn sign_claims(signing_key: &SigningKey, claims: &TokenClaims) -> Result<String, TokenError> {
     let verifying_key = signing_key.verifying_key();
     let header = serde_json::json!({
@@ -932,6 +1001,9 @@ impl fmt::Display for TokenError {
             TokenError::Expired => write!(f, "token expired"),
             TokenError::WrongAudience => write!(f, "token audience mismatch"),
             TokenError::BadSignature => write!(f, "token signature check failed"),
+            TokenError::Revoked => write!(f, "token jti is revoked"),
+            TokenError::WrongSubject => write!(f, "token subject mismatch"),
+            TokenError::WrongRunId => write!(f, "token run_id mismatch"),
             TokenError::Json(message) => write!(f, "token JSON error: {message}"),
         }
     }
