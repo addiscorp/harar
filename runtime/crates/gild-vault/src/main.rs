@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, anyhow};
 use gild_vault_client::{
     HararTokenTemplate, MintTokenRequest, MintedToken, TokenError, VaultClient,
-    VerifyTokenResponse, generate_signing_key, jwks_for_key, mint_token, signing_key_bytes,
-    signing_key_from_bytes, verify_token,
+    VerifyTokenResponse, default_vault_socket_path, generate_signing_key, jwks_for_key, mint_token,
+    signing_key_bytes, signing_key_from_bytes, verify_token,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -437,7 +437,7 @@ async fn run_harar_cli(command: String) -> Result<()> {
 }
 
 async fn cli_mint(args: &[String]) -> Result<()> {
-    let socket = cli_value(args, "--socket").unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_string());
+    let socket = cli_socket(args);
     let template = cli_value(args, "--template")
         .and_then(|value| HararTokenTemplate::parse(&value))
         .ok_or_else(|| {
@@ -463,7 +463,7 @@ async fn cli_mint(args: &[String]) -> Result<()> {
 }
 
 async fn cli_verify(args: &[String]) -> Result<()> {
-    let socket = cli_value(args, "--socket").unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_string());
+    let socket = cli_socket(args);
     let token =
         cli_value(args, "--token").ok_or_else(|| anyhow!("harar verify requires --token"))?;
     let audience = cli_value(args, "--audience")
@@ -492,10 +492,14 @@ async fn cli_verify(args: &[String]) -> Result<()> {
 }
 
 async fn cli_jwks(args: &[String]) -> Result<()> {
-    let socket = cli_value(args, "--socket").unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_string());
+    let socket = cli_socket(args);
     let jwks = VaultClient::from_socket_path(socket).jwks().await?;
     println!("{}", serde_json::to_string(&jwks)?);
     Ok(())
+}
+
+fn cli_socket(args: &[String]) -> String {
+    cli_value(args, "--socket").unwrap_or_else(default_vault_socket_path)
 }
 
 fn cli_value(args: &[String], name: &str) -> Option<String> {
@@ -1995,9 +1999,12 @@ fn now_epoch_seconds() -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gild_vault_client::{DEFAULT_GILD_VAULT_SOCKET_PATH, VerifyTokenRequest};
     use std::time::Duration;
     use tempfile::tempdir;
     use tokio::net::UnixStream;
+
+    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
     fn peer(uid: u32, username: &str) -> PeerCred {
         PeerCred {
@@ -2063,6 +2070,16 @@ mod tests {
             heartbeat_interval: Duration::from_millis(10),
             sync_interval: Duration::from_millis(10),
             promote_after_failures: 2,
+        }
+    }
+
+    fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
+        // SAFETY: callers hold ENV_LOCK while restoring process environment.
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
         }
     }
 
@@ -2378,6 +2395,99 @@ mod tests {
         assert!(jwk.get("d").is_none());
         let body = reply.body.to_string();
         assert!(!body.contains("private"));
+    }
+
+    #[tokio::test]
+    async fn mint_audit_does_not_export_token_or_signing_key() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path());
+        let signing_key = signing_key_bytes(&state.signing_key);
+        let signing_key_debug = format!("{signing_key:?}");
+
+        let minted = handle_request(
+            &state,
+            &peer(0, "root"),
+            VaultRequest::Mint {
+                template: HararTokenTemplate::Service,
+                subject: "service:gild".to_string(),
+                run_id: None,
+                ttl_seconds: 60,
+            },
+        )
+        .await
+        .unwrap();
+
+        let audit = fs::read_to_string(&state.audit_log_path).unwrap();
+        assert!(audit.contains("\"op\":\"mint\""));
+        assert!(audit.contains("\"result\":\"ok\""));
+        assert!(!audit.contains(minted.token.as_deref().unwrap()));
+        assert!(!audit.contains(&signing_key_debug));
+        assert!(!audit.contains("signing_key"));
+        assert!(!audit.contains("private"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn harar_default_socket_matches_daemon_and_env_path_works_without_socket_arg() {
+        assert_eq!(DEFAULT_SOCKET_PATH, DEFAULT_GILD_VAULT_SOCKET_PATH);
+
+        let _guard = ENV_LOCK.lock().await;
+        let previous_harar = std::env::var_os("HARAR_SOCKET");
+        let previous_vault = std::env::var_os("VAULT_SOCKET");
+        let previous_gild = std::env::var_os("GILD_VAULT_SOCKET");
+
+        let dir = tempdir().unwrap();
+        let socket_path = dir.path().join("gild-vault.sock");
+        let mut config = test_config(dir.path(), "gild-vault.sock");
+        config.socket_path = socket_path.clone();
+        let state = Arc::new(test_state(dir.path()));
+        let server = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move {
+                serve(config, state).await.unwrap();
+            }
+        });
+
+        for _ in 0..50 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(socket_path.exists());
+
+        // SAFETY: this test serializes process-env mutation with ENV_LOCK and
+        // restores all touched vars before returning.
+        unsafe {
+            std::env::set_var("HARAR_SOCKET", &socket_path);
+            std::env::remove_var("VAULT_SOCKET");
+            std::env::remove_var("GILD_VAULT_SOCKET");
+        }
+
+        let client = VaultClient::from_socket();
+        let minted = client
+            .mint_token(&MintTokenRequest {
+                template: HararTokenTemplate::Service,
+                subject: "service:gild".to_string(),
+                run_id: None,
+                ttl_seconds: 60,
+            })
+            .await
+            .unwrap();
+        let verified = client
+            .verify_token(&VerifyTokenRequest {
+                token: minted.token,
+                audience: "linkhash".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert!(verified.valid);
+        assert_eq!(verified.sub.as_deref(), Some("service:gild"));
+
+        restore_env("HARAR_SOCKET", previous_harar);
+        restore_env("VAULT_SOCKET", previous_vault);
+        restore_env("GILD_VAULT_SOCKET", previous_gild);
+        server.abort();
     }
 
     #[test]

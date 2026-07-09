@@ -6,12 +6,13 @@ use std::sync::Arc;
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand_core::{OsRng, RngCore};
+use seam_ir::{SeamBoundary, SeamContract, SeamDefinition, SeamPrimitive, SeamRecord, SeamType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
 const DEFAULT_SOCKET_PATH: &str = "/run/tana-vault.sock";
-const DEFAULT_GILD_VAULT_SOCKET_PATH: &str = "/run/gild-vault/sock";
+pub const DEFAULT_GILD_VAULT_SOCKET_PATH: &str = "/run/gild-vault.sock";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const ISSUER: &str = "harar";
 const MAX_SUBJECT_LEN: usize = 256;
@@ -327,11 +328,7 @@ impl Secrets {
 
 impl VaultClient {
     pub fn from_socket() -> Self {
-        Self::from_socket_path(
-            std::env::var("VAULT_SOCKET")
-                .or_else(|_| std::env::var("GILD_VAULT_SOCKET"))
-                .unwrap_or_else(|_| DEFAULT_GILD_VAULT_SOCKET_PATH.to_string()),
-        )
+        Self::from_socket_path(default_vault_socket_path())
     }
 
     pub fn from_socket_path(path: impl AsRef<Path>) -> Self {
@@ -590,6 +587,123 @@ impl VaultClient {
 
         serde_json::from_slice(&response).map_err(VaultClientError::Json)
     }
+}
+
+pub fn default_vault_socket_path() -> String {
+    std::env::var("HARAR_SOCKET")
+        .or_else(|_| std::env::var("VAULT_SOCKET"))
+        .or_else(|_| std::env::var("GILD_VAULT_SOCKET"))
+        .unwrap_or_else(|_| DEFAULT_GILD_VAULT_SOCKET_PATH.to_string())
+}
+
+pub fn harar_auth_contract() -> SeamContract {
+    fn primitive(name: SeamPrimitive) -> SeamType {
+        SeamType::Primitive { name }
+    }
+    fn string() -> SeamType {
+        primitive(SeamPrimitive::String)
+    }
+    fn int() -> SeamType {
+        primitive(SeamPrimitive::Int)
+    }
+    fn bool_type() -> SeamType {
+        primitive(SeamPrimitive::Bool)
+    }
+    fn option(item: SeamType) -> SeamType {
+        SeamType::Option {
+            item: Box::new(item),
+        }
+    }
+    fn list(item: SeamType) -> SeamType {
+        SeamType::List {
+            item: Box::new(item),
+        }
+    }
+    fn named(name: &str) -> SeamType {
+        SeamType::Named {
+            name: name.to_string(),
+        }
+    }
+    fn record(name: &str, fields: &[(&str, SeamType)]) -> SeamDefinition {
+        SeamDefinition::Record(SeamRecord {
+            name: name.to_string(),
+            fields: fields
+                .iter()
+                .map(|(name, ty)| ((*name).to_string(), ty.clone()))
+                .collect(),
+        })
+    }
+
+    let mut contract = SeamContract::new("harar_auth", 1);
+    contract.boundaries = vec![
+        SeamBoundary {
+            function: "mint".to_string(),
+            request: "HararMintTokenRequest".to_string(),
+            response: "HararMintTokenResponse".to_string(),
+        },
+        SeamBoundary {
+            function: "verify".to_string(),
+            request: "HararVerifyTokenRequest".to_string(),
+            response: "HararVerifyTokenResponse".to_string(),
+        },
+        SeamBoundary {
+            function: "jwks".to_string(),
+            request: "HararJwksRequest".to_string(),
+            response: "HararJwksResponse".to_string(),
+        },
+    ];
+    contract.definitions = vec![
+        record(
+            "HararMintTokenRequest",
+            &[
+                ("template", string()),
+                ("subject", string()),
+                ("run_id", option(string())),
+                ("ttl_seconds", int()),
+            ],
+        ),
+        record(
+            "HararMintTokenResponse",
+            &[
+                ("ok", bool_type()),
+                ("token", option(string())),
+                ("jti", option(string())),
+                ("exp", option(int())),
+                ("aud", option(string())),
+                ("scopes", option(list(string()))),
+                ("error", option(string())),
+            ],
+        ),
+        record(
+            "HararVerifyTokenRequest",
+            &[("token", string()), ("audience", string())],
+        ),
+        record(
+            "HararVerifyTokenResponse",
+            &[
+                ("ok", bool_type()),
+                ("valid", option(bool_type())),
+                ("sub", option(string())),
+                ("jti", option(string())),
+                ("exp", option(int())),
+                ("error", option(string())),
+            ],
+        ),
+        record("HararJwksRequest", &[]),
+        record(
+            "HararJwk",
+            &[
+                ("kty", string()),
+                ("kid", string()),
+                ("crv", string()),
+                ("alg", string()),
+                ("use", string()),
+                ("x", string()),
+            ],
+        ),
+        record("HararJwksResponse", &[("keys", list(named("HararJwk")))]),
+    ];
+    contract
 }
 
 pub fn generate_signing_key() -> SigningKey {
@@ -1069,6 +1183,61 @@ mod tests {
             verify_token(&jwks, &tampered, "linkhash", 1001).unwrap_err(),
             TokenError::BadSignature
         );
+    }
+
+    #[test]
+    fn verify_rejects_unknown_kid() {
+        let key = generate_signing_key();
+        let minted = mint_token(
+            &key,
+            &MintTokenRequest {
+                template: HararTokenTemplate::Service,
+                subject: "service:gild".to_string(),
+                run_id: None,
+                ttl_seconds: 60,
+            },
+            1000,
+        )
+        .unwrap();
+        let mut parts = minted
+            .token
+            .split('.')
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let header = serde_json::json!({
+            "alg": "EdDSA",
+            "typ": "JWT",
+            "kid": "harar-wrong-key",
+        });
+        parts[0] = b64_url(serde_json::to_vec(&header).unwrap());
+        let wrong_kid = parts.join(".");
+
+        assert_eq!(
+            verify_token(
+                &jwks_for_key(&key.verifying_key()),
+                &wrong_kid,
+                "linkhash",
+                1001
+            )
+            .unwrap_err(),
+            TokenError::KeyNotFound
+        );
+    }
+
+    #[test]
+    fn harar_auth_contract_contains_public_jwks_only() {
+        let contract = harar_auth_contract();
+        let json = serde_json::to_value(&contract).unwrap();
+
+        assert_eq!(json["format"], "seam.contract@1");
+        assert_eq!(json["name"], "harar_auth");
+        let serialized = json.to_string();
+        assert!(serialized.contains("HararMintTokenResponse"));
+        assert!(serialized.contains("HararVerifyTokenResponse"));
+        assert!(serialized.contains("HararJwksResponse"));
+        assert!(!serialized.contains("\"d\""));
+        assert!(!serialized.contains("private"));
+        assert!(!serialized.contains("signing"));
     }
 
     struct MockAgent {

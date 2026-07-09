@@ -10,6 +10,7 @@ ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+seam_ir = { path = "../seam_ir" }
 tokio = { workspace = true, features = ["io-util", "net", "sync"] }
 
 [dev-dependencies]
