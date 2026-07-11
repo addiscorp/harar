@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use age::secrecy::ExposeSecret;
 use axum::Router;
-use gild_vault_client::VaultClient;
-use gild_vault_proxy::{AppState, app};
+use harar_client::VaultClient;
+use harar_proxy::{AppState, app};
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
     ExtendedKeyUsagePurpose, IsCa, KeyUsagePurpose,
@@ -93,7 +93,7 @@ async fn real_vault_round_trip_and_cross_shop_keys_stay_scoped() {
 async fn proxy_binary_uses_vault_socket_env_and_checks_health_before_binding() {
     let vault = RealVault::start();
     let port = unused_local_port();
-    let mut proxy = Command::new(gild_vault_proxy_binary())
+    let mut proxy = Command::new(harar_proxy_binary())
         .arg("--bind")
         .arg("127.0.0.1")
         .arg("--port")
@@ -121,7 +121,7 @@ async fn proxy_binary_tls_requires_client_cert_and_bearer_and_audits_cn() {
     let certs = TlsFixture::new();
     let tls_port = unused_local_port();
     let audit_log = certs.temp.path().join("audit.log");
-    let mut proxy = Command::new(gild_vault_proxy_binary())
+    let mut proxy = Command::new(harar_proxy_binary())
         .arg("--tls-bind")
         .arg(format!("127.0.0.1:{tls_port}"))
         .arg("--tls-ca")
@@ -200,7 +200,7 @@ fn proxy_binary_refuses_to_bind_when_configured_socket_is_unreachable() {
         std::process::id(),
         unused_local_port()
     ));
-    let output = Command::new(gild_vault_proxy_binary())
+    let output = Command::new(harar_proxy_binary())
         .arg("--bind")
         .arg("127.0.0.1")
         .arg("--port")
@@ -263,6 +263,7 @@ impl RealVault {
         let state_path = temp.path().join("keys.age");
         let master_key_path = temp.path().join("vault-master.key");
         let replication_token_path = temp.path().join("vault-replication-token");
+        let signing_key_path = temp.path().join("harar-signing.key");
         let identity = age::x25519::Identity::generate();
         std::fs::write(
             &master_key_path,
@@ -284,6 +285,8 @@ impl RealVault {
             .arg(&audit_log)
             .arg("--replication-token-file")
             .arg(&replication_token_path)
+            .arg("--signing-key-file")
+            .arg(&signing_key_path)
             .env("GILD_VAULT_MASTER_KEY_PATH", &master_key_path)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -307,11 +310,11 @@ impl Drop for RealVault {
 }
 
 fn gild_vault_binary() -> PathBuf {
-    workspace_binary("gild-vault")
+    workspace_binary("harar")
 }
 
-fn gild_vault_proxy_binary() -> PathBuf {
-    workspace_binary("gild-vault-proxy")
+fn harar_proxy_binary() -> PathBuf {
+    workspace_binary("harar-proxy")
 }
 
 fn workspace_binary(name: &str) -> PathBuf {

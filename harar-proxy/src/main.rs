@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use axum::Extension;
-use gild_vault_client::VaultClient;
-use gild_vault_proxy::{AppState, RequestPeer, app, parse_peer_upstreams};
+use harar_client::VaultClient;
+use harar_proxy::{AppState, RequestPeer, app, parse_peer_upstreams};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as HyperBuilder;
 use hyper_util::service::TowerToHyperService;
@@ -70,7 +70,7 @@ struct Config {
     tls: Option<TlsConfig>,
     socket_path: PathBuf,
     token: String,
-    peers: Vec<gild_vault_proxy::PeerUpstream>,
+    peers: Vec<harar_proxy::PeerUpstream>,
     audit_log_path: Option<PathBuf>,
 }
 
@@ -156,7 +156,7 @@ impl Config {
                     let value = args
                         .next()
                         .ok_or_else(|| anyhow!("--peer requires a value"))?;
-                    peers.push(gild_vault_proxy::PeerUpstream::new(value));
+                    peers.push(harar_proxy::PeerUpstream::new(value));
                 }
                 _ => {}
             }

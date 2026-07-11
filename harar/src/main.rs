@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
-use gild_vault_client::{
-    HararTokenTemplate, MintTokenRequest, MintedToken, TokenError, VaultClient,
-    VerifyTokenResponse, default_vault_socket_path, generate_signing_key, jwks_for_key, mint_token,
+use harar_client::{
+    HararTokenTemplate, MintTokenRequest, MintedToken, RevokeTokenRequest, TokenError, VaultClient,
+    VerifyTokenRequest, default_vault_socket_path, generate_signing_key, jwks_for_key, mint_token,
     signing_key_bytes, signing_key_from_bytes, validate_token_bindings, verify_token,
 };
 use serde::{Deserialize, Serialize};
@@ -427,7 +427,7 @@ fn harar_command() -> Option<String> {
         .nth(1)
         .unwrap_or_else(|| "serve".to_string());
     match command.as_str() {
-        "mint" | "verify" | "jwks" => Some(command),
+        "mint" | "verify" | "revoke" | "jwks" => Some(command),
         "serve" => None,
         _ => None,
     }
@@ -438,6 +438,7 @@ async fn run_harar_cli(command: String) -> Result<()> {
     match command.as_str() {
         "mint" => cli_mint(&args).await,
         "verify" => cli_verify(&args).await,
+        "revoke" => cli_revoke(&args).await,
         "jwks" => cli_jwks(&args).await,
         _ => Err(anyhow!("unknown harar command {command}")),
     }
@@ -476,24 +477,14 @@ async fn cli_verify(args: &[String]) -> Result<()> {
     let audience = cli_value(args, "--audience")
         .or_else(|| cli_value(args, "--aud"))
         .ok_or_else(|| anyhow!("harar verify requires --audience"))?;
-    let client = VaultClient::from_socket_path(socket);
-    let jwks = client.jwks().await?;
-    let response = match verify_token(&jwks, &token, &audience, now_epoch_seconds()?) {
-        Ok(claims) => VerifyTokenResponse {
-            valid: true,
-            sub: Some(claims.sub),
-            jti: Some(claims.jti),
-            exp: Some(claims.exp),
-            error: None,
-        },
-        Err(err) => VerifyTokenResponse {
-            valid: false,
-            sub: None,
-            jti: None,
-            exp: None,
-            error: Some(token_error_code(&err).to_string()),
-        },
-    };
+    let response = VaultClient::from_socket_path(socket)
+        .verify_token(&VerifyTokenRequest {
+            token,
+            audience,
+            subject: cli_value(args, "--subject"),
+            run_id: cli_value(args, "--run-id"),
+        })
+        .await?;
     println!("{}", serde_json::to_string(&response)?);
     Ok(())
 }
@@ -502,6 +493,19 @@ async fn cli_jwks(args: &[String]) -> Result<()> {
     let socket = cli_socket(args);
     let jwks = VaultClient::from_socket_path(socket).jwks().await?;
     println!("{}", serde_json::to_string(&jwks)?);
+    Ok(())
+}
+
+async fn cli_revoke(args: &[String]) -> Result<()> {
+    let socket = cli_socket(args);
+    let jti = cli_value(args, "--jti").ok_or_else(|| anyhow!("harar revoke requires --jti"))?;
+    VaultClient::from_socket_path(socket)
+        .revoke_token(&RevokeTokenRequest { jti })
+        .await?;
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({ "ok": true }))?
+    );
     Ok(())
 }
 
@@ -2058,7 +2062,7 @@ fn now_epoch_seconds() -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gild_vault_client::{DEFAULT_GILD_VAULT_SOCKET_PATH, VerifyTokenRequest};
+    use harar_client::{DEFAULT_GILD_VAULT_SOCKET_PATH, VerifyTokenRequest};
     use std::time::Duration;
     use tempfile::tempdir;
     use tokio::net::UnixStream;

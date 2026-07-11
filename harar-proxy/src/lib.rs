@@ -11,7 +11,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
-use gild_vault_client::{VaultClient, VaultClientError};
+use harar_client::{VaultClient, VaultClientError};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 

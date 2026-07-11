@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "harar",
+    "harar-client",
+    "harar-proxy",
+]
+resolver = "2"
+
+[workspace.dependencies]
+axum = "0.7"
+hyper = "1"
+hyper-util = "0.1"
+serde = "1"
+serde_json = "1"
+tokio = "1"

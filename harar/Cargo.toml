@@ -1,26 +1,22 @@
 [package]
-name = "gild-vault"
+name = "harar"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "gild-vault"
-path = "src/main.rs"
-
-[[bin]]
 name = "harar"
-path = "src/harar.rs"
+path = "src/main.rs"
 
 [dependencies]
 age = "0.11.3"
 anyhow = "1"
 clap = { version = "4.5", features = ["derive", "env"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
-gild-vault-client = { path = "../gild-vault-client" }
+harar-client = { path = "../harar-client" }
 libc = "0.2"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-tana-cli-core = { path = "../tana-cli-core" }
+tana-cli-core = { version = "0.1", registry = "linkhash" }
 tokio = { workspace = true, features = ["full"] }
 
 [dev-dependencies]

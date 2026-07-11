@@ -1,6 +1,6 @@
 use age::secrecy::ExposeSecret;
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -500,7 +500,7 @@ fn is_writable_dir(path: &Path) -> bool {
 }
 
 fn gild_vault_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_gild-vault")
+    env!("CARGO_BIN_EXE_harar")
 }
 
 fn harar_bin() -> &'static str {

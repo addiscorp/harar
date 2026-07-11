@@ -1,7 +1,7 @@
 use crate::cli::{SocketArgs, print_json};
 use anyhow::Result;
 use clap::Args;
-use gild_vault_client::{VaultClient, VerifyTokenRequest};
+use harar_client::{VaultClient, VerifyTokenRequest};
 
 #[derive(Debug, Args)]
 pub struct Verify {

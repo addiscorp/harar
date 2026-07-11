@@ -1,7 +1,7 @@
 use crate::cli::{SocketArgs, print_json};
 use anyhow::{Context, Result};
 use clap::Args;
-use gild_vault_client::{HararTokenTemplate, MintTokenRequest, VaultClient};
+use harar_client::{HararTokenTemplate, MintTokenRequest, VaultClient};
 
 #[derive(Debug, Args)]
 pub struct Mint {

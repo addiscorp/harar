@@ -1,8 +1,8 @@
 [package]
-name = "gild-vault-client"
+name = "harar-client"
 version = "0.1.0"
 edition = "2021"
-description = "Rust SDK for reading secrets from gild-vault"
+description = "Rust SDK for reading secrets from Harar"
 
 [dependencies]
 base64 = "0.22"
@@ -10,7 +10,7 @@ ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-seam_ir = { path = "../seam_ir" }
+seam_ir = { version = "0.1", registry = "linkhash" }
 tokio = { workspace = true, features = ["io-util", "net", "sync"] }
 
 [dev-dependencies]
