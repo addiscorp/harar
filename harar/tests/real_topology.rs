@@ -334,6 +334,7 @@ fn spawn_vault(dir: &Path, socket: &Path, cleanup_socket: Option<PathBuf>) -> Va
     fs::write(&replication_token, "test-replication-token\n").expect("write replication token");
 
     let mut command = Command::new(gild_vault_bin());
+    command.arg("serve");
     if socket != Path::new(DEFAULT_SOCKET) {
         command.args(["--socket", socket_str(socket)]);
     }

@@ -3,10 +3,6 @@ name = "harar-proxy"
 version = "0.1.0"
 edition = "2024"
 
-[[bin]]
-name = "harar-proxy"
-path = "src/main.rs"
-
 [dependencies]
 anyhow = "1"
 axum = { workspace = true }

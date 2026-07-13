@@ -950,6 +950,7 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "harar-client",
+ "harar-proxy",
  "libc",
  "serde",
  "serde_json",

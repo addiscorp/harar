@@ -1,8 +1,10 @@
 use anyhow::{Context, Result, anyhow};
+#[cfg(test)]
+use harar_client::VaultClient;
 use harar_client::{
-    HararTokenTemplate, MintTokenRequest, MintedToken, RevokeTokenRequest, TokenError, VaultClient,
-    VerifyTokenRequest, default_vault_socket_path, generate_signing_key, jwks_for_key, mint_token,
-    signing_key_bytes, signing_key_from_bytes, validate_token_bindings, verify_token,
+    HararTokenTemplate, MintTokenRequest, MintedToken, TokenError, generate_signing_key,
+    jwks_for_key, mint_token, signing_key_bytes, signing_key_from_bytes, validate_token_bindings,
+    verify_token,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -18,6 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
+mod cli;
 mod master_key;
 
 const DEFAULT_SOCKET_PATH: &str = "/run/gild-vault.sock";
@@ -368,13 +371,10 @@ struct AuditEvent<'a> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if let Some(command) = harar_command() {
-        return run_harar_cli(command).await;
-    }
-    run_daemon().await
+    cli::run().await
 }
 
-async fn run_daemon() -> Result<()> {
+pub(crate) async fn run_daemon() -> Result<()> {
     let config = Config::from_env_and_args();
     let master_key = master_key::load_master_key()?;
     let master_recipient = master_key.to_public();
@@ -416,107 +416,6 @@ async fn run_daemon() -> Result<()> {
     }
 
     serve(config, state).await
-}
-
-fn harar_command() -> Option<String> {
-    let bin = std::env::args().next().unwrap_or_default();
-    if !bin.rsplit('/').next().unwrap_or("").contains("harar") {
-        return None;
-    }
-    let command = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "serve".to_string());
-    match command.as_str() {
-        "mint" | "verify" | "revoke" | "jwks" => Some(command),
-        "serve" => None,
-        _ => None,
-    }
-}
-
-async fn run_harar_cli(command: String) -> Result<()> {
-    let args = std::env::args().skip(2).collect::<Vec<_>>();
-    match command.as_str() {
-        "mint" => cli_mint(&args).await,
-        "verify" => cli_verify(&args).await,
-        "revoke" => cli_revoke(&args).await,
-        "jwks" => cli_jwks(&args).await,
-        _ => Err(anyhow!("unknown harar command {command}")),
-    }
-}
-
-async fn cli_mint(args: &[String]) -> Result<()> {
-    let socket = cli_socket(args);
-    let template = cli_value(args, "--template")
-        .and_then(|value| HararTokenTemplate::parse(&value))
-        .ok_or_else(|| {
-            anyhow!("harar mint requires --template agent-session|run-scoped|service")
-        })?;
-    let subject =
-        cli_value(args, "--subject").ok_or_else(|| anyhow!("harar mint requires --subject"))?;
-    let ttl_seconds = cli_value(args, "--ttl-seconds")
-        .ok_or_else(|| anyhow!("harar mint requires --ttl-seconds"))?
-        .parse::<u64>()
-        .context("parse --ttl-seconds")?;
-    let request = MintTokenRequest {
-        template,
-        subject,
-        run_id: cli_value(args, "--run-id"),
-        ttl_seconds,
-    };
-    let token = VaultClient::from_socket_path(socket)
-        .mint_token(&request)
-        .await?;
-    println!("{}", serde_json::to_string(&token)?);
-    Ok(())
-}
-
-async fn cli_verify(args: &[String]) -> Result<()> {
-    let socket = cli_socket(args);
-    let token =
-        cli_value(args, "--token").ok_or_else(|| anyhow!("harar verify requires --token"))?;
-    let audience = cli_value(args, "--audience")
-        .or_else(|| cli_value(args, "--aud"))
-        .ok_or_else(|| anyhow!("harar verify requires --audience"))?;
-    let response = VaultClient::from_socket_path(socket)
-        .verify_token(&VerifyTokenRequest {
-            token,
-            audience,
-            subject: cli_value(args, "--subject"),
-            run_id: cli_value(args, "--run-id"),
-        })
-        .await?;
-    println!("{}", serde_json::to_string(&response)?);
-    Ok(())
-}
-
-async fn cli_jwks(args: &[String]) -> Result<()> {
-    let socket = cli_socket(args);
-    let jwks = VaultClient::from_socket_path(socket).jwks().await?;
-    println!("{}", serde_json::to_string(&jwks)?);
-    Ok(())
-}
-
-async fn cli_revoke(args: &[String]) -> Result<()> {
-    let socket = cli_socket(args);
-    let jti = cli_value(args, "--jti").ok_or_else(|| anyhow!("harar revoke requires --jti"))?;
-    VaultClient::from_socket_path(socket)
-        .revoke_token(&RevokeTokenRequest { jti })
-        .await?;
-    println!(
-        "{}",
-        serde_json::to_string(&serde_json::json!({ "ok": true }))?
-    );
-    Ok(())
-}
-
-fn cli_socket(args: &[String]) -> String {
-    cli_value(args, "--socket").unwrap_or_else(default_vault_socket_path)
-}
-
-fn cli_value(args: &[String], name: &str) -> Option<String> {
-    args.windows(2)
-        .find(|window| window[0] == name)
-        .map(|window| window[1].clone())
 }
 
 async fn serve(config: Config, state: Arc<AppState>) -> Result<()> {

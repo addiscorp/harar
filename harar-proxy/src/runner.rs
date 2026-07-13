@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
+use crate::{AppState, PeerUpstream, RequestPeer, app, parse_peer_upstreams};
 use anyhow::{Context, Result, anyhow};
 use axum::Extension;
 use harar_client::VaultClient;
-use harar_proxy::{AppState, RequestPeer, app, parse_peer_upstreams};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as HyperBuilder;
 use hyper_util::service::TowerToHyperService;
@@ -23,8 +23,10 @@ const DEFAULT_PORT: u16 = 9444;
 const DEFAULT_AUDIT_LOG_PATH: &str = "/var/log/gild-vault-proxy-audit.log";
 pub const DEFAULT_SOCKET_PATH: &str = "/run/gild-vault/sock";
 
-#[tokio::main]
-async fn main() -> Result<()> {
+pub async fn run_from_env_and_args() -> Result<()> {
+    // Other workspace dependencies enable both Rustls providers. Select the provider used
+    // by this server before any TLS configuration is constructed.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let config = Config::from_env_and_args()?;
     let vault = VaultClient::from_socket_path(&config.socket_path);
     smoke_check_vault(&vault, &config.socket_path).await?;
@@ -70,7 +72,7 @@ struct Config {
     tls: Option<TlsConfig>,
     socket_path: PathBuf,
     token: String,
-    peers: Vec<harar_proxy::PeerUpstream>,
+    peers: Vec<PeerUpstream>,
     audit_log_path: Option<PathBuf>,
 }
 
@@ -156,7 +158,7 @@ impl Config {
                     let value = args
                         .next()
                         .ok_or_else(|| anyhow!("--peer requires a value"))?;
-                    peers.push(harar_proxy::PeerUpstream::new(value));
+                    peers.push(PeerUpstream::new(value));
                 }
                 _ => {}
             }
