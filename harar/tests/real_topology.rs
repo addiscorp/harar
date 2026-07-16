@@ -3,6 +3,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use std::fs;
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -11,6 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_SOCKET: &str = "/run/gild-vault.sock";
+const MAX_TEST_SOCKET_PATH_BYTES: usize = 104;
 
 #[derive(Debug, Deserialize)]
 struct MintedToken {
@@ -92,8 +94,8 @@ impl Drop for VaultDaemon {
 #[test]
 fn harar_real_topology_mint_verify_revoke_jwks_over_socket() {
     let dir = TestDir::new("harar-real-topology");
-    let socket = dir.path().join("gild-vault.sock");
-    let _daemon = spawn_vault(dir.path(), &socket, None);
+    let socket = short_test_socket_path();
+    let _daemon = spawn_vault(dir.path(), &socket, Some(socket.clone()));
     wait_for_connectable_socket(&socket);
 
     let jwks: Jwks = harar_json(["jwks", "--socket", socket_str(&socket)]);
@@ -219,8 +221,8 @@ fn harar_real_topology_mint_verify_revoke_jwks_over_socket() {
 #[test]
 fn harar_no_socket_flag_uses_env_selected_socket_over_real_daemon() {
     let dir = TestDir::new("harar-no-socket-flag");
-    let socket = dir.path().join("gild-vault.sock");
-    let _daemon = spawn_vault(dir.path(), &socket, None);
+    let socket = short_test_socket_path();
+    let _daemon = spawn_vault(dir.path(), &socket, Some(socket.clone()));
     wait_for_connectable_socket(&socket);
 
     let socket_env = [("HARAR_SOCKET", socket_str(&socket))];
@@ -533,6 +535,20 @@ fn is_writable_dir(path: &Path) -> bool {
         }
         Err(_) => false,
     }
+}
+
+fn short_test_socket_path() -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before epoch")
+        .as_nanos();
+    let path = PathBuf::from(format!("/tmp/hr-{}-{nanos}.sock", std::process::id()));
+    assert!(
+        path.as_os_str().as_bytes().len() < MAX_TEST_SOCKET_PATH_BYTES,
+        "test socket path exceeds Unix-domain-socket limit: {}",
+        path.display()
+    );
+    path
 }
 
 fn gild_vault_bin() -> &'static str {
