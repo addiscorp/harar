@@ -58,6 +58,8 @@ impl TestDir {
             .as_nanos();
         let path = std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
         fs::create_dir_all(&path).expect("create test dir");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .expect("secure test state dir");
         Self { path }
     }
 
@@ -113,45 +115,54 @@ fn harar_real_topology_mint_verify_revoke_jwks_over_socket() {
     assert!(!minted.token.is_empty());
     assert!(!minted.jti.is_empty());
 
-    let verified: VerifyTokenResponse = harar_json([
-        "verify",
-        "--socket",
-        socket_str(&socket),
-        "--token",
-        &minted.token,
-        "--audience",
-        "linkhash",
-        "--subject",
-        "service:gild",
-    ]);
+    let verified: VerifyTokenResponse = harar_json_with_env(
+        [
+            "verify",
+            "--socket",
+            socket_str(&socket),
+            "--secret-env",
+            "HARAR_TEST_TOKEN",
+            "--audience",
+            "linkhash",
+            "--subject",
+            "service:gild",
+        ],
+        &[("HARAR_TEST_TOKEN", &minted.token)],
+    );
     assert!(verified.valid, "{verified:?}");
     assert_eq!(verified.sub.as_deref(), Some("service:gild"));
     assert_eq!(verified.jti.as_deref(), Some(minted.jti.as_str()));
     assert_eq!(verified.exp, Some(minted.exp));
     assert_eq!(verified.error, None);
 
-    let wrong_aud: VerifyTokenResponse = harar_json([
-        "verify",
-        "--socket",
-        socket_str(&socket),
-        "--token",
-        &minted.token,
-        "--audience",
-        "deka",
-    ]);
+    let wrong_aud: VerifyTokenResponse = harar_json_with_env(
+        [
+            "verify",
+            "--socket",
+            socket_str(&socket),
+            "--secret-env",
+            "HARAR_TEST_TOKEN",
+            "--audience",
+            "deka",
+        ],
+        &[("HARAR_TEST_TOKEN", &minted.token)],
+    );
     assert!(!wrong_aud.valid, "{wrong_aud:?}");
     assert_eq!(wrong_aud.error.as_deref(), Some("wrong_audience"));
 
     let forged = forge_signature(&minted.token);
-    let forged_verify: VerifyTokenResponse = harar_json([
-        "verify",
-        "--socket",
-        socket_str(&socket),
-        "--token",
-        &forged,
-        "--audience",
-        "linkhash",
-    ]);
+    let forged_verify: VerifyTokenResponse = harar_json_with_env(
+        [
+            "verify",
+            "--socket",
+            socket_str(&socket),
+            "--secret-env",
+            "HARAR_TEST_TOKEN",
+            "--audience",
+            "linkhash",
+        ],
+        &[("HARAR_TEST_TOKEN", &forged)],
+    );
     assert!(!forged_verify.valid, "{forged_verify:?}");
     assert_eq!(forged_verify.error.as_deref(), Some("bad_signature"));
 
@@ -162,15 +173,18 @@ fn harar_real_topology_mint_verify_revoke_jwks_over_socket() {
         "--jti",
         &minted.jti,
     ]);
-    let revoked: VerifyTokenResponse = harar_json([
-        "verify",
-        "--socket",
-        socket_str(&socket),
-        "--token",
-        &minted.token,
-        "--audience",
-        "linkhash",
-    ]);
+    let revoked: VerifyTokenResponse = harar_json_with_env(
+        [
+            "verify",
+            "--socket",
+            socket_str(&socket),
+            "--secret-env",
+            "HARAR_TEST_TOKEN",
+            "--audience",
+            "linkhash",
+        ],
+        &[("HARAR_TEST_TOKEN", &minted.token)],
+    );
     assert!(!revoked.valid, "{revoked:?}");
     assert_eq!(revoked.error.as_deref(), Some("revoked"));
 
@@ -186,15 +200,18 @@ fn harar_real_topology_mint_verify_revoke_jwks_over_socket() {
         "1",
     ]);
     thread::sleep(Duration::from_secs(2));
-    let expired: VerifyTokenResponse = harar_json([
-        "verify",
-        "--socket",
-        socket_str(&socket),
-        "--token",
-        &short_lived.token,
-        "--audience",
-        "linkhash",
-    ]);
+    let expired: VerifyTokenResponse = harar_json_with_env(
+        [
+            "verify",
+            "--socket",
+            socket_str(&socket),
+            "--secret-env",
+            "HARAR_TEST_TOKEN",
+            "--audience",
+            "linkhash",
+        ],
+        &[("HARAR_TEST_TOKEN", &short_lived.token)],
+    );
     assert!(!expired.valid, "{expired:?}");
     assert_eq!(expired.error.as_deref(), Some("expired"));
 }
@@ -223,17 +240,19 @@ fn harar_no_socket_flag_uses_env_selected_socket_over_real_daemon() {
         &socket_env,
     );
 
+    let mut verify_env = socket_env.to_vec();
+    verify_env.push(("HARAR_TEST_TOKEN", minted.token.as_str()));
     let verified: VerifyTokenResponse = harar_json_with_env(
         [
             "verify",
-            "--token",
-            &minted.token,
+            "--secret-env",
+            "HARAR_TEST_TOKEN",
             "--audience",
             "linkhash",
             "--subject",
             "service:gild-no-flag",
         ],
-        &socket_env,
+        &verify_env,
     );
     assert!(verified.valid, "{verified:?}");
     assert_eq!(verified.jti.as_deref(), Some(minted.jti.as_str()));
@@ -267,15 +286,18 @@ fn harar_default_socket_path_works_without_socket_overrides_when_available() {
         "--ttl-seconds",
         "30",
     ]);
-    let verified: VerifyTokenResponse = harar_json_without_socket_env([
-        "verify",
-        "--token",
+    let verified: VerifyTokenResponse = harar_json_without_socket_env_with_secret(
+        [
+            "verify",
+            "--secret-env",
+            "HARAR_TEST_TOKEN",
+            "--audience",
+            "linkhash",
+            "--subject",
+            "service:gild-default",
+        ],
         &minted.token,
-        "--audience",
-        "linkhash",
-        "--subject",
-        "service:gild-default",
-    ]);
+    );
 
     assert!(verified.valid, "{verified:?}");
     assert_eq!(verified.jti.as_deref(), Some(minted.jti.as_str()));
@@ -416,6 +438,19 @@ where
     run_harar_json(
         args,
         &[],
+        ["HARAR_SOCKET", "VAULT_SOCKET", "GILD_VAULT_SOCKET"],
+    )
+}
+
+fn harar_json_without_socket_env_with_secret<T, I, S>(args: I, secret: &str) -> T
+where
+    T: DeserializeOwned,
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    run_harar_json(
+        args,
+        &[("HARAR_TEST_TOKEN", secret)],
         ["HARAR_SOCKET", "VAULT_SOCKET", "GILD_VAULT_SOCKET"],
     )
 }

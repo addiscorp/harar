@@ -261,6 +261,7 @@ struct RealVault {
 impl RealVault {
     fn start() -> Self {
         let temp = tempfile::tempdir().unwrap();
+        set_mode(temp.path(), 0o700);
         let socket_path = temp.path().join("run/gild-vault/sock");
         std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
         let state_path = temp.path().join("keys.age");

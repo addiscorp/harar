@@ -7,6 +7,7 @@ pub mod mint;
 pub mod proxy;
 pub mod put;
 pub mod revoke;
+pub mod secret_input;
 pub mod self_cmd;
 pub mod serve;
 pub mod setup;

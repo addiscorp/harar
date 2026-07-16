@@ -17,7 +17,7 @@ harar-proxy = { path = "../harar-proxy" }
 libc = "0.2"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-tana-cli-core = { version = "0.1", registry = "linkhash" }
+tana-cli-core = { version = "=0.2.0", registry = "linkhash" }
 tokio = { workspace = true, features = ["full"] }
 
 [dev-dependencies]

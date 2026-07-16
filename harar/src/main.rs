@@ -12,7 +12,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -376,6 +376,11 @@ async fn main() -> Result<()> {
 
 pub(crate) async fn run_daemon() -> Result<()> {
     let config = Config::from_env_and_args();
+    let state_dir = config
+        .state_path
+        .parent()
+        .ok_or_else(|| anyhow!("state path has no parent"))?;
+    ensure_operator_private_dir(state_dir, 0o700, "state")?;
     let master_key = master_key::load_master_key()?;
     let master_recipient = master_key.to_public();
     let keys = load_keys(&config.state_path, &master_key)?;
@@ -1625,16 +1630,17 @@ fn load_replication_token(path: &Path) -> Result<String> {
 }
 
 fn load_or_create_signing_key(path: &Path) -> Result<ed25519_dalek::SigningKey> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("signing key path has no parent"))?;
+    ensure_operator_private_dir(parent, 0o700, "signing key parent")?;
     match fs::read(path) {
-        Ok(bytes) => signing_key_from_bytes(&bytes)
-            .map_err(|err| anyhow!("decode harar signing key at {}: {err}", path.display())),
+        Ok(bytes) => {
+            verify_operator_private_file(path, 0o600, "signing key")?;
+            signing_key_from_bytes(&bytes)
+                .map_err(|err| anyhow!("decode harar signing key at {}: {err}", path.display()))
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("create {}", parent.display()))?;
-                fs::set_permissions(parent, fs::Permissions::from_mode(0o750))
-                    .with_context(|| format!("chmod 0750 {}", parent.display()))?;
-            }
             let key = generate_signing_key();
             let mut file = OpenOptions::new()
                 .create_new(true)
@@ -1646,10 +1652,54 @@ fn load_or_create_signing_key(path: &Path) -> Result<ed25519_dalek::SigningKey> 
                 .with_context(|| format!("write harar signing key {}", path.display()))?;
             file.sync_all()
                 .with_context(|| format!("sync harar signing key {}", path.display()))?;
+            drop(file);
+            verify_operator_private_file(path, 0o600, "signing key")?;
             Ok(key)
         }
         Err(err) => Err(err).with_context(|| format!("read {}", path.display())),
     }
+}
+
+fn ensure_operator_private_dir(path: &Path, mode: u32, kind: &str) -> Result<()> {
+    let existed = path.exists();
+    fs::create_dir_all(path)
+        .with_context(|| format!("create {kind} directory {}", path.display()))?;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect {kind} directory {}", path.display()))?;
+    if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(anyhow!(
+            "refusing unowned {kind} directory {}",
+            path.display()
+        ));
+    }
+    if existed && metadata.permissions().mode() & 0o022 != 0 {
+        return Err(anyhow!(
+            "refusing attacker-writable {kind} directory {}",
+            path.display()
+        ));
+    }
+    if !existed {
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+        // SAFETY: c_path is NUL-terminated and names the directory just created.
+        if unsafe { libc::chown(c_path.as_ptr(), libc::geteuid(), libc::getegid()) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("chown {kind} directory {}", path.display()));
+        }
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+fn verify_operator_private_file(path: &Path, mode: u32, kind: &str) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("inspect {kind} {}", path.display()))?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o777 != mode
+    {
+        return Err(anyhow!("refusing unsafe {kind} {}", path.display()));
+    }
+    Ok(())
 }
 
 fn load_replication_meta(path: &Path) -> Result<ReplicationMeta> {
@@ -3474,6 +3524,16 @@ mod tests {
 
         let mode = fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o750);
+    }
+
+    #[test]
+    fn signing_key_loader_refuses_attacker_writable_key_before_reading_it() {
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("harar-signing.key");
+        fs::write(&key_path, [7_u8; 32]).unwrap();
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o666)).unwrap();
+
+        assert!(load_or_create_signing_key(&key_path).is_err());
     }
 
     #[tokio::test]

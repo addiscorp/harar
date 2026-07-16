@@ -3,7 +3,8 @@ use anyhow::{Context, Result, anyhow};
 use clap::Args;
 use std::fs::{self, File, OpenOptions};
 use std::io::{IsTerminal, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -112,6 +113,10 @@ fn setup(paths: &SetupPaths) -> Result<bool> {
         )
     })?;
     ensure_dir(config_parent, PRIVATE_DIR_MODE, "configuration")?;
+    let signing_key = paths.state_dir.join("harar-signing.key");
+    if signing_key.exists() {
+        verify_private_file_owner(&signing_key, CONFIG_MODE, "signing key")?;
+    }
 
     let created = if paths.config_path.exists() {
         verify_file(&paths.config_path, CONFIG_MODE)?;
@@ -125,12 +130,25 @@ fn setup(paths: &SetupPaths) -> Result<bool> {
 }
 
 fn ensure_dir(path: &Path, mode: u32, kind: &str) -> Result<()> {
+    let existed = path.exists();
     fs::create_dir_all(path)
         .with_context(|| format!("create {kind} directory {}", path.display()))?;
-    let metadata = fs::metadata(path)
+    let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("inspect {kind} directory {}", path.display()))?;
     if !metadata.is_dir() {
         return Err(anyhow!("{kind} path {} is not a directory", path.display()));
+    }
+    verify_owner(&metadata, path, kind)?;
+    if existed && metadata.permissions().mode() & 0o022 != 0 {
+        return Err(anyhow!(
+            "refusing attacker-writable {kind} directory {}",
+            path.display()
+        ));
+    }
+    if !existed {
+        // New paths are explicitly owned by the operator before any daemon
+        // material can be created beneath them.
+        set_owner_to_operator(path, kind)?;
     }
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
         .with_context(|| format!("chmod {mode:o} {}", path.display()))
@@ -207,13 +225,46 @@ fn verify_dir(path: &Path, expected_mode: u32) -> Result<()> {
 }
 
 fn verify_file(path: &Path, expected_mode: u32) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("verify configuration {}", path.display()))?;
+    verify_private_file_owner(path, expected_mode, "configuration")
+}
+
+fn verify_private_file_owner(path: &Path, expected_mode: u32, kind: &str) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("verify {kind} {}", path.display()))?;
     if !metadata.is_file() || metadata.permissions().mode() & 0o777 != expected_mode {
         return Err(anyhow!(
-            "configuration {} must be a regular file with mode {expected_mode:o}",
+            "{kind} {} must be a regular file with mode {expected_mode:o}",
             path.display()
         ));
+    }
+    verify_owner(&metadata, path, kind)?;
+    Ok(())
+}
+
+fn verify_owner(metadata: &fs::Metadata, path: &Path, kind: &str) -> Result<()> {
+    let operator = unsafe { libc::geteuid() };
+    if !is_owned_by_operator(metadata, operator) {
+        return Err(anyhow!(
+            "refusing {kind} {} owned by uid {}; operator uid is {operator}",
+            path.display(),
+            metadata.uid()
+        ));
+    }
+    Ok(())
+}
+
+fn is_owned_by_operator(metadata: &fs::Metadata, operator: u32) -> bool {
+    metadata.uid() == operator
+}
+
+fn set_owner_to_operator(path: &Path, kind: &str) -> Result<()> {
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+    // SAFETY: c_path is NUL-terminated and refers to the path just created.
+    if unsafe { libc::chown(c_path.as_ptr(), uid, gid) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("chown {kind} directory {}", path.display()));
     }
     Ok(())
 }
@@ -275,5 +326,40 @@ mod tests {
         fs::write(&paths.config_path, "x").unwrap();
         fs::set_permissions(&paths.config_path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(setup(&paths).is_err());
+    }
+
+    #[test]
+    fn setup_refuses_attacker_writable_state_dir_and_signing_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        fs::create_dir(&state_dir).unwrap();
+        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o777)).unwrap();
+        let paths = SetupPaths {
+            state_dir: state_dir.clone(),
+            log_dir: temp.path().join("logs"),
+            config_path: temp.path().join("config.toml"),
+        };
+        assert!(
+            setup(&paths)
+                .unwrap_err()
+                .to_string()
+                .contains("attacker-writable")
+        );
+
+        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let signing_key = state_dir.join("harar-signing.key");
+        fs::write(&signing_key, [7_u8; 32]).unwrap();
+        fs::set_permissions(&signing_key, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(setup(&paths).is_err());
+    }
+
+    #[test]
+    fn ownership_check_refuses_a_different_operator_uid() {
+        let temp = tempfile::tempdir().unwrap();
+        let metadata = fs::metadata(temp.path()).unwrap();
+        assert!(is_owned_by_operator(&metadata, metadata.uid()));
+        assert!(metadata.uid() != u32::MAX);
+        let wrong_operator = metadata.uid() + 1;
+        assert!(!is_owned_by_operator(&metadata, wrong_operator));
     }
 }
