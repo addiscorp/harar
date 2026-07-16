@@ -99,6 +99,24 @@ mod tests {
         restore_env("HARAR_SOCKET", previous);
     }
 
+    #[test]
+    fn credential_commands_reject_secret_values_in_argv() {
+        for argv in [
+            vec!["harar", "self", "login", "--token", "tg_usr_leak"],
+            vec![
+                "harar",
+                "verify",
+                "--token",
+                "eyJhbGciOiJFZERTQSJ9.leak",
+                "--audience",
+                "linkhash",
+            ],
+            vec!["harar", "put", "DATABASE_URL", "postgres://secret@db"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err());
+        }
+    }
+
     #[derive(Debug, Parser)]
     struct SocketOnly {
         #[command(flatten)]
