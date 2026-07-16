@@ -1,28 +1,365 @@
 use crate::cli::print_json;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::Args;
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::fs::{self, File, OpenOptions};
+use std::io::{IsTerminal, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+const DEFAULT_STATE_DIR: &str = "/var/lib/gild-vault";
+const DEFAULT_LOG_DIR: &str = "/var/log/gild-vault";
+const CONFIG_MODE: u32 = 0o600;
+const PRIVATE_DIR_MODE: u32 = 0o700;
+const LOG_DIR_MODE: u32 = 0o750;
+
+/// Provision the local directories and non-secret daemon configuration.
+///
+/// With a terminal attached, omitted paths are confirmed interactively. Automation can
+/// supply all paths explicitly and pass `--yes` to guarantee a non-interactive run.
 #[derive(Debug, Args)]
 pub struct Setup {
-    #[arg(long, default_value = "/var/lib/gild-vault")]
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    #[arg(long)]
+    log_dir: Option<PathBuf>,
+    #[arg(long)]
+    config_path: Option<PathBuf>,
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SetupPaths {
     state_dir: PathBuf,
-    #[arg(long, default_value = "/var/log")]
     log_dir: PathBuf,
+    config_path: PathBuf,
 }
 
 pub async fn run(cmd: Setup) -> Result<()> {
-    fs::create_dir_all(&cmd.state_dir)
-        .with_context(|| format!("create {}", cmd.state_dir.display()))?;
-    fs::set_permissions(&cmd.state_dir, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("chmod 0700 {}", cmd.state_dir.display()))?;
-    fs::create_dir_all(&cmd.log_dir)
-        .with_context(|| format!("create {}", cmd.log_dir.display()))?;
+    let paths = select_paths(cmd)?;
+    let created_config = setup(&paths)?;
     print_json(&serde_json::json!({
         "ok": true,
-        "state_dir": cmd.state_dir,
-        "log_dir": cmd.log_dir
+        "state_dir": paths.state_dir,
+        "log_dir": paths.log_dir,
+        "config_path": paths.config_path,
+        "config_created": created_config,
+        "verified": true,
     }))
+}
+
+fn select_paths(cmd: Setup) -> Result<SetupPaths> {
+    let interactive = !cmd.yes && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let state_dir = choose_path(
+        "State directory",
+        cmd.state_dir,
+        PathBuf::from(DEFAULT_STATE_DIR),
+        interactive,
+    )?;
+    let log_dir = choose_path(
+        "Log directory",
+        cmd.log_dir,
+        PathBuf::from(DEFAULT_LOG_DIR),
+        interactive,
+    )?;
+    let config_path = choose_path(
+        "Configuration file",
+        cmd.config_path,
+        state_dir.join("harar.toml"),
+        interactive,
+    )?;
+    Ok(SetupPaths {
+        state_dir,
+        log_dir,
+        config_path,
+    })
+}
+
+fn choose_path(
+    label: &str,
+    supplied: Option<PathBuf>,
+    default: PathBuf,
+    interactive: bool,
+) -> Result<PathBuf> {
+    if let Some(path) = supplied {
+        return Ok(path);
+    }
+    if !interactive {
+        return Ok(default);
+    }
+    print!("{label} [{}]: ", default.display());
+    std::io::stdout().flush().context("flush setup prompt")?;
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .context("read setup response")?;
+    let answer = answer.trim();
+    Ok(if answer.is_empty() {
+        default
+    } else {
+        PathBuf::from(answer)
+    })
+}
+
+fn setup(paths: &SetupPaths) -> Result<bool> {
+    ensure_dir(&paths.state_dir, PRIVATE_DIR_MODE, "state")?;
+    ensure_dir(&paths.log_dir, LOG_DIR_MODE, "log")?;
+    let config_parent = paths.config_path.parent().ok_or_else(|| {
+        anyhow!(
+            "configuration path {} has no parent directory",
+            paths.config_path.display()
+        )
+    })?;
+    ensure_dir(config_parent, PRIVATE_DIR_MODE, "configuration")?;
+    let signing_key = paths.state_dir.join("harar-signing.key");
+    if signing_key.exists() {
+        verify_private_file_owner(&signing_key, CONFIG_MODE, "signing key")?;
+    }
+
+    let created = if paths.config_path.exists() {
+        verify_file(&paths.config_path, CONFIG_MODE)?;
+        false
+    } else {
+        write_config_atomically(&paths.config_path, &render_config(paths))?;
+        true
+    };
+    verify(paths)?;
+    Ok(created)
+}
+
+fn ensure_dir(path: &Path, mode: u32, kind: &str) -> Result<()> {
+    let existed = path.exists();
+    fs::create_dir_all(path)
+        .with_context(|| format!("create {kind} directory {}", path.display()))?;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect {kind} directory {}", path.display()))?;
+    if !metadata.is_dir() {
+        return Err(anyhow!("{kind} path {} is not a directory", path.display()));
+    }
+    verify_owner(&metadata, path, kind)?;
+    if existed && metadata.permissions().mode() & 0o022 != 0 {
+        return Err(anyhow!(
+            "refusing attacker-writable {kind} directory {}",
+            path.display()
+        ));
+    }
+    if !existed {
+        // New paths are explicitly owned by the operator before any daemon
+        // material can be created beneath them.
+        set_owner_to_operator(path, kind)?;
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .with_context(|| format!("chmod {mode:o} {}", path.display()))
+}
+
+fn render_config(paths: &SetupPaths) -> String {
+    format!(
+        "# Generated by `harar setup`. This file contains no credentials.\nstate_dir = {:?}\nstate_path = {:?}\naudit_log_path = {:?}\nsigning_key_path = {:?}\n",
+        paths.state_dir.display().to_string(),
+        paths.state_dir.join("keys.age").display().to_string(),
+        paths.log_dir.join("gild-vault.log").display().to_string(),
+        paths
+            .state_dir
+            .join("harar-signing.key")
+            .display()
+            .to_string(),
+    )
+}
+
+fn write_config_atomically(path: &Path, contents: &str) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        anyhow!(
+            "configuration path {} has no parent directory",
+            path.display()
+        )
+    })?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp = parent.join(format!(".harar-setup-{}-{nonce}.tmp", std::process::id()));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(CONFIG_MODE)
+            .open(&tmp)
+            .with_context(|| format!("create temporary configuration {}", tmp.display()))?;
+        file.write_all(contents.as_bytes())
+            .context("write configuration")?;
+        file.set_permissions(fs::Permissions::from_mode(CONFIG_MODE))
+            .context("chmod temporary configuration")?;
+        file.sync_all().context("sync temporary configuration")?;
+        drop(file);
+        fs::rename(&tmp, path)
+            .with_context(|| format!("install configuration {}", path.display()))?;
+        File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .context("sync configuration directory")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn verify(paths: &SetupPaths) -> Result<()> {
+    verify_dir(&paths.state_dir, PRIVATE_DIR_MODE)?;
+    verify_dir(&paths.log_dir, LOG_DIR_MODE)?;
+    verify_file(&paths.config_path, CONFIG_MODE)
+}
+
+fn verify_dir(path: &Path, expected_mode: u32) -> Result<()> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("verify directory {}", path.display()))?;
+    if !metadata.is_dir() || metadata.permissions().mode() & 0o777 != expected_mode {
+        return Err(anyhow!(
+            "directory {} did not pass setup verification",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_file(path: &Path, expected_mode: u32) -> Result<()> {
+    verify_private_file_owner(path, expected_mode, "configuration")
+}
+
+fn verify_private_file_owner(path: &Path, expected_mode: u32, kind: &str) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("verify {kind} {}", path.display()))?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o777 != expected_mode {
+        return Err(anyhow!(
+            "{kind} {} must be a regular file with mode {expected_mode:o}",
+            path.display()
+        ));
+    }
+    verify_owner(&metadata, path, kind)?;
+    Ok(())
+}
+
+fn verify_owner(metadata: &fs::Metadata, path: &Path, kind: &str) -> Result<()> {
+    let operator = unsafe { libc::geteuid() };
+    if !is_owned_by_operator(metadata, operator) {
+        return Err(anyhow!(
+            "refusing {kind} {} owned by uid {}; operator uid is {operator}",
+            path.display(),
+            metadata.uid()
+        ));
+    }
+    Ok(())
+}
+
+fn is_owned_by_operator(metadata: &fs::Metadata, operator: u32) -> bool {
+    metadata.uid() == operator
+}
+
+fn set_owner_to_operator(path: &Path, kind: &str) -> Result<()> {
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+    // SAFETY: c_path is NUL-terminated and refers to the path just created.
+    if unsafe { libc::chown(c_path.as_ptr(), uid, gid) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("chown {kind} directory {}", path.display()));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setup_is_secure_atomic_and_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = SetupPaths {
+            state_dir: temp.path().join("state"),
+            log_dir: temp.path().join("logs"),
+            config_path: temp.path().join("config").join("harar.toml"),
+        };
+        assert!(setup(&paths).unwrap());
+        let original = fs::read_to_string(&paths.config_path).unwrap();
+        assert!(!setup(&paths).unwrap());
+        assert_eq!(fs::read_to_string(&paths.config_path).unwrap(), original);
+        assert_eq!(
+            fs::metadata(&paths.config_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            CONFIG_MODE
+        );
+        assert_eq!(
+            fs::metadata(&paths.state_dir).unwrap().permissions().mode() & 0o777,
+            PRIVATE_DIR_MODE
+        );
+        assert_eq!(
+            fs::metadata(&paths.log_dir).unwrap().permissions().mode() & 0o777,
+            LOG_DIR_MODE
+        );
+        assert!(
+            !temp
+                .path()
+                .join("config")
+                .read_dir()
+                .unwrap()
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".tmp"))
+        );
+    }
+
+    #[test]
+    fn setup_refuses_insecure_existing_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = SetupPaths {
+            state_dir: temp.path().join("state"),
+            log_dir: temp.path().join("logs"),
+            config_path: temp.path().join("config.toml"),
+        };
+        fs::write(&paths.config_path, "x").unwrap();
+        fs::set_permissions(&paths.config_path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(setup(&paths).is_err());
+    }
+
+    #[test]
+    fn setup_refuses_attacker_writable_state_dir_and_signing_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        fs::create_dir(&state_dir).unwrap();
+        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o777)).unwrap();
+        let paths = SetupPaths {
+            state_dir: state_dir.clone(),
+            log_dir: temp.path().join("logs"),
+            config_path: temp.path().join("config.toml"),
+        };
+        assert!(
+            setup(&paths)
+                .unwrap_err()
+                .to_string()
+                .contains("attacker-writable")
+        );
+
+        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let signing_key = state_dir.join("harar-signing.key");
+        fs::write(&signing_key, [7_u8; 32]).unwrap();
+        fs::set_permissions(&signing_key, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(setup(&paths).is_err());
+    }
+
+    #[test]
+    fn ownership_check_refuses_a_different_operator_uid() {
+        let temp = tempfile::tempdir().unwrap();
+        let metadata = fs::metadata(temp.path()).unwrap();
+        assert!(is_owned_by_operator(&metadata, metadata.uid()));
+        assert!(metadata.uid() != u32::MAX);
+        let wrong_operator = metadata.uid() + 1;
+        assert!(!is_owned_by_operator(&metadata, wrong_operator));
+    }
 }

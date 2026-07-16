@@ -93,7 +93,8 @@ async fn real_vault_round_trip_and_cross_shop_keys_stay_scoped() {
 async fn proxy_binary_uses_vault_socket_env_and_checks_health_before_binding() {
     let vault = RealVault::start();
     let port = unused_local_port();
-    let mut proxy = Command::new(harar_proxy_binary())
+    let mut proxy = Command::new(harar_binary())
+        .arg("proxy")
         .arg("--bind")
         .arg("127.0.0.1")
         .arg("--port")
@@ -121,7 +122,8 @@ async fn proxy_binary_tls_requires_client_cert_and_bearer_and_audits_cn() {
     let certs = TlsFixture::new();
     let tls_port = unused_local_port();
     let audit_log = certs.temp.path().join("audit.log");
-    let mut proxy = Command::new(harar_proxy_binary())
+    let mut proxy = Command::new(harar_binary())
+        .arg("proxy")
         .arg("--tls-bind")
         .arg(format!("127.0.0.1:{tls_port}"))
         .arg("--tls-ca")
@@ -200,7 +202,8 @@ fn proxy_binary_refuses_to_bind_when_configured_socket_is_unreachable() {
         std::process::id(),
         unused_local_port()
     ));
-    let output = Command::new(harar_proxy_binary())
+    let output = Command::new(harar_binary())
+        .arg("proxy")
         .arg("--bind")
         .arg("127.0.0.1")
         .arg("--port")
@@ -258,6 +261,7 @@ struct RealVault {
 impl RealVault {
     fn start() -> Self {
         let temp = tempfile::tempdir().unwrap();
+        set_mode(temp.path(), 0o700);
         let socket_path = temp.path().join("run/gild-vault/sock");
         std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
         let state_path = temp.path().join("keys.age");
@@ -277,6 +281,7 @@ impl RealVault {
         let binary = gild_vault_binary();
 
         let child = Command::new(binary)
+            .arg("serve")
             .arg("--socket")
             .arg(&socket_path)
             .arg("--state-path")
@@ -313,8 +318,8 @@ fn gild_vault_binary() -> PathBuf {
     workspace_binary("harar")
 }
 
-fn harar_proxy_binary() -> PathBuf {
-    workspace_binary("harar-proxy")
+fn harar_binary() -> PathBuf {
+    workspace_binary("harar")
 }
 
 fn workspace_binary(name: &str) -> PathBuf {
@@ -326,15 +331,11 @@ fn workspace_binary(name: &str) -> PathBuf {
         .unwrap()
         .to_path_buf();
     let binary = target_dir.join(name);
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let mut command = Command::new(cargo);
-    command.args(["build", "--quiet", "-p", name]);
-    if !cfg!(debug_assertions) {
-        command.arg("--release");
-    }
-    let status = command.status().unwrap();
-    assert!(status.success(), "failed to build {name} test binary");
-    assert!(binary.exists(), "{} was not built", binary.display());
+    assert!(
+        binary.exists(),
+        "{} was not built; run `cargo build -p {name}` before this integration test",
+        binary.display()
+    );
     binary
 }
 

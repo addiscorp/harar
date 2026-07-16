@@ -15,6 +15,8 @@ use harar_client::{VaultClient, VaultClientError};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+pub mod runner;
+
 #[cfg(test)]
 use std::collections::HashMap;
 

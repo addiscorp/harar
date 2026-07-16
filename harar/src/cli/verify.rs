@@ -1,3 +1,4 @@
+use crate::cli::secret_input::SecretInput;
 use crate::cli::{SocketArgs, print_json};
 use anyhow::Result;
 use clap::Args;
@@ -7,8 +8,8 @@ use harar_client::{VaultClient, VerifyTokenRequest};
 pub struct Verify {
     #[command(flatten)]
     socket: SocketArgs,
-    #[arg(long)]
-    token: String,
+    #[command(flatten)]
+    secret: SecretInput,
     #[arg(long, alias = "aud")]
     audience: String,
     #[arg(long)]
@@ -18,9 +19,10 @@ pub struct Verify {
 }
 
 pub async fn run(cmd: Verify) -> Result<()> {
+    let token = cmd.secret.read("Token")?;
     let response = VaultClient::from_socket_path(cmd.socket.socket)
         .verify_token(&VerifyTokenRequest {
-            token: cmd.token,
+            token,
             audience: cmd.audience,
             subject: cmd.subject,
             run_id: cmd.run_id,

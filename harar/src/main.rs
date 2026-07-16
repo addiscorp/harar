@@ -1,8 +1,10 @@
 use anyhow::{Context, Result, anyhow};
+#[cfg(test)]
+use harar_client::VaultClient;
 use harar_client::{
-    HararTokenTemplate, MintTokenRequest, MintedToken, RevokeTokenRequest, TokenError, VaultClient,
-    VerifyTokenRequest, default_vault_socket_path, generate_signing_key, jwks_for_key, mint_token,
-    signing_key_bytes, signing_key_from_bytes, validate_token_bindings, verify_token,
+    HararTokenTemplate, MintTokenRequest, MintedToken, TokenError, generate_signing_key,
+    jwks_for_key, mint_token, signing_key_bytes, signing_key_from_bytes, validate_token_bindings,
+    verify_token,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -10,7 +12,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -18,6 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
+mod cli;
 mod master_key;
 
 const DEFAULT_SOCKET_PATH: &str = "/run/gild-vault.sock";
@@ -368,14 +371,16 @@ struct AuditEvent<'a> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if let Some(command) = harar_command() {
-        return run_harar_cli(command).await;
-    }
-    run_daemon().await
+    cli::run().await
 }
 
-async fn run_daemon() -> Result<()> {
+pub(crate) async fn run_daemon() -> Result<()> {
     let config = Config::from_env_and_args();
+    let state_dir = config
+        .state_path
+        .parent()
+        .ok_or_else(|| anyhow!("state path has no parent"))?;
+    ensure_operator_private_dir(state_dir, 0o700, "state")?;
     let master_key = master_key::load_master_key()?;
     let master_recipient = master_key.to_public();
     let keys = load_keys(&config.state_path, &master_key)?;
@@ -416,107 +421,6 @@ async fn run_daemon() -> Result<()> {
     }
 
     serve(config, state).await
-}
-
-fn harar_command() -> Option<String> {
-    let bin = std::env::args().next().unwrap_or_default();
-    if !bin.rsplit('/').next().unwrap_or("").contains("harar") {
-        return None;
-    }
-    let command = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "serve".to_string());
-    match command.as_str() {
-        "mint" | "verify" | "revoke" | "jwks" => Some(command),
-        "serve" => None,
-        _ => None,
-    }
-}
-
-async fn run_harar_cli(command: String) -> Result<()> {
-    let args = std::env::args().skip(2).collect::<Vec<_>>();
-    match command.as_str() {
-        "mint" => cli_mint(&args).await,
-        "verify" => cli_verify(&args).await,
-        "revoke" => cli_revoke(&args).await,
-        "jwks" => cli_jwks(&args).await,
-        _ => Err(anyhow!("unknown harar command {command}")),
-    }
-}
-
-async fn cli_mint(args: &[String]) -> Result<()> {
-    let socket = cli_socket(args);
-    let template = cli_value(args, "--template")
-        .and_then(|value| HararTokenTemplate::parse(&value))
-        .ok_or_else(|| {
-            anyhow!("harar mint requires --template agent-session|run-scoped|service")
-        })?;
-    let subject =
-        cli_value(args, "--subject").ok_or_else(|| anyhow!("harar mint requires --subject"))?;
-    let ttl_seconds = cli_value(args, "--ttl-seconds")
-        .ok_or_else(|| anyhow!("harar mint requires --ttl-seconds"))?
-        .parse::<u64>()
-        .context("parse --ttl-seconds")?;
-    let request = MintTokenRequest {
-        template,
-        subject,
-        run_id: cli_value(args, "--run-id"),
-        ttl_seconds,
-    };
-    let token = VaultClient::from_socket_path(socket)
-        .mint_token(&request)
-        .await?;
-    println!("{}", serde_json::to_string(&token)?);
-    Ok(())
-}
-
-async fn cli_verify(args: &[String]) -> Result<()> {
-    let socket = cli_socket(args);
-    let token =
-        cli_value(args, "--token").ok_or_else(|| anyhow!("harar verify requires --token"))?;
-    let audience = cli_value(args, "--audience")
-        .or_else(|| cli_value(args, "--aud"))
-        .ok_or_else(|| anyhow!("harar verify requires --audience"))?;
-    let response = VaultClient::from_socket_path(socket)
-        .verify_token(&VerifyTokenRequest {
-            token,
-            audience,
-            subject: cli_value(args, "--subject"),
-            run_id: cli_value(args, "--run-id"),
-        })
-        .await?;
-    println!("{}", serde_json::to_string(&response)?);
-    Ok(())
-}
-
-async fn cli_jwks(args: &[String]) -> Result<()> {
-    let socket = cli_socket(args);
-    let jwks = VaultClient::from_socket_path(socket).jwks().await?;
-    println!("{}", serde_json::to_string(&jwks)?);
-    Ok(())
-}
-
-async fn cli_revoke(args: &[String]) -> Result<()> {
-    let socket = cli_socket(args);
-    let jti = cli_value(args, "--jti").ok_or_else(|| anyhow!("harar revoke requires --jti"))?;
-    VaultClient::from_socket_path(socket)
-        .revoke_token(&RevokeTokenRequest { jti })
-        .await?;
-    println!(
-        "{}",
-        serde_json::to_string(&serde_json::json!({ "ok": true }))?
-    );
-    Ok(())
-}
-
-fn cli_socket(args: &[String]) -> String {
-    cli_value(args, "--socket").unwrap_or_else(default_vault_socket_path)
-}
-
-fn cli_value(args: &[String], name: &str) -> Option<String> {
-    args.windows(2)
-        .find(|window| window[0] == name)
-        .map(|window| window[1].clone())
 }
 
 async fn serve(config: Config, state: Arc<AppState>) -> Result<()> {
@@ -1726,16 +1630,17 @@ fn load_replication_token(path: &Path) -> Result<String> {
 }
 
 fn load_or_create_signing_key(path: &Path) -> Result<ed25519_dalek::SigningKey> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("signing key path has no parent"))?;
+    ensure_operator_private_dir(parent, 0o700, "signing key parent")?;
     match fs::read(path) {
-        Ok(bytes) => signing_key_from_bytes(&bytes)
-            .map_err(|err| anyhow!("decode harar signing key at {}: {err}", path.display())),
+        Ok(bytes) => {
+            verify_operator_private_file(path, 0o600, "signing key")?;
+            signing_key_from_bytes(&bytes)
+                .map_err(|err| anyhow!("decode harar signing key at {}: {err}", path.display()))
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("create {}", parent.display()))?;
-                fs::set_permissions(parent, fs::Permissions::from_mode(0o750))
-                    .with_context(|| format!("chmod 0750 {}", parent.display()))?;
-            }
             let key = generate_signing_key();
             let mut file = OpenOptions::new()
                 .create_new(true)
@@ -1747,10 +1652,54 @@ fn load_or_create_signing_key(path: &Path) -> Result<ed25519_dalek::SigningKey> 
                 .with_context(|| format!("write harar signing key {}", path.display()))?;
             file.sync_all()
                 .with_context(|| format!("sync harar signing key {}", path.display()))?;
+            drop(file);
+            verify_operator_private_file(path, 0o600, "signing key")?;
             Ok(key)
         }
         Err(err) => Err(err).with_context(|| format!("read {}", path.display())),
     }
+}
+
+fn ensure_operator_private_dir(path: &Path, mode: u32, kind: &str) -> Result<()> {
+    let existed = path.exists();
+    fs::create_dir_all(path)
+        .with_context(|| format!("create {kind} directory {}", path.display()))?;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect {kind} directory {}", path.display()))?;
+    if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(anyhow!(
+            "refusing unowned {kind} directory {}",
+            path.display()
+        ));
+    }
+    if existed && metadata.permissions().mode() & 0o022 != 0 {
+        return Err(anyhow!(
+            "refusing attacker-writable {kind} directory {}",
+            path.display()
+        ));
+    }
+    if !existed {
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+        // SAFETY: c_path is NUL-terminated and names the directory just created.
+        if unsafe { libc::chown(c_path.as_ptr(), libc::geteuid(), libc::getegid()) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("chown {kind} directory {}", path.display()));
+        }
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+fn verify_operator_private_file(path: &Path, mode: u32, kind: &str) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("inspect {kind} {}", path.display()))?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o777 != mode
+    {
+        return Err(anyhow!("refusing unsafe {kind} {}", path.display()));
+    }
+    Ok(())
 }
 
 fn load_replication_meta(path: &Path) -> Result<ReplicationMeta> {
@@ -3575,6 +3524,16 @@ mod tests {
 
         let mode = fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o750);
+    }
+
+    #[test]
+    fn signing_key_loader_refuses_attacker_writable_key_before_reading_it() {
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("harar-signing.key");
+        fs::write(&key_path, [7_u8; 32]).unwrap();
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o666)).unwrap();
+
+        assert!(load_or_create_signing_key(&key_path).is_err());
     }
 
     #[tokio::test]

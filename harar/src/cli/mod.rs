@@ -7,10 +7,12 @@ pub mod mint;
 pub mod proxy;
 pub mod put;
 pub mod revoke;
+pub mod secret_input;
 pub mod self_cmd;
 pub mod serve;
 pub mod setup;
 pub mod verify;
+pub mod version;
 
 const DEFAULT_SOCKET_PATH: &str = "/run/gild-vault.sock";
 
@@ -32,6 +34,7 @@ enum Command {
     Revoke(revoke::Revoke),
     Jwks(jwks::Jwks),
     Setup(setup::Setup),
+    Version(version::Version),
     #[command(name = "self")]
     SelfCmd(self_cmd::SelfCommand),
 }
@@ -53,6 +56,7 @@ pub async fn run() -> anyhow::Result<()> {
         Command::Revoke(cmd) => revoke::run(cmd).await,
         Command::Jwks(cmd) => jwks::run(cmd).await,
         Command::Setup(cmd) => setup::run(cmd).await,
+        Command::Version(cmd) => version::run(cmd),
         Command::SelfCmd(cmd) => self_cmd::run(cmd).await,
     }
 }
@@ -93,6 +97,24 @@ mod tests {
 
         assert_eq!(cli.socket.socket, PathBuf::from(socket));
         restore_env("HARAR_SOCKET", previous);
+    }
+
+    #[test]
+    fn credential_commands_reject_secret_values_in_argv() {
+        for argv in [
+            vec!["harar", "self", "login", "--token", "tg_usr_leak"],
+            vec![
+                "harar",
+                "verify",
+                "--token",
+                "eyJhbGciOiJFZERTQSJ9.leak",
+                "--audience",
+                "linkhash",
+            ],
+            vec!["harar", "put", "DATABASE_URL", "postgres://secret@db"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err());
+        }
     }
 
     #[derive(Debug, Parser)]
