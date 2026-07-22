@@ -1,4 +1,5 @@
 use age::secrecy::ExposeSecret;
+use harar_client::{ConsumeOnceRequest, PurgeOnceRequest, StageOnceRequest, VaultClient};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use std::fs;
@@ -56,7 +57,10 @@ impl TestDir {
             .duration_since(UNIX_EPOCH)
             .expect("system clock before epoch")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
+        // Unix socket paths are bounded by sockaddr_un. Cargo's isolated
+        // TMPDIR can exceed that bound, so keep real-socket fixtures under the
+        // conventional short temporary root.
+        let path = Path::new("/tmp").join(format!("{prefix}-{}-{nanos}", std::process::id()));
         fs::create_dir_all(&path).expect("create test dir");
         Self { path }
     }
@@ -75,15 +79,28 @@ impl Drop for TestDir {
 struct VaultDaemon {
     child: Child,
     cleanup_socket: Option<PathBuf>,
+    stderr_path: PathBuf,
 }
 
 impl Drop for VaultDaemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.stop();
         if let Some(socket) = &self.cleanup_socket {
             let _ = fs::remove_file(socket);
         }
+    }
+}
+
+impl VaultDaemon {
+    fn stop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+
+    fn stderr(&self) -> String {
+        fs::read_to_string(&self.stderr_path).expect("read daemon stderr")
     }
 }
 
@@ -241,6 +258,147 @@ fn harar_no_socket_flag_uses_env_selected_socket_over_real_daemon() {
     let _: serde_json::Value = harar_json_with_env(["revoke", "--jti", &minted.jti], &socket_env);
 }
 
+/// This is deliberately separate-process coverage: Harar obtains SO_PEERCRED
+/// from the connected Unix socket and harar-client serializes the v2 custody
+/// envelopes. The daemon runs in a user namespace which maps this test's host
+/// uid to the real `git-server` uid (994), so there is no injected PeerCred.
+#[tokio::test(flavor = "current_thread")]
+async fn harar_real_topology_one_time_custody_v2_over_unix_socket() {
+    let dir = TestDir::new("harar-custody-v2-topology");
+    let socket = dir.path().join("gild-vault.sock");
+    let mut daemon = spawn_git_server_vault(dir.path(), &socket);
+    wait_for_connectable_socket(&socket);
+
+    let client = VaultClient::from_socket_path(&socket);
+    let stage = StageOnceRequest {
+        token_id: "pat-topology-1".to_string(),
+        principal_id: "principal-topology-1".to_string(),
+        display_id: "display-topology-1".to_string(),
+        value: "topology-custody-value-not-for-output".to_string(),
+        ttl_seconds: 2,
+    };
+    let binding = ConsumeOnceRequest {
+        token_id: stage.token_id.clone(),
+        principal_id: stage.principal_id.clone(),
+        display_id: stage.display_id.clone(),
+    };
+
+    client
+        .stage_once(&stage)
+        .await
+        .expect("stage through Unix socket");
+
+    let wrong_principal = ConsumeOnceRequest {
+        principal_id: "principal-topology-wrong".to_string(),
+        ..binding.clone()
+    };
+    assert_terminal(client.consume_once(&wrong_principal).await);
+    assert_eq!(
+        client
+            .consume_once(&binding)
+            .await
+            .expect("rightful consume through Unix socket"),
+        stage.value
+    );
+    assert_terminal(client.consume_once(&binding).await);
+
+    let concurrent_stage = StageOnceRequest {
+        token_id: "pat-topology-concurrent".to_string(),
+        display_id: "display-topology-concurrent".to_string(),
+        ..stage.clone()
+    };
+    let concurrent_binding = ConsumeOnceRequest {
+        token_id: concurrent_stage.token_id.clone(),
+        principal_id: concurrent_stage.principal_id.clone(),
+        display_id: concurrent_stage.display_id.clone(),
+    };
+    client
+        .stage_once(&concurrent_stage)
+        .await
+        .expect("stage concurrent record through Unix socket");
+    let left = client.clone();
+    let right = client.clone();
+    let left_binding = concurrent_binding.clone();
+    let right_binding = concurrent_binding.clone();
+    let (left_result, right_result) = tokio::join!(
+        left.consume_once(&left_binding),
+        right.consume_once(&right_binding),
+    );
+    let winners = [left_result, right_result]
+        .into_iter()
+        .filter(|result| result.is_ok())
+        .count();
+    assert_eq!(
+        winners, 1,
+        "only one concurrent Unix-socket consume may win"
+    );
+    assert_terminal(client.consume_once(&concurrent_binding).await);
+
+    let purge_stage = StageOnceRequest {
+        token_id: "pat-topology-purge".to_string(),
+        display_id: "display-topology-purge".to_string(),
+        ..stage.clone()
+    };
+    let purge_binding = PurgeOnceRequest {
+        token_id: purge_stage.token_id.clone(),
+        principal_id: purge_stage.principal_id.clone(),
+        display_id: purge_stage.display_id.clone(),
+    };
+    client
+        .stage_once(&purge_stage)
+        .await
+        .expect("stage purge record through Unix socket");
+    client
+        .purge_once(&purge_binding)
+        .await
+        .expect("purge through Unix socket");
+    assert_terminal(
+        client
+            .consume_once(&ConsumeOnceRequest {
+                token_id: purge_binding.token_id,
+                principal_id: purge_binding.principal_id,
+                display_id: purge_binding.display_id,
+            })
+            .await,
+    );
+
+    let expiry_stage = StageOnceRequest {
+        token_id: "pat-topology-expiry".to_string(),
+        display_id: "display-topology-expiry".to_string(),
+        ttl_seconds: 1,
+        ..stage.clone()
+    };
+    let expiry_binding = ConsumeOnceRequest {
+        token_id: expiry_stage.token_id.clone(),
+        principal_id: expiry_stage.principal_id.clone(),
+        display_id: expiry_stage.display_id.clone(),
+    };
+    client
+        .stage_once(&expiry_stage)
+        .await
+        .expect("stage expiry record through Unix socket");
+    daemon.stop();
+    thread::sleep(Duration::from_secs(2));
+    daemon = spawn_git_server_vault(dir.path(), &socket);
+    wait_for_connectable_socket(&socket);
+    assert_terminal(client.consume_once(&expiry_binding).await);
+
+    daemon.stop();
+    let audit = fs::read_to_string(dir.path().join("audit.log")).expect("read daemon audit");
+    let stderr = daemon.stderr();
+    for forbidden in [
+        stage.value.as_str(),
+        stage.display_id.as_str(),
+        stage.principal_id.as_str(),
+    ] {
+        assert!(!audit.contains(forbidden));
+        assert!(!stderr.contains(forbidden));
+    }
+    assert!(audit.contains("\"op\":\"stage_once\""));
+    assert!(audit.contains("\"op\":\"consume_once\""));
+    assert!(audit.contains("\"op\":\"purge_once\""));
+}
+
 #[test]
 fn harar_default_socket_path_works_without_socket_overrides_when_available() {
     let _default_daemon = match default_socket_case() {
@@ -330,8 +488,14 @@ fn spawn_vault(dir: &Path, socket: &Path, cleanup_socket: Option<PathBuf>) -> Va
     let state_path = dir.join("keys.age");
     let audit_log = dir.join("audit.log");
     let signing_key = dir.join("harar-signing.key");
-    write_master_key(&master_key);
-    fs::write(&replication_token, "test-replication-token\n").expect("write replication token");
+    if !master_key.exists() {
+        write_master_key(&master_key);
+    }
+    if !replication_token.exists() {
+        fs::write(&replication_token, "test-replication-token\n").expect("write replication token");
+    }
+    let stderr_path = dir.join("daemon.stderr.log");
+    let stderr = fs::File::create(&stderr_path).expect("create daemon stderr log");
 
     let mut command = Command::new(gild_vault_bin());
     if socket != Path::new(DEFAULT_SOCKET) {
@@ -350,14 +514,75 @@ fn spawn_vault(dir: &Path, socket: &Path, cleanup_socket: Option<PathBuf>) -> Va
         ])
         .env("GILD_VAULT_MASTER_KEY_PATH", &master_key)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(stderr))
         .spawn()
         .expect("spawn gild-vault daemon");
 
     VaultDaemon {
         child,
         cleanup_socket,
+        stderr_path,
     }
+}
+
+fn spawn_git_server_vault(dir: &Path, socket: &Path) -> VaultDaemon {
+    let master_key = dir.join("vault-master.key");
+    let replication_token = dir.join("vault-replication-token");
+    let state_path = dir.join("keys.age");
+    let audit_log = dir.join("audit.log");
+    let signing_key = dir.join("harar-signing.key");
+    if !master_key.exists() {
+        write_master_key(&master_key);
+    }
+    if !replication_token.exists() {
+        fs::write(&replication_token, "test-replication-token\n").expect("write replication token");
+    }
+    let stderr_path = dir.join("daemon.stderr.log");
+    let stderr = fs::File::create(&stderr_path).expect("create daemon stderr log");
+
+    // uid 994 is the real git-server identity. Mapping the test runner's host
+    // uid to it lets the daemon read a kernel-provided SO_PEERCRED with that
+    // identity, without a fake PeerCred or a privileged setuid helper.
+    let uid = std::process::id();
+    let host_uid = unsafe { libc::geteuid() };
+    let child = Command::new("unshare")
+        .args([
+            "-U",
+            "--map-users",
+            &format!("994:{host_uid}:1"),
+            "--setuid",
+            "994",
+            "--",
+            gild_vault_bin(),
+            "--socket",
+            socket_str(socket),
+            "--state-path",
+            path_str(&state_path),
+            "--audit-log",
+            path_str(&audit_log),
+            "--replication-token-file",
+            path_str(&replication_token),
+            "--signing-key-file",
+            path_str(&signing_key),
+        ])
+        .env("GILD_VAULT_MASTER_KEY_PATH", &master_key)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .unwrap_or_else(|err| panic!("spawn git-server identity vault process {uid}: {err}"));
+
+    VaultDaemon {
+        child,
+        cleanup_socket: Some(socket.to_path_buf()),
+        stderr_path,
+    }
+}
+
+fn assert_terminal(result: Result<String, harar_client::VaultClientError>) {
+    assert!(
+        result.is_err(),
+        "one-time custody operation must be terminal"
+    );
 }
 
 fn write_master_key(path: &Path) {

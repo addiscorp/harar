@@ -1512,6 +1512,75 @@ mod tests {
         assert!(!serialized.contains("signing"));
     }
 
+    /// Consumer-owned v2 fixture. Keep these wire objects literal so a change
+    /// to either the client serializer or Harar's response envelopes is caught
+    /// before the Unix-socket seam can drift.
+    #[test]
+    fn custody_v2_consumer_envelopes_match_contract_fixture() {
+        let stage = VaultRequest::StageOnce {
+            token_id: "pat-fixture-1",
+            principal_id: "principal-fixture-1",
+            display_id: "display-fixture-1",
+            value: "fixture-value",
+            ttl_seconds: 60,
+        };
+        assert_eq!(
+            serde_json::to_value(stage).unwrap(),
+            serde_json::json!({
+                "op": "stageonce",
+                "token_id": "pat-fixture-1",
+                "principal_id": "principal-fixture-1",
+                "display_id": "display-fixture-1",
+                "value": "fixture-value",
+                "ttl_seconds": 60,
+            })
+        );
+
+        let consume = VaultRequest::ConsumeOnce {
+            token_id: "pat-fixture-1",
+            principal_id: "principal-fixture-1",
+            display_id: "display-fixture-1",
+        };
+        assert_eq!(
+            serde_json::to_value(consume).unwrap(),
+            serde_json::json!({
+                "op": "consumeonce",
+                "token_id": "pat-fixture-1",
+                "principal_id": "principal-fixture-1",
+                "display_id": "display-fixture-1",
+            })
+        );
+
+        let purge = VaultRequest::PurgeOnce {
+            token_id: "pat-fixture-1",
+            principal_id: "principal-fixture-1",
+            display_id: "display-fixture-1",
+        };
+        assert_eq!(
+            serde_json::to_value(purge).unwrap(),
+            serde_json::json!({
+                "op": "purgeonce",
+                "token_id": "pat-fixture-1",
+                "principal_id": "principal-fixture-1",
+                "display_id": "display-fixture-1",
+            })
+        );
+
+        let stage_response: VaultResponse =
+            serde_json::from_value(serde_json::json!({"ok": true})).unwrap();
+        assert!(stage_response.ok);
+        assert_eq!(stage_response.value, None);
+        let consume_response: VaultResponse =
+            serde_json::from_value(serde_json::json!({"ok": true, "value": "fixture-value"}))
+                .unwrap();
+        assert!(consume_response.ok);
+        assert_eq!(consume_response.value.as_deref(), Some("fixture-value"));
+        let terminal_response: VaultResponse =
+            serde_json::from_value(serde_json::json!({"ok": false, "error": "not_found"})).unwrap();
+        assert!(!terminal_response.ok);
+        assert_eq!(terminal_response.error.as_deref(), Some("not_found"));
+    }
+
     struct MockAgent {
         socket_path: PathBuf,
         _temp: TempDir,
