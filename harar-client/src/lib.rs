@@ -156,6 +156,34 @@ pub struct RevokeTokenRequest {
     pub jti: String,
 }
 
+/// A short-lived value that may be returned exactly once to its future owner.
+///
+/// This is deliberately unrelated to Harar's JWT templates and generic secret
+/// vault. `display_id` is an opaque, caller-generated handle; it is never
+/// returned by list/get APIs because this record type has no list/get API.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StageOnceRequest {
+    pub token_id: String,
+    pub principal_id: String,
+    pub display_id: String,
+    pub value: String,
+    pub ttl_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ConsumeOnceRequest {
+    pub token_id: String,
+    pub principal_id: String,
+    pub display_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PurgeOnceRequest {
+    pub token_id: String,
+    pub principal_id: String,
+    pub display_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Jwks {
     pub keys: Vec<Jwk>,
@@ -226,6 +254,23 @@ enum VaultRequest<'a> {
         key: &'a str,
         #[serde(skip_serializing_if = "Option::is_none")]
         shop_id: Option<&'a str>,
+    },
+    StageOnce {
+        token_id: &'a str,
+        principal_id: &'a str,
+        display_id: &'a str,
+        value: &'a str,
+        ttl_seconds: u64,
+    },
+    ConsumeOnce {
+        token_id: &'a str,
+        principal_id: &'a str,
+        display_id: &'a str,
+    },
+    PurgeOnce {
+        token_id: &'a str,
+        principal_id: &'a str,
+        display_id: &'a str,
     },
     Mint {
         template: &'a HararTokenTemplate,
@@ -447,6 +492,70 @@ impl VaultClient {
         self.delete_scoped(key, None).await
     }
 
+    /// Stage an opaque value for a single future consume. This does not print,
+    /// list, or otherwise expose the value.
+    pub async fn stage_once(&self, request: &StageOnceRequest) -> Result<(), VaultClientError> {
+        validate_once_stage(request)?;
+        let response = self
+            .request(&VaultRequest::StageOnce {
+                token_id: &request.token_id,
+                principal_id: &request.principal_id,
+                display_id: &request.display_id,
+                value: &request.value,
+                ttl_seconds: request.ttl_seconds,
+            })
+            .await?;
+        response_to_unit(response, "stage_once_failed")
+    }
+
+    /// Atomically take a staged value. A successful call permanently removes
+    /// the record before returning its value; retry callers receive no value.
+    pub async fn consume_once(
+        &self,
+        request: &ConsumeOnceRequest,
+    ) -> Result<String, VaultClientError> {
+        validate_once_binding(
+            &request.token_id,
+            &request.principal_id,
+            &request.display_id,
+        )?;
+        let response = self
+            .request(&VaultRequest::ConsumeOnce {
+                token_id: &request.token_id,
+                principal_id: &request.principal_id,
+                display_id: &request.display_id,
+            })
+            .await?;
+        if response.ok {
+            response.value.ok_or_else(|| {
+                VaultClientError::InvalidResponse("missing one-time value".to_string())
+            })
+        } else {
+            Err(VaultClientError::Vault(
+                response
+                    .error
+                    .unwrap_or_else(|| "consume_once_failed".to_string()),
+            ))
+        }
+    }
+
+    /// Terminally remove a staged value without reading it.
+    pub async fn purge_once(&self, request: &PurgeOnceRequest) -> Result<(), VaultClientError> {
+        validate_once_binding(
+            &request.token_id,
+            &request.principal_id,
+            &request.display_id,
+        )?;
+        let response = self
+            .request(&VaultRequest::PurgeOnce {
+                token_id: &request.token_id,
+                principal_id: &request.principal_id,
+                display_id: &request.display_id,
+            })
+            .await?;
+        response_to_unit(response, "purge_once_failed")
+    }
+
     pub async fn delete_for_shop(&self, key: &str, shop_id: &str) -> Result<(), VaultClientError> {
         self.delete_scoped(key, Some(shop_id)).await
     }
@@ -628,6 +737,44 @@ impl VaultClient {
     }
 }
 
+fn validate_once_binding(
+    token_id: &str,
+    principal_id: &str,
+    display_id: &str,
+) -> Result<(), VaultClientError> {
+    if token_id.trim().is_empty() || principal_id.trim().is_empty() || display_id.trim().is_empty()
+    {
+        return Err(VaultClientError::InvalidResponse(
+            "one-time custody binding cannot be empty".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_once_stage(request: &StageOnceRequest) -> Result<(), VaultClientError> {
+    validate_once_binding(
+        &request.token_id,
+        &request.principal_id,
+        &request.display_id,
+    )?;
+    if request.value.is_empty() || request.ttl_seconds == 0 {
+        return Err(VaultClientError::InvalidResponse(
+            "one-time custody value and ttl are required".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn response_to_unit(response: VaultResponse, fallback: &str) -> Result<(), VaultClientError> {
+    if response.ok {
+        Ok(())
+    } else {
+        Err(VaultClientError::Vault(
+            response.error.unwrap_or_else(|| fallback.to_string()),
+        ))
+    }
+}
+
 pub fn default_vault_socket_path() -> String {
     std::env::var("HARAR_SOCKET")
         .or_else(|_| std::env::var("VAULT_SOCKET"))
@@ -673,7 +820,7 @@ pub fn harar_auth_contract() -> SeamContract {
         })
     }
 
-    let mut contract = SeamContract::new("harar_auth", 1);
+    let mut contract = SeamContract::new("harar_auth", 2);
     contract.boundaries = vec![
         SeamBoundary {
             function: "mint".to_string(),
@@ -694,6 +841,21 @@ pub fn harar_auth_contract() -> SeamContract {
             function: "jwks".to_string(),
             request: "HararJwksRequest".to_string(),
             response: "HararJwksResponse".to_string(),
+        },
+        SeamBoundary {
+            function: "stage_once".to_string(),
+            request: "HararStageOnceRequest".to_string(),
+            response: "HararOkResponse".to_string(),
+        },
+        SeamBoundary {
+            function: "consume_once".to_string(),
+            request: "HararConsumeOnceRequest".to_string(),
+            response: "HararConsumeOnceResponse".to_string(),
+        },
+        SeamBoundary {
+            function: "purge_once".to_string(),
+            request: "HararPurgeOnceRequest".to_string(),
+            response: "HararOkResponse".to_string(),
         },
     ];
     contract.definitions = vec![
@@ -739,6 +901,40 @@ pub fn harar_auth_contract() -> SeamContract {
             ],
         ),
         record("HararRevokeTokenRequest", &[("jti", string())]),
+        record(
+            "HararStageOnceRequest",
+            &[
+                ("token_id", string()),
+                ("principal_id", string()),
+                ("display_id", string()),
+                ("value", string()),
+                ("ttl_seconds", int()),
+            ],
+        ),
+        record(
+            "HararConsumeOnceRequest",
+            &[
+                ("token_id", string()),
+                ("principal_id", string()),
+                ("display_id", string()),
+            ],
+        ),
+        record(
+            "HararConsumeOnceResponse",
+            &[
+                ("ok", bool_type()),
+                ("value", option(string())),
+                ("error", option(string())),
+            ],
+        ),
+        record(
+            "HararPurgeOnceRequest",
+            &[
+                ("token_id", string()),
+                ("principal_id", string()),
+                ("display_id", string()),
+            ],
+        ),
         record("HararOkResponse", &[("ok", bool_type())]),
         record("HararJwksRequest", &[]),
         record(
@@ -1303,13 +1499,86 @@ mod tests {
 
         assert_eq!(json["format"], "seam.contract@1");
         assert_eq!(json["name"], "harar_auth");
+        assert_eq!(json["version"], 2);
         let serialized = json.to_string();
         assert!(serialized.contains("HararMintTokenResponse"));
         assert!(serialized.contains("HararVerifyTokenResponse"));
         assert!(serialized.contains("HararJwksResponse"));
+        assert!(serialized.contains("HararStageOnceRequest"));
+        assert!(serialized.contains("HararConsumeOnceRequest"));
+        assert!(serialized.contains("HararPurgeOnceRequest"));
         assert!(!serialized.contains("\"d\""));
         assert!(!serialized.contains("private"));
         assert!(!serialized.contains("signing"));
+    }
+
+    /// Consumer-owned v2 fixture. Keep these wire objects literal so a change
+    /// to either the client serializer or Harar's response envelopes is caught
+    /// before the Unix-socket seam can drift.
+    #[test]
+    fn custody_v2_consumer_envelopes_match_contract_fixture() {
+        let stage = VaultRequest::StageOnce {
+            token_id: "pat-fixture-1",
+            principal_id: "principal-fixture-1",
+            display_id: "display-fixture-1",
+            value: "fixture-value",
+            ttl_seconds: 60,
+        };
+        assert_eq!(
+            serde_json::to_value(stage).unwrap(),
+            serde_json::json!({
+                "op": "stageonce",
+                "token_id": "pat-fixture-1",
+                "principal_id": "principal-fixture-1",
+                "display_id": "display-fixture-1",
+                "value": "fixture-value",
+                "ttl_seconds": 60,
+            })
+        );
+
+        let consume = VaultRequest::ConsumeOnce {
+            token_id: "pat-fixture-1",
+            principal_id: "principal-fixture-1",
+            display_id: "display-fixture-1",
+        };
+        assert_eq!(
+            serde_json::to_value(consume).unwrap(),
+            serde_json::json!({
+                "op": "consumeonce",
+                "token_id": "pat-fixture-1",
+                "principal_id": "principal-fixture-1",
+                "display_id": "display-fixture-1",
+            })
+        );
+
+        let purge = VaultRequest::PurgeOnce {
+            token_id: "pat-fixture-1",
+            principal_id: "principal-fixture-1",
+            display_id: "display-fixture-1",
+        };
+        assert_eq!(
+            serde_json::to_value(purge).unwrap(),
+            serde_json::json!({
+                "op": "purgeonce",
+                "token_id": "pat-fixture-1",
+                "principal_id": "principal-fixture-1",
+                "display_id": "display-fixture-1",
+            })
+        );
+
+        let stage_response: VaultResponse =
+            serde_json::from_value(serde_json::json!({"ok": true})).unwrap();
+        assert!(stage_response.ok);
+        assert_eq!(stage_response.value, None);
+        let consume_response: VaultResponse =
+            serde_json::from_value(serde_json::json!({"ok": true, "value": "fixture-value"}))
+                .unwrap();
+        assert!(consume_response.ok);
+        assert_eq!(consume_response.value.as_deref(), Some("fixture-value"));
+        let terminal_response: VaultResponse =
+            serde_json::from_value(serde_json::json!({"ok": false, "error": "not_found"})).unwrap();
+        assert!(!terminal_response.ok);
+        assert_eq!(terminal_response.error.as_deref(), Some("not_found"));
     }
 
     struct MockAgent {
