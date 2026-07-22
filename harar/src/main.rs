@@ -34,6 +34,7 @@ const MAX_HTTP_RESPONSE_BYTES: usize = 1024 * 1024;
 const PROMOTION_EPOCH_BUMP: u64 = 1000;
 const HIGHER_EPOCH_PEER_RESULT: &str =
     "detected higher-epoch peer, refusing writes - operator action required";
+const MAX_ONCE_TTL_SECONDS: u64 = 300;
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -162,8 +163,10 @@ impl Mode {
 
 struct AppState {
     keys: Mutex<HashMap<String, String>>,
+    once_records: Mutex<HashMap<String, OneTimeRecord>>,
     started_at: Instant,
     state_path: PathBuf,
+    once_state_path: PathBuf,
     replication_meta_path: PathBuf,
     replication_log_path: PathBuf,
     audit_log_path: PathBuf,
@@ -176,6 +179,16 @@ struct AppState {
     replication_log: Mutex<Vec<ReplicationLogEntry>>,
     replication_token: String,
     signing_key: ed25519_dalek::SigningKey,
+}
+
+/// This record is intentionally stored separately from generic vault keys.
+/// There is no generic get/list path that can address it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct OneTimeRecord {
+    token_id: String,
+    principal_id: String,
+    value: String,
+    expires_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -238,6 +251,23 @@ enum VaultRequest {
         key: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         shop_id: Option<String>,
+    },
+    StageOnce {
+        token_id: String,
+        principal_id: String,
+        display_id: String,
+        value: String,
+        ttl_seconds: u64,
+    },
+    ConsumeOnce {
+        token_id: String,
+        principal_id: String,
+        display_id: String,
+    },
+    PurgeOnce {
+        token_id: String,
+        principal_id: String,
+        display_id: String,
     },
     Mint {
         template: HararTokenTemplate,
@@ -379,6 +409,8 @@ async fn run_daemon() -> Result<()> {
     let master_key = master_key::load_master_key()?;
     let master_recipient = master_key.to_public();
     let keys = load_keys(&config.state_path, &master_key)?;
+    let once_state_path = once_state_path(&config.state_path);
+    let once_records = load_once_records(&once_state_path, &master_key)?;
     let replication_meta_path = replication_meta_path(&config.state_path);
     let replication_log_path = replication_log_path(&config.state_path);
     let meta = load_replication_meta(&replication_meta_path)?;
@@ -387,8 +419,10 @@ async fn run_daemon() -> Result<()> {
     let signing_key = load_or_create_signing_key(&config.signing_key_path)?;
     let state = Arc::new(AppState {
         keys: Mutex::new(keys),
+        once_records: Mutex::new(once_records),
         started_at: Instant::now(),
         state_path: config.state_path.clone(),
+        once_state_path,
         replication_meta_path,
         replication_log_path,
         audit_log_path: config.audit_log_path.clone(),
@@ -746,7 +780,12 @@ async fn handle_request(
 
     if matches!(
         request,
-        VaultRequest::Put { .. } | VaultRequest::Delete { .. } | VaultRequest::Revoke { .. }
+        VaultRequest::Put { .. }
+            | VaultRequest::Delete { .. }
+            | VaultRequest::Revoke { .. }
+            | VaultRequest::StageOnce { .. }
+            | VaultRequest::ConsumeOnce { .. }
+            | VaultRequest::PurgeOnce { .. }
     ) {
         if *state.mode.lock().await == Mode::Replica {
             audit(
@@ -802,6 +841,33 @@ async fn handle_request(
             append_replication_log(state, "delete", &key, None).await?;
             VaultResponse::ok()
         }
+        VaultRequest::StageOnce {
+            token_id,
+            principal_id,
+            display_id,
+            value,
+            ttl_seconds,
+        } => {
+            stage_once(
+                state,
+                token_id,
+                principal_id,
+                display_id,
+                value,
+                ttl_seconds,
+            )
+            .await?
+        }
+        VaultRequest::ConsumeOnce {
+            token_id,
+            principal_id,
+            display_id,
+        } => consume_once(state, token_id, principal_id, display_id).await?,
+        VaultRequest::PurgeOnce {
+            token_id,
+            principal_id,
+            display_id,
+        } => purge_once(state, token_id, principal_id, display_id).await?,
         VaultRequest::Mint {
             template,
             subject,
@@ -903,6 +969,116 @@ async fn handle_request(
     };
     audit(state, op, key_for_audit.as_deref(), peer, result)?;
     Ok(response)
+}
+
+async fn stage_once(
+    state: &AppState,
+    token_id: String,
+    principal_id: String,
+    display_id: String,
+    value: String,
+    ttl_seconds: u64,
+) -> Result<VaultResponse> {
+    if !valid_once_binding(&token_id, &principal_id, &display_id)
+        || value.is_empty()
+        || ttl_seconds == 0
+        || ttl_seconds > MAX_ONCE_TTL_SECONDS
+    {
+        return Ok(VaultResponse::error("bad_request"));
+    }
+    let expires_at = now_epoch_seconds()?.saturating_add(ttl_seconds);
+    let mut records = state.once_records.lock().await;
+    let changed = remove_expired_once_records(&mut records, now_epoch_seconds()?);
+    if records.contains_key(&display_id) {
+        if changed {
+            persist_once_records(&state.once_state_path, &state.master_recipient, &records)?;
+        }
+        return Ok(VaultResponse::error("already_exists"));
+    }
+    records.insert(
+        display_id,
+        OneTimeRecord {
+            token_id,
+            principal_id,
+            value,
+            expires_at,
+        },
+    );
+    persist_once_records(&state.once_state_path, &state.master_recipient, &records)?;
+    Ok(VaultResponse::ok())
+}
+
+async fn consume_once(
+    state: &AppState,
+    token_id: String,
+    principal_id: String,
+    display_id: String,
+) -> Result<VaultResponse> {
+    if !valid_once_binding(&token_id, &principal_id, &display_id) {
+        return Ok(VaultResponse::error("bad_request"));
+    }
+    let mut records = state.once_records.lock().await;
+    let now = now_epoch_seconds()?;
+    let changed = remove_expired_once_records(&mut records, now);
+    let record = records.remove(&display_id);
+    let response = match record {
+        Some(record)
+            if record.token_id == token_id
+                && record.principal_id == principal_id
+                && record.expires_at > now =>
+        {
+            VaultResponse {
+                value: Some(record.value),
+                ..VaultResponse::ok()
+            }
+        }
+        Some(record) => {
+            // A mismatched caller must not destroy the rightful owner's record.
+            records.insert(display_id, record);
+            VaultResponse::error("not_found")
+        }
+        None => VaultResponse::error("not_found"),
+    };
+    if changed || response.ok {
+        persist_once_records(&state.once_state_path, &state.master_recipient, &records)?;
+    }
+    Ok(response)
+}
+
+async fn purge_once(
+    state: &AppState,
+    token_id: String,
+    principal_id: String,
+    display_id: String,
+) -> Result<VaultResponse> {
+    if !valid_once_binding(&token_id, &principal_id, &display_id) {
+        return Ok(VaultResponse::error("bad_request"));
+    }
+    let mut records = state.once_records.lock().await;
+    let changed = remove_expired_once_records(&mut records, now_epoch_seconds()?);
+    let removed = match records.get(&display_id) {
+        Some(record) if record.token_id == token_id && record.principal_id == principal_id => {
+            records.remove(&display_id);
+            true
+        }
+        _ => false,
+    };
+    if changed || removed {
+        persist_once_records(&state.once_state_path, &state.master_recipient, &records)?;
+    }
+    // Deliberately terminal/idempotent: callers do not learn whether an
+    // already-purged handle ever existed.
+    Ok(VaultResponse::ok())
+}
+
+fn valid_once_binding(token_id: &str, principal_id: &str, display_id: &str) -> bool {
+    !token_id.trim().is_empty() && !principal_id.trim().is_empty() && !display_id.trim().is_empty()
+}
+
+fn remove_expired_once_records(records: &mut HashMap<String, OneTimeRecord>, now: u64) -> bool {
+    let before = records.len();
+    records.retain(|_, record| record.expires_at > now);
+    records.len() != before
 }
 
 async fn read_request_bytes(stream: &mut UnixStream) -> Result<Vec<u8>> {
@@ -1518,6 +1694,9 @@ impl VaultRequest {
             Self::Put { .. } => "put",
             Self::List { .. } => "list",
             Self::Delete { .. } => "delete",
+            Self::StageOnce { .. } => "stage_once",
+            Self::ConsumeOnce { .. } => "consume_once",
+            Self::PurgeOnce { .. } => "purge_once",
             Self::Mint { .. } => "mint",
             Self::Verify { .. } => "verify",
             Self::Revoke { .. } => "revoke",
@@ -1528,6 +1707,9 @@ impl VaultRequest {
     fn key(&self) -> Option<&str> {
         match self {
             Self::Get { key, .. } | Self::Put { key, .. } | Self::Delete { key, .. } => Some(key),
+            Self::StageOnce { token_id, .. }
+            | Self::ConsumeOnce { token_id, .. }
+            | Self::PurgeOnce { token_id, .. } => Some(token_id),
             Self::List { .. }
             | Self::Mint { .. }
             | Self::Verify { .. }
@@ -1542,6 +1724,15 @@ fn authorize(peer: &PeerCred, request: &VaultRequest) -> Decision {
         VaultRequest::Health | VaultRequest::Verify { .. } => Decision::Allow,
         VaultRequest::Mint { .. } | VaultRequest::Revoke { .. } => {
             if is_admin(peer) || is_gild(peer) {
+                Decision::Allow
+            } else {
+                Decision::Deny("forbidden")
+            }
+        }
+        VaultRequest::StageOnce { .. }
+        | VaultRequest::ConsumeOnce { .. }
+        | VaultRequest::PurgeOnce { .. } => {
+            if is_git_server(peer) {
                 Decision::Allow
             } else {
                 Decision::Deny("forbidden")
@@ -1629,6 +1820,16 @@ fn is_gild(peer: &PeerCred) -> bool {
     )
 }
 
+/// One-time PAT display custody is exclusively for the Linkhash/git-server
+/// service. It does not inherit generic vault, template-mint, or device-auth
+/// privileges.
+fn is_git_server(peer: &PeerCred) -> bool {
+    matches!(
+        peer.username.as_deref(),
+        Some("deka-git") | Some("git-server")
+    )
+}
+
 fn is_admin(peer: &PeerCred) -> bool {
     peer.uid == 0
         || peer.uid == unsafe { libc::geteuid() }
@@ -1713,6 +1914,32 @@ fn replication_meta_path(state_path: &Path) -> PathBuf {
 
 fn replication_log_path(state_path: &Path) -> PathBuf {
     state_path.with_extension("replication.log")
+}
+
+fn once_state_path(state_path: &Path) -> PathBuf {
+    state_path.with_extension("once.age")
+}
+
+fn load_once_records(
+    path: &Path,
+    identity: &age::x25519::Identity,
+) -> Result<HashMap<String, OneTimeRecord>> {
+    match fs::read(path) {
+        Ok(bytes) => {
+            if bytes.is_empty() {
+                return Ok(HashMap::new());
+            }
+            let plaintext = age::decrypt(identity, &bytes).with_context(|| {
+                format!(
+                    "decrypt one-time custody state at {}; refusing to boot because encrypted state could not be read",
+                    path.display()
+                )
+            })?;
+            serde_json::from_slice(&plaintext).context("decode one-time custody state")
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+        Err(err) => Err(err).with_context(|| format!("read {}", path.display())),
+    }
 }
 
 fn load_replication_token(path: &Path) -> Result<String> {
@@ -1882,6 +2109,45 @@ fn persist_keys(
     file.write_all(&ciphertext)
         .context("write encrypted gild-vault state")?;
     file.sync_all().context("sync gild-vault state")?;
+    fs::rename(&tmp_path, path)
+        .with_context(|| format!("rename {} to {}", tmp_path.display(), path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod 0600 {}", path.display()))?;
+    try_chown(path, Some("gild-vault"), None);
+    fs::File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .with_context(|| format!("sync {}", parent.display()))?;
+    Ok(())
+}
+
+fn persist_once_records(
+    path: &Path,
+    recipient: &age::x25519::Recipient,
+    records: &HashMap<String, OneTimeRecord>,
+) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Err(anyhow!("one-time state path must have a parent"));
+    };
+    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o750))
+        .with_context(|| format!("chmod 0750 {}", parent.display()))?;
+    try_chown(parent, Some("gild-vault"), Some("gild"));
+
+    let plaintext = serde_json::to_vec(records).context("encode one-time custody state")?;
+    let ciphertext =
+        age::encrypt(recipient, &plaintext).context("encrypt one-time custody state with age")?;
+    let tmp_path = path.with_extension(format!("once.age.tmp.{}", std::process::id()));
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&tmp_path)
+        .with_context(|| format!("open {}", tmp_path.display()))?;
+    try_chown(&tmp_path, Some("gild-vault"), None);
+    file.write_all(&ciphertext)
+        .context("write encrypted one-time custody state")?;
+    file.sync_all().context("sync one-time custody state")?;
     fs::rename(&tmp_path, path)
         .with_context(|| format!("rename {} to {}", tmp_path.display(), path.display()))?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
@@ -2098,9 +2364,11 @@ mod tests {
                 ("AGENT_AMINA_TOKEN".to_string(), "amina-secret".to_string()),
                 ("AGENT_IDRIS_TOKEN".to_string(), "idris-secret".to_string()),
             ])),
+            once_records: Mutex::new(HashMap::new()),
             started_at: Instant::now() - Duration::from_secs(5),
             replication_meta_path: replication_meta_path(&state_path),
             replication_log_path: replication_log_path(&state_path),
+            once_state_path: once_state_path(&state_path),
             state_path,
             audit_log_path: dir.join("audit.log"),
             master_recipient: master_key.to_public(),
@@ -2150,9 +2418,11 @@ mod tests {
         let state_path = dir.join("keys.age");
         AppState {
             keys: Mutex::new(HashMap::from([(key.to_string(), "secret".to_string())])),
+            once_records: Mutex::new(HashMap::new()),
             started_at: Instant::now(),
             replication_meta_path: replication_meta_path(&state_path),
             replication_log_path: replication_log_path(&state_path),
+            once_state_path: once_state_path(&state_path),
             state_path,
             audit_log_path: dir.join("audit.log"),
             master_recipient: master_key.to_public(),
@@ -2165,6 +2435,211 @@ mod tests {
             replication_token: "test-replication-token".to_string(),
             signing_key: generate_signing_key(),
         }
+    }
+
+    fn once_stage_request() -> VaultRequest {
+        VaultRequest::StageOnce {
+            token_id: "pat-42".to_string(),
+            principal_id: "user-7".to_string(),
+            display_id: "opaque-display-handle".to_string(),
+            value: "custody-test-value-not-for-audit".to_string(),
+            ttl_seconds: 30,
+        }
+    }
+
+    fn once_consume_request(principal_id: &str) -> VaultRequest {
+        VaultRequest::ConsumeOnce {
+            token_id: "pat-42".to_string(),
+            principal_id: principal_id.to_string(),
+            display_id: "opaque-display-handle".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn one_time_custody_consumes_once_and_redacts_audit() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path());
+        let git = peer(1004, "deka-git");
+
+        assert!(
+            handle_request(&state, &git, once_stage_request())
+                .await
+                .unwrap()
+                .ok
+        );
+        let first = handle_request(&state, &git, once_consume_request("user-7"))
+            .await
+            .unwrap();
+        assert_eq!(
+            first.value.as_deref(),
+            Some("custody-test-value-not-for-audit")
+        );
+        let retry = handle_request(&state, &git, once_consume_request("user-7"))
+            .await
+            .unwrap();
+        assert!(!retry.ok);
+        assert_eq!(retry.error.as_deref(), Some("not_found"));
+
+        let audit = fs::read_to_string(&state.audit_log_path).unwrap();
+        assert!(audit.contains("\"op\":\"stage_once\""));
+        assert!(audit.contains("\"key\":\"pat-42\""));
+        assert!(!audit.contains("custody-test-value-not-for-audit"));
+        assert!(!audit.contains("opaque-display-handle"));
+        assert!(!audit.contains("user-7"));
+    }
+
+    #[tokio::test]
+    async fn one_time_custody_enforces_service_and_principal_boundary() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path());
+        let forbidden = handle_request(&state, &peer(1005, "gild"), once_stage_request())
+            .await
+            .unwrap();
+        assert_eq!(forbidden.error.as_deref(), Some("forbidden"));
+
+        let git = peer(1004, "deka-git");
+        assert!(
+            handle_request(&state, &git, once_stage_request())
+                .await
+                .unwrap()
+                .ok
+        );
+        let wrong = handle_request(&state, &git, once_consume_request("user-8"))
+            .await
+            .unwrap();
+        assert_eq!(wrong.error.as_deref(), Some("not_found"));
+        assert!(
+            handle_request(&state, &git, once_consume_request("user-7"))
+                .await
+                .unwrap()
+                .ok
+        );
+    }
+
+    #[tokio::test]
+    async fn one_time_custody_concurrent_consumers_have_one_winner() {
+        let dir = tempdir().unwrap();
+        let state = Arc::new(test_state(dir.path()));
+        let git = peer(1004, "deka-git");
+        assert!(
+            handle_request(&state, &git, once_stage_request())
+                .await
+                .unwrap()
+                .ok
+        );
+
+        let first = {
+            let state = Arc::clone(&state);
+            let git = git.clone();
+            tokio::spawn(async move {
+                handle_request(&state, &git, once_consume_request("user-7")).await
+            })
+        };
+        let second = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                handle_request(
+                    &state,
+                    &peer(1004, "deka-git"),
+                    once_consume_request("user-7"),
+                )
+                .await
+            })
+        };
+        let results = [
+            first.await.unwrap().unwrap(),
+            second.await.unwrap().unwrap(),
+        ];
+        assert_eq!(results.iter().filter(|response| response.ok).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|response| response.value.is_some())
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn one_time_custody_purge_expiry_and_generic_list_are_terminal() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path());
+        let git = peer(1004, "deka-git");
+        assert!(
+            handle_request(&state, &git, once_stage_request())
+                .await
+                .unwrap()
+                .ok
+        );
+
+        let list = handle_request(
+            &state,
+            &peer(0, "root"),
+            VaultRequest::List { shop_id: None },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !list
+                .keys
+                .unwrap_or_default()
+                .iter()
+                .any(|key| key == "opaque-display-handle")
+        );
+
+        assert!(
+            handle_request(
+                &state,
+                &git,
+                VaultRequest::PurgeOnce {
+                    token_id: "pat-42".to_string(),
+                    principal_id: "user-7".to_string(),
+                    display_id: "opaque-display-handle".to_string(),
+                },
+            )
+            .await
+            .unwrap()
+            .ok
+        );
+        assert_eq!(
+            handle_request(&state, &git, once_consume_request("user-7"))
+                .await
+                .unwrap()
+                .error
+                .as_deref(),
+            Some("not_found")
+        );
+
+        state.once_records.lock().await.insert(
+            "expired-display".to_string(),
+            OneTimeRecord {
+                token_id: "pat-expired".to_string(),
+                principal_id: "user-7".to_string(),
+                value: "expired-value".to_string(),
+                expires_at: now_epoch_seconds().unwrap().saturating_sub(1),
+            },
+        );
+        {
+            let records = state.once_records.lock().await;
+            persist_once_records(&state.once_state_path, &state.master_recipient, &records)
+                .unwrap();
+        }
+        let restarted_records =
+            load_once_records(&state.once_state_path, &state.master_identity).unwrap();
+        let restarted = AppState {
+            once_records: Mutex::new(restarted_records),
+            ..test_state(dir.path())
+        };
+        let expired = consume_once(
+            &restarted,
+            "pat-expired".to_string(),
+            "user-7".to_string(),
+            "expired-display".to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(expired.error.as_deref(), Some("not_found"));
+        assert!(restarted.once_records.lock().await.is_empty());
     }
 
     #[test]
@@ -2730,9 +3205,11 @@ mod tests {
                 ("shops/shop_b/SECRET".to_string(), "b".to_string()),
                 ("AGENT_AMINA_TOKEN".to_string(), "amina".to_string()),
             ])),
+            once_records: Mutex::new(HashMap::new()),
             started_at: Instant::now(),
             replication_meta_path: replication_meta_path(&state_path),
             replication_log_path: replication_log_path(&state_path),
+            once_state_path: once_state_path(&state_path),
             state_path,
             audit_log_path: dir.path().join("audit.log"),
             master_recipient: master_key.to_public(),
@@ -3028,9 +3505,11 @@ mod tests {
         let replica_state_path = dir.path().join("replica.keys.age");
         let replica_state = Arc::new(AppState {
             keys: Mutex::new(HashMap::new()),
+            once_records: Mutex::new(HashMap::new()),
             started_at: Instant::now(),
             replication_meta_path: replication_meta_path(&replica_state_path),
             replication_log_path: replication_log_path(&replica_state_path),
+            once_state_path: once_state_path(&replica_state_path),
             state_path: replica_state_path,
             audit_log_path: dir.path().join("replica.audit.log"),
             master_recipient: master_key.to_public(),
