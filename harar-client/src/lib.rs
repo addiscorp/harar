@@ -307,6 +307,27 @@ enum VaultRequest<'a> {
         audience: &'a str,
     },
     Identity,
+    SessionStart(&'a oidc::SessionStartAsk),
+    SessionRefresh {
+        session_token: &'a str,
+    },
+    Exchange(&'a oidc::ExchangeAsk),
+    SessionRevoke {
+        sid: &'a str,
+    },
+    Sessions {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sid: Option<&'a str>,
+    },
+}
+
+/// What `exchange` hands back to the child.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Exchanged {
+    pub token: String,
+    pub claims: oidc::IdentityClaims,
+    pub session: oidc::Session,
+    pub session_token: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -330,6 +351,9 @@ struct VaultResponse {
     sub: Option<String>,
     claims: Option<oidc::IdentityClaims>,
     identity: Option<oidc::IdentityPolicy>,
+    session: Option<oidc::Session>,
+    sessions: Option<Vec<oidc::Session>>,
+    session_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -763,6 +787,50 @@ impl VaultClient {
         self.policy_request(&VaultRequest::Identity).await
     }
 
+    /// Starts a session for an agent; returns it and its session token.
+    pub async fn session_start(
+        &self,
+        ask: &oidc::SessionStartAsk,
+    ) -> Result<(oidc::Session, String), VaultClientError> {
+        let response = self.identity_request(&VaultRequest::SessionStart(ask), "session_failed").await?;
+        session_and_token(response)
+    }
+
+    pub async fn session_refresh(&self, session_token: &str) -> Result<(oidc::Session, String), VaultClientError> {
+        let response = self
+            .identity_request(&VaultRequest::SessionRefresh { session_token }, "session_failed")
+            .await?;
+        session_and_token(response)
+    }
+
+    pub async fn exchange(&self, ask: &oidc::ExchangeAsk) -> Result<Exchanged, VaultClientError> {
+        let response = self.identity_request(&VaultRequest::Exchange(ask), "exchange_failed").await?;
+        let missing = || VaultClientError::InvalidResponse("incomplete exchange".to_string());
+        Ok(Exchanged {
+            token: response.token.ok_or_else(missing)?,
+            claims: response.claims.ok_or_else(missing)?,
+            session: response.session.ok_or_else(missing)?,
+            session_token: response.session_token.ok_or_else(missing)?,
+        })
+    }
+
+    /// Revokes a session; returns it and everything under it.
+    pub async fn session_revoke(&self, sid: &str) -> Result<Vec<oidc::Session>, VaultClientError> {
+        self.sessions_request(&VaultRequest::SessionRevoke { sid }).await
+    }
+
+    /// The caller's sessions, or the tree under `sid`.
+    pub async fn sessions(&self, sid: Option<&str>) -> Result<Vec<oidc::Session>, VaultClientError> {
+        self.sessions_request(&VaultRequest::Sessions { sid }).await
+    }
+
+    async fn sessions_request(&self, request: &VaultRequest<'_>) -> Result<Vec<oidc::Session>, VaultClientError> {
+        self.identity_request(request, "sessions_failed")
+            .await?
+            .sessions
+            .ok_or_else(|| VaultClientError::InvalidResponse("missing sessions".to_string()))
+    }
+
     async fn policy_request(&self, request: &VaultRequest<'_>) -> Result<oidc::IdentityPolicy, VaultClientError> {
         self.identity_request(request, "identity_failed")
             .await?
@@ -801,6 +869,13 @@ impl VaultClient {
         }
 
         serde_json::from_slice(&response).map_err(VaultClientError::Json)
+    }
+}
+
+fn session_and_token(response: VaultResponse) -> Result<(oidc::Session, String), VaultClientError> {
+    match (response.session, response.session_token) {
+        (Some(session), Some(token)) => Ok((session, token)),
+        _ => Err(VaultClientError::InvalidResponse("missing session".to_string())),
     }
 }
 
@@ -1168,9 +1243,14 @@ fn sign_claims(signing_key: &SigningKey, claims: &TokenClaims) -> Result<String,
 }
 
 fn random_jti() -> String {
+    random_id("jti_")
+}
+
+/// `prefix` followed by 128 random bits, base64url.
+pub fn random_id(prefix: &str) -> String {
     let mut bytes = [0_u8; 16];
     OsRng.fill_bytes(&mut bytes);
-    format!("jti_{}", b64_url(bytes))
+    format!("{prefix}{}", b64_url(bytes))
 }
 
 fn valid_bounded_token_param(value: &str, max_len: usize, allow_colon: bool) -> bool {

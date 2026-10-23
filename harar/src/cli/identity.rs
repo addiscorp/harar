@@ -1,11 +1,12 @@
 //! `harar token`, `harar workload` and `harar policy`: asking the issuer for
 //! identity tokens, and the rules it decides by.
 
+use crate::cli::secret_input::SecretInput;
 use crate::cli::{SocketArgs, print_json};
 use anyhow::{Result, anyhow};
 use clap::{Args, Subcommand};
 use harar_client::VaultClient;
-use harar_client::oidc::{Actor, Alg, Grant, TokenAsk, Workload};
+use harar_client::oidc::{Actor, Alg, ExchangeAsk, Grant, SessionGrant, SessionStartAsk, TokenAsk, Workload};
 
 /// Get an identity token for this process's workload.
 ///
@@ -72,6 +73,9 @@ enum WorkloadAction {
         sub: String,
         #[arg(long)]
         user: String,
+        /// Subjects it may start sessions for, such as 'agent:*' (may repeat).
+        #[arg(long = "sessions-for")]
+        sessions_for: Vec<String>,
     },
     /// Remove a workload and everything granted to it.
     Remove { sub: String },
@@ -81,7 +85,9 @@ enum WorkloadAction {
 pub async fn workload(cmd: WorkloadCmd) -> Result<()> {
     let client = VaultClient::from_socket_path(cmd.socket.socket);
     let policy = match cmd.action {
-        WorkloadAction::Add { sub, user } => client.workload_add(&Workload { sub, user }).await?,
+        WorkloadAction::Add { sub, user, sessions_for } => {
+            client.workload_add(&Workload { sub, user, sessions_for }).await?
+        }
         WorkloadAction::Remove { sub } => client.workload_remove(&sub).await?,
         WorkloadAction::List => client.identity().await?,
     };
@@ -161,6 +167,109 @@ pub async fn policy(cmd: PolicyCmd) -> Result<()> {
     }
 }
 
+/// Agent sessions: started by a workload, narrowed by `harar exchange`, and
+/// revoked together with everything under them.
+#[derive(Debug, Args)]
+pub struct SessionCmd {
+    #[command(flatten)]
+    socket: SocketArgs,
+    #[command(subcommand)]
+    action: SessionAction,
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionAction {
+    /// Start a session for SUB, such as agent:ava. Prints it and its session
+    /// token, which the agent keeps.
+    Start {
+        sub: String,
+        /// Who the agent works for, such as user:sami.
+        #[arg(long = "for")]
+        for_sub: Option<String>,
+        /// How long it lasts (default 8h, at most 24h).
+        #[arg(long, value_parser = parse_duration)]
+        ttl: Option<u64>,
+        /// What it may reach: AUDIENCE=scope,scope (may repeat).
+        #[arg(long = "grant", value_parser = parse_session_grant)]
+        grants: Vec<SessionGrant>,
+    },
+    /// A fresh session token, given the current one.
+    Refresh {
+        #[command(flatten)]
+        token: SecretInput,
+    },
+    /// End a session and every session under it.
+    Revoke { sid: String },
+    /// The sessions you started.
+    List,
+    /// A session and everything under it.
+    Tree { sid: String },
+}
+
+pub async fn session(cmd: SessionCmd) -> Result<()> {
+    let client = VaultClient::from_socket_path(cmd.socket.socket);
+    match cmd.action {
+        SessionAction::Start { sub, for_sub, ttl, grants } => {
+            let ask = SessionStartAsk { sub, for_sub, ttl_seconds: ttl, grants };
+            let (session, token) = client.session_start(&ask).await?;
+            print_json(&serde_json::json!({ "session": session, "session_token": token }))
+        }
+        SessionAction::Refresh { token } => {
+            let (session, token) = client.session_refresh(&token.read("Session token")?).await?;
+            print_json(&serde_json::json!({ "session": session, "session_token": token }))
+        }
+        SessionAction::Revoke { sid } => print_json(&client.session_revoke(&sid).await?),
+        SessionAction::List => print_json(&client.sessions(None).await?),
+        SessionAction::Tree { sid } => print_json(&client.sessions(Some(&sid)).await?),
+    }
+}
+
+/// Trade your session token for a narrower child: a child session, and a
+/// token for one audience with fewer scopes, ending no later than yours.
+#[derive(Debug, Args)]
+pub struct Exchange {
+    #[command(flatten)]
+    socket: SocketArgs,
+    /// Your session token.
+    #[command(flatten)]
+    token: SecretInput,
+    /// The child's name; it becomes <your subject>/<name>.
+    #[arg(long)]
+    name: String,
+    #[arg(long = "aud")]
+    audience: String,
+    #[arg(long = "scope")]
+    scopes: Vec<String>,
+    #[arg(long, value_parser = parse_duration)]
+    ttl: Option<u64>,
+}
+
+pub async fn exchange(cmd: Exchange) -> Result<()> {
+    let ask = ExchangeAsk {
+        session_token: cmd.token.read("Session token")?,
+        name: cmd.name,
+        audience: cmd.audience,
+        scopes: cmd.scopes,
+        ttl_seconds: cmd.ttl,
+    };
+    print_json(&VaultClient::from_socket_path(cmd.socket.socket).exchange(&ask).await?)
+}
+
+/// `AUDIENCE=scope,scope`. Audiences can contain `=`; scopes can't, so the
+/// last one splits them.
+fn parse_session_grant(value: &str) -> Result<SessionGrant> {
+    let (audience, scopes) = value
+        .rsplit_once('=')
+        .ok_or_else(|| anyhow!("expected AUDIENCE=scope,scope"))?;
+    if audience.is_empty() {
+        return Err(anyhow!("expected AUDIENCE=scope,scope"));
+    }
+    Ok(SessionGrant {
+        audience: audience.to_string(),
+        scopes: scopes.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect(),
+    })
+}
+
 fn parse_duration(value: &str) -> Result<u64> {
     let (digits, unit) = match value.find(|c: char| !c.is_ascii_digit()) {
         Some(at) => value.split_at(at),
@@ -183,6 +292,16 @@ fn parse_alg(value: &str) -> Result<Alg> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_grants_split_on_the_last_equals() {
+        let grant = parse_session_grant("https://x.test/?a=b=deploy:staging,logs:read").unwrap();
+        assert_eq!(grant.audience, "https://x.test/?a=b");
+        assert_eq!(grant.scopes, ["deploy:staging", "logs:read"]);
+        assert_eq!(parse_session_grant("https://x.test=").unwrap().scopes, Vec::<String>::new());
+        assert!(parse_session_grant("no-equals").is_err());
+        assert!(parse_session_grant("=deploy:x").is_err());
+    }
 
     #[test]
     fn durations_read_like_people_write_them() {

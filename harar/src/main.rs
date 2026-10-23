@@ -6,7 +6,10 @@ use harar_client::{
     mint_token, signing_key_bytes, signing_key_from_bytes, validate_token_bindings,
     verify_token,
 };
-use harar_client::oidc::{self, Alg, Grant, IdentityClaims, IdentityPolicy, TokenAsk, Workload};
+use harar_client::oidc::{
+    self, Alg, ExchangeAsk, Grant, IdentityClaims, IdentityPolicy, IdentityRequest, Session, SessionGrant,
+    SessionStartAsk, TokenAsk, Workload,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -27,6 +30,7 @@ mod dotenv;
 mod identity;
 mod mask;
 mod screen;
+mod sessions;
 mod ssh;
 mod template;
 #[cfg(target_os = "macos")]
@@ -341,6 +345,20 @@ enum VaultRequest {
     },
     /// The issuer's workloads and grants.
     Identity,
+    SessionStart(SessionStartAsk),
+    /// A fresh session token, for the holder of a live one.
+    SessionRefresh {
+        session_token: String,
+    },
+    Exchange(ExchangeAsk),
+    SessionRevoke {
+        sid: String,
+    },
+    /// The sessions the caller may see, or one session's tree.
+    Sessions {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sid: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -382,6 +400,12 @@ struct VaultResponse {
     claims: Option<IdentityClaims>,
     #[serde(skip_serializing_if = "Option::is_none")]
     identity: Option<IdentityPolicy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session: Option<Session>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sessions: Option<Vec<Session>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_token: Option<String>,
 }
 
 impl VaultResponse {
@@ -406,6 +430,9 @@ impl VaultResponse {
             sub: None,
             claims: None,
             identity: None,
+            session: None,
+            sessions: None,
+            session_token: None,
         }
     }
 
@@ -430,6 +457,9 @@ impl VaultResponse {
             sub: None,
             claims: None,
             identity: None,
+            session: None,
+            sessions: None,
+            session_token: None,
         }
     }
 }
@@ -813,6 +843,9 @@ async fn handle_request(
             | VaultRequest::WorkloadRemove { .. }
             | VaultRequest::Grant(_)
             | VaultRequest::Ungrant { .. }
+            | VaultRequest::SessionStart(_)
+            | VaultRequest::Exchange(_)
+            | VaultRequest::SessionRevoke { .. }
     ) {
         if *state.mode.lock().await == Mode::Replica {
             audit(
@@ -977,13 +1010,21 @@ async fn handle_request(
         }
         VaultRequest::Token(ask) => {
             let user = peer.username.as_deref().unwrap_or_default();
-            let decided = identity::load(&*state.keys.lock().await)
-                .and_then(|policy| identity::decide(&policy, user, &ask));
+            let now = now_epoch_seconds()?;
+            let decided = {
+                let keys = state.keys.lock().await;
+                identity::load(&keys)
+                    .and_then(|policy| identity::decide(&policy, user, &ask))
+                    .and_then(|mut request| {
+                        sessions::bind_actor(&sessions::load(&keys)?, &mut request, now)?;
+                        Ok(request)
+                    })
+            };
             match decided {
                 Err(reason) => VaultResponse::error(reason),
                 Ok(request) => {
                     let alg = ask.alg.unwrap_or(Alg::ES256);
-                    match state.issuer.issue(&request, alg, now_epoch_seconds()?) {
+                    match state.issuer.issue(&request, alg, now) {
                         Ok((token, claims)) => VaultResponse {
                             token: Some(token),
                             claims: Some(claims),
@@ -1013,6 +1054,46 @@ async fn handle_request(
             },
             Err(reason) => VaultResponse::error(reason),
         },
+        VaultRequest::SessionStart(ask) => session_start(state, peer, ask).await?,
+        VaultRequest::SessionRefresh { session_token } => {
+            let now = now_epoch_seconds()?;
+            let keys = state.keys.lock().await;
+            let refreshed = sessions::load(&keys).and_then(|all| {
+                let sid = session_from_token(state, &all, &session_token, now)?;
+                Ok((all[&sid].clone(), issue_session_token(state, &all, &all[&sid], now)?))
+            });
+            match refreshed {
+                Ok((session, token)) => VaultResponse {
+                    session: Some(session),
+                    session_token: Some(token),
+                    ..VaultResponse::ok()
+                },
+                Err(reason) => VaultResponse::error(reason),
+            }
+        }
+        VaultRequest::Exchange(ask) => exchange(state, ask).await?,
+        VaultRequest::SessionRevoke { sid } => session_revoke(state, peer, sid).await?,
+        VaultRequest::Sessions { sid } => {
+            let keys = state.keys.lock().await;
+            let visible = sessions::load(&keys).and_then(|all| {
+                let manager = session_manager(&keys, peer)?;
+                let listed = match &sid {
+                    Some(sid) => sessions::tree(&all, sid),
+                    None => all.values().cloned().collect(),
+                };
+                Ok(listed
+                    .into_iter()
+                    .filter(|s| manager.may_manage(s))
+                    .collect::<Vec<_>>())
+            });
+            match visible {
+                Ok(listed) => VaultResponse {
+                    sessions: Some(listed),
+                    ..VaultResponse::ok()
+                },
+                Err(reason) => VaultResponse::error(reason),
+            }
+        }
         VaultRequest::Health => {
             let keys = state.keys.lock().await;
             VaultResponse {
@@ -1036,6 +1117,169 @@ async fn handle_request(
     Ok(response)
 }
 
+/// Who may see and revoke sessions: an admin sees all, a workload sees the
+/// ones it started (and their children).
+enum SessionManager {
+    Admin,
+    Workload(String),
+}
+
+impl SessionManager {
+    fn may_manage(&self, session: &Session) -> bool {
+        match self {
+            Self::Admin => true,
+            Self::Workload(sub) => &session.started_by == sub,
+        }
+    }
+}
+
+fn session_manager(keys: &HashMap<String, String>, peer: &PeerCred) -> Result<SessionManager, &'static str> {
+    if is_admin(peer) {
+        return Ok(SessionManager::Admin);
+    }
+    let user = peer.username.as_deref().unwrap_or_default();
+    identity::load(keys)?
+        .workloads
+        .into_iter()
+        .find(|w| w.user == user)
+        .map(|w| SessionManager::Workload(w.sub))
+        .ok_or("forbidden")
+}
+
+/// A session token: the session's subject, for the issuer itself, carrying the
+/// session id. It is what an agent trades in `exchange` and `session refresh`.
+fn issue_session_token(
+    state: &AppState,
+    all: &sessions::Sessions,
+    session: &Session,
+    now: u64,
+) -> Result<String, &'static str> {
+    let request = IdentityRequest {
+        sub: session.sub.clone(),
+        aud: state.issuer.url().to_string(),
+        scopes: vec![],
+        ttl_seconds: (session.expires_at - now).min(oidc::MAX_TTL_SECONDS),
+        act: sessions::chain_above(all, session),
+        extra: [(oidc::SID_CLAIM.to_string(), session.sid.clone().into())].into(),
+    };
+    state
+        .issuer
+        .issue(&request, Alg::ES256, now)
+        .map(|(token, _)| token)
+        .map_err(|err| token_error_code(&err))
+}
+
+/// The live session a session token speaks for.
+fn session_from_token(
+    state: &AppState,
+    all: &sessions::Sessions,
+    token: &str,
+    now: u64,
+) -> Result<String, &'static str> {
+    let claims = oidc::verify_identity(&state.issuer.jwks(), token, state.issuer.url(), state.issuer.url(), now)
+        .map_err(|_| "invalid_session_token")?;
+    let sid = claims
+        .extra
+        .get(oidc::SID_CLAIM)
+        .and_then(|sid| sid.as_str())
+        .ok_or("invalid_session_token")?;
+    if !sessions::is_live(all, sid, now) || all[sid].sub != claims.sub {
+        return Err("session_not_live");
+    }
+    Ok(sid.to_string())
+}
+
+async fn session_start(state: &AppState, peer: &PeerCred, ask: SessionStartAsk) -> Result<VaultResponse> {
+    let now = now_epoch_seconds()?;
+    let mut keys = state.keys.lock().await;
+    let started = identity::load(&keys).and_then(|policy| {
+        let mut all = sessions::load(&keys)?;
+        let user = peer.username.as_deref().unwrap_or_default();
+        let session = sessions::start(&policy, &mut all, user, &ask, harar_client::random_id("s_"), now)?;
+        let token = issue_session_token(state, &all, &session, now)?;
+        Ok((all, session, token))
+    });
+    let (all, session, token) = match started {
+        Ok(started) => started,
+        Err(reason) => return Ok(VaultResponse::error(reason)),
+    };
+    write_entry(state, &mut keys, sessions::SESSIONS_KEY, sessions::store(&all)).await?;
+    Ok(VaultResponse {
+        session: Some(session),
+        session_token: Some(token),
+        ..VaultResponse::ok()
+    })
+}
+
+async fn exchange(state: &AppState, ask: ExchangeAsk) -> Result<VaultResponse> {
+    let now = now_epoch_seconds()?;
+    let mut keys = state.keys.lock().await;
+    let exchanged = sessions::load(&keys).and_then(|mut all| {
+        let parent = session_from_token(state, &all, &ask.session_token, now)?;
+        let grant = SessionGrant { audience: ask.audience.clone(), scopes: ask.scopes.clone() };
+        let child = sessions::child(&mut all, &parent, &ask.name, grant, ask.ttl_seconds, harar_client::random_id("s_"), now)?;
+        let request = IdentityRequest {
+            sub: child.sub.clone(),
+            aud: ask.audience.clone(),
+            scopes: ask.scopes.clone(),
+            ttl_seconds: (child.expires_at - now).min(oidc::MAX_TTL_SECONDS),
+            act: sessions::actor_for(&all, &parent),
+            extra: [(oidc::SID_CLAIM.to_string(), child.sid.clone().into())].into(),
+        };
+        let (token, claims) = state
+            .issuer
+            .issue(&request, Alg::ES256, now)
+            .map_err(|err| token_error_code(&err))?;
+        let session_token = issue_session_token(state, &all, &child, now)?;
+        Ok((all, child, token, claims, session_token))
+    });
+    let (all, child, token, claims, session_token) = match exchanged {
+        Ok(exchanged) => exchanged,
+        Err(reason) => return Ok(VaultResponse::error(reason)),
+    };
+    write_entry(state, &mut keys, sessions::SESSIONS_KEY, sessions::store(&all)).await?;
+    Ok(VaultResponse {
+        token: Some(token),
+        claims: Some(claims),
+        session: Some(child),
+        session_token: Some(session_token),
+        ..VaultResponse::ok()
+    })
+}
+
+async fn session_revoke(state: &AppState, peer: &PeerCred, sid: String) -> Result<VaultResponse> {
+    let now = now_epoch_seconds()?;
+    let mut keys = state.keys.lock().await;
+    let revoked = sessions::load(&keys).and_then(|mut all| {
+        let manager = session_manager(&keys, peer)?;
+        match all.get(&sid) {
+            Some(session) if manager.may_manage(session) => {}
+            // Someone else's session looks the same as no session.
+            _ => return Err("not_found"),
+        }
+        sessions::revoke(&mut all, &sid, now);
+        let tree = sessions::tree(&all, &sid);
+        Ok((all, tree))
+    });
+    let (all, tree) = match revoked {
+        Ok(revoked) => revoked,
+        Err(reason) => return Ok(VaultResponse::error(reason)),
+    };
+    write_entry(state, &mut keys, sessions::SESSIONS_KEY, sessions::store(&all)).await?;
+    Ok(VaultResponse {
+        sessions: Some(tree),
+        ..VaultResponse::ok()
+    })
+}
+
+/// Stores one vault entry the way every write does: on disk, then in the
+/// replication log.
+async fn write_entry(state: &AppState, keys: &mut HashMap<String, String>, key: &str, text: String) -> Result<()> {
+    keys.insert(key.to_string(), text.clone());
+    persist_keys(&state.state_path, &state.master_recipient, keys)?;
+    append_replication_log(state, "put", key, Some(text)).await
+}
+
 /// Changes the identity policy and stores it like any other vault write.
 /// `change` returns whether anything changed; nothing changing is `not_found`.
 async fn update_identity(
@@ -1052,10 +1296,7 @@ async fn update_identity(
         Ok(false) => return Ok(VaultResponse::error("not_found")),
         Ok(true) => {}
     }
-    let text = identity::store(&policy);
-    keys.insert(identity::POLICY_KEY.to_string(), text.clone());
-    persist_keys(&state.state_path, &state.master_recipient, &keys)?;
-    append_replication_log(state, "put", identity::POLICY_KEY, Some(text)).await?;
+    write_entry(state, &mut keys, identity::POLICY_KEY, identity::store(&policy)).await?;
     Ok(VaultResponse {
         identity: Some(policy),
         ..VaultResponse::ok()
@@ -1798,6 +2039,11 @@ impl VaultRequest {
             Self::Grant(_) => "grant",
             Self::Ungrant { .. } => "ungrant",
             Self::Identity => "identity",
+            Self::SessionStart(_) => "session_start",
+            Self::SessionRefresh { .. } => "session_refresh",
+            Self::Exchange(_) => "exchange",
+            Self::SessionRevoke { .. } => "session_revoke",
+            Self::Sessions { .. } => "sessions",
         }
     }
 
@@ -1812,7 +2058,12 @@ impl VaultRequest {
             | Self::Verify { .. }
             | Self::Revoke { .. }
             | Self::Health
-            | Self::Identity => None,
+            | Self::Identity
+            | Self::SessionRefresh { .. }
+            | Self::Sessions { sid: None } => None,
+            Self::SessionStart(ask) => Some(&ask.sub),
+            Self::Exchange(ask) => Some(&ask.audience),
+            Self::SessionRevoke { sid } | Self::Sessions { sid: Some(sid) } => Some(sid),
             Self::Token(ask) => Some(&ask.audience),
             Self::WorkloadAdd(Workload { sub, .. })
             | Self::Grant(Grant { sub, .. })
@@ -1827,6 +2078,13 @@ fn authorize(peer: &PeerCred, request: &VaultRequest) -> Decision {
         VaultRequest::Health | VaultRequest::Verify { .. } => Decision::Allow,
         // Who gets what is the identity policy's call, made in the handler.
         VaultRequest::Token(_) => Decision::Allow,
+        // Sessions are decided in the handler too: by the calling workload, or
+        // by the session token presented.
+        VaultRequest::SessionStart(_)
+        | VaultRequest::SessionRefresh { .. }
+        | VaultRequest::Exchange(_)
+        | VaultRequest::SessionRevoke { .. }
+        | VaultRequest::Sessions { .. } => Decision::Allow,
         VaultRequest::WorkloadAdd(_)
         | VaultRequest::WorkloadRemove { .. }
         | VaultRequest::Grant(_)

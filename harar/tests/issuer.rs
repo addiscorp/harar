@@ -14,6 +14,7 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const AUD: &str = "https://api.example.test";
+const GILD: &str = "https://gild.example.test";
 
 struct Issuer {
     child: Child,
@@ -85,15 +86,24 @@ impl Issuer {
     }
 
     fn harar(&self, args: &[&str]) -> Output {
+        self.harar_with(args, &[])
+    }
+
+    fn harar_with(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_harar"))
             .args(args)
+            .envs(env.iter().copied())
             .env("HARAR_SOCKET", &self.socket)
             .output()
             .expect("run harar")
     }
 
     fn ok(&self, args: &[&str]) -> serde_json::Value {
-        let out = self.harar(args);
+        self.ok_with(args, &[])
+    }
+
+    fn ok_with(&self, args: &[&str], env: &[(&str, &str)]) -> serde_json::Value {
+        let out = self.harar_with(args, env);
         assert!(out.status.success(), "harar {args:?}: {}", String::from_utf8_lossy(&out.stderr));
         serde_json::from_slice(&out.stdout).unwrap()
     }
@@ -131,8 +141,25 @@ fn now() -> u64 {
 }
 
 fn grant_me(issuer: &Issuer) {
-    issuer.ok(&["workload", "add", "svc:ci@test", "--user", &me()]);
+    issuer.ok(&["workload", "add", "svc:ci@test", "--user", &me(), "--sessions-for", "agent:*"]);
     issuer.ok(&["policy", "allow", "svc:ci@test", "--aud", AUD, "--scope", "deploy:*", "--may-act-for", "agent:*"]);
+    issuer.ok(&["policy", "allow", "svc:ci@test", "--aud", GILD, "--scope", "repo:*", "--may-act-for", "agent:*"]);
+}
+
+/// Ava's session, for Sami: deploy to staging, and anything in repos.
+fn start_ava(issuer: &Issuer) -> (String, String) {
+    let started = issuer.ok(&[
+        "session", "start", "agent:ava", "--for", "user:sami",
+        "--grant", &format!("{AUD}=deploy:staging"), "--grant", &format!("{GILD}=repo:*"),
+    ]);
+    let sid = started["session"]["sid"].as_str().unwrap().to_string();
+    (sid, started["session_token"].as_str().unwrap().to_string())
+}
+
+fn refused_with(out: Output, reason: &str) {
+    assert!(!out.status.success(), "allowed, expected {reason}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(reason), "expected {reason}: {stderr}");
 }
 
 #[test]
@@ -142,15 +169,17 @@ fn tokens_verify_against_the_published_discovery_and_jwks() {
     let jwks = issuer.jwks();
     assert_eq!(jwks.keys.iter().map(|k| k.alg.as_str()).collect::<Vec<_>>(), ["ES256", "EdDSA"]);
 
+    let (sid, _) = start_ava(&issuer);
     for alg in ["ES256", "EdDSA"] {
         let out = issuer.ok(&[
-            "token", "--aud", AUD, "--scope", "deploy:staging", "--act", "agent:ava", "--session", "s_123", "--alg", alg,
+            "token", "--aud", AUD, "--scope", "deploy:staging", "--act", "agent:ava", "--session", &sid, "--alg", alg,
         ]);
         let token = out["token"].as_str().unwrap();
         let claims: IdentityClaims = oidc::verify_identity(&jwks, token, &issuer.url, AUD, now()).unwrap();
         assert_eq!(claims.sub, "svc:ci@test", "the subject comes from the calling OS user");
         assert!(claims.has_scope("deploy:staging"));
-        assert_eq!(claims.act.as_ref().unwrap().sid.as_deref(), Some("s_123"));
+        assert_eq!(claims.act.as_ref().unwrap().sid.as_deref(), Some(sid.as_str()));
+        assert_eq!(claims.act.as_ref().unwrap().chain(), ["agent:ava", "user:sami"], "gild for ava for sami");
         assert_eq!(claims.exp - claims.iat, oidc::DEFAULT_TTL_SECONDS);
         assert_eq!(serde_json::to_value(&claims).unwrap(), out["claims"]);
     }
@@ -213,4 +242,97 @@ fn keys_and_rules_survive_a_restart() {
     assert_eq!(issuer.jwks(), before, "the signing keys were read back, not regenerated");
     let token = issuer.ok(&["token", "--aud", AUD, "--scope", "deploy:staging"]);
     assert!(oidc::verify_identity(&before, token["token"].as_str().unwrap(), &issuer.url, AUD, now()).is_ok());
+}
+
+/// S1 and S7: gild acts for Ava within her session; Ava hands a sub-agent a
+/// narrower token; S10: revoking Ava's session ends the sub-agent's too.
+#[test]
+fn sessions_narrow_through_exchange_and_die_together() {
+    let issuer = Issuer::start();
+    grant_me(&issuer);
+    let jwks = issuer.jwks();
+    let (sid, ava_token) = start_ava(&issuer);
+
+    // gild's own grant covers deploy:*, but Ava's session only staging.
+    refused_with(
+        issuer.harar(&["token", "--aud", AUD, "--scope", "deploy:production", "--act", "agent:ava", "--session", &sid]),
+        "scope_not_in_session",
+    );
+    refused_with(issuer.harar(&["token", "--aud", AUD, "--act", "agent:ava"]), "session_required");
+    refused_with(
+        issuer.harar(&["token", "--aud", AUD, "--act", "agent:ava", "--session", "s_made_up"]),
+        "session_not_live",
+    );
+
+    // Ava's session token is for the issuer itself, so no service accepts it.
+    let session_claims = oidc::verify_identity(&jwks, &ava_token, &issuer.url, &issuer.url, now()).unwrap();
+    assert_eq!(session_claims.sub, "agent:ava");
+    assert!(oidc::verify_identity(&jwks, &ava_token, &issuer.url, AUD, now()).is_err());
+
+    let ava = [("AVA_SESSION", ava_token.as_str())];
+    let child = issuer.ok_with(
+        &["exchange", "--secret-env", "AVA_SESSION", "--name", "reviewer", "--aud", GILD, "--scope", "repo:read", "--ttl", "30m"],
+        &ava,
+    );
+    let claims = oidc::verify_identity(&jwks, child["token"].as_str().unwrap(), &issuer.url, GILD, now()).unwrap();
+    assert_eq!(claims.sub, "agent:ava/reviewer");
+    assert_eq!(claims.scope, "repo:read");
+    assert_eq!(claims.exp - claims.iat, 1800);
+    assert_eq!(claims.act.unwrap().chain(), ["agent:ava", "user:sami"]);
+    let child_sid = child["session"]["sid"].as_str().unwrap().to_string();
+    let child_token = child["session_token"].as_str().unwrap().to_string();
+    let reviewer = [("CHILD_SESSION", child_token.as_str())];
+
+    // Never wider than the parent.
+    refused_with(
+        issuer.harar_with(&["exchange", "--secret-env", "CHILD_SESSION", "--name", "x", "--aud", GILD, "--scope", "repo:write"], &reviewer),
+        "scope_not_granted",
+    );
+    refused_with(
+        issuer.harar_with(&["exchange", "--secret-env", "CHILD_SESSION", "--name", "x", "--aud", AUD], &reviewer),
+        "audience_not_granted",
+    );
+    let tree = issuer.ok(&["session", "tree", &sid]);
+    let sids: Vec<_> = tree.as_array().unwrap().iter().map(|s| s["sid"].as_str().unwrap()).collect();
+    assert_eq!(sids, [sid.as_str(), child_sid.as_str()]);
+
+    let refreshed = issuer.ok_with(&["session", "refresh", "--secret-env", "AVA_SESSION"], &ava);
+    assert_eq!(refreshed["session"]["sid"], sid.as_str());
+
+    let revoked = issuer.ok(&["session", "revoke", &sid]);
+    assert_eq!(revoked.as_array().unwrap().len(), 2, "the revocation reports the whole tree");
+    refused_with(
+        issuer.harar_with(&["exchange", "--secret-env", "CHILD_SESSION", "--name", "y", "--aud", GILD], &reviewer),
+        "session_not_live",
+    );
+    refused_with(issuer.harar_with(&["session", "refresh", "--secret-env", "AVA_SESSION"], &ava), "session_not_live");
+    refused_with(
+        issuer.harar(&["token", "--aud", AUD, "--scope", "deploy:staging", "--act", "agent:ava", "--session", &sid]),
+        "session_not_live",
+    );
+}
+
+#[test]
+fn a_forged_or_foreign_session_token_is_refused() {
+    let issuer = Issuer::start();
+    grant_me(&issuer);
+    let (_, ava_token) = start_ava(&issuer);
+    // An access token for a service is not a session token, even with a sid.
+    let child = issuer.ok_with(
+        &["exchange", "--secret-env", "T", "--name", "c", "--aud", GILD, "--scope", "repo:read"],
+        &[("T", ava_token.as_str())],
+    );
+    let access = child["token"].as_str().unwrap();
+    refused_with(
+        issuer.harar_with(&["exchange", "--secret-env", "T", "--name", "d", "--aud", GILD], &[("T", access)]),
+        "invalid_session_token",
+    );
+    // Another issuer's session token.
+    let other = Issuer::start();
+    grant_me(&other);
+    let (_, foreign) = start_ava(&other);
+    refused_with(
+        issuer.harar_with(&["exchange", "--secret-env", "T", "--name", "d", "--aud", GILD], &[("T", foreign.as_str())]),
+        "invalid_session_token",
+    );
 }
