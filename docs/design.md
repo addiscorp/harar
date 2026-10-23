@@ -119,6 +119,7 @@ Proposed names. `mint` becomes `token`, `put` becomes `set`.
 
 | Group | Commands |
 |---|---|
+| Master key | `key init` `key status` `key recover` |
 | Your vault | `unlock` `lock` `status` `get` `set` `rm` `run` `inject` `import` `plugin init` `ssh keygen` |
 | Devices | `device add` `device list` `device remove` |
 | Identity tokens | `token` `exchange` `verify` `keys rotate` `keys list` |
