@@ -115,12 +115,12 @@ rotation; a rogue agent; a lost laptop; the server being down.
 
 ## Commands
 
-Proposed names. `mint` becomes `token`, `put` becomes `set`.
+Names in the first two rows exist (#14–#21). The rest are proposed; `mint` becomes `token`.
 
 | Group | Commands |
 |---|---|
-| Master key | `key init` `key status` `key recover` |
-| Your vault | `unlock` `lock` `status` `get` `set` `rm` `run` `inject` `import` `plugin init` `ssh keygen` |
+| Master key | `key init [--file-tier]` `key status` `key recover` |
+| Your vault | `agent` `agent plist` `unlock` `lock` `status` `get` `put` `list` `delete` `run` `import` `inject` `plugin init/run/list` `ssh keygen` `ssh list` |
 | Devices | `device add` `device list` `device remove` |
 | Identity tokens | `token` `exchange` `verify` `keys rotate` `keys list` |
 | Fleet | `host enroll` `host approve` `host list` `workload add` `workload list` |
