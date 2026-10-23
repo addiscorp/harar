@@ -48,6 +48,8 @@ struct Jwk {
     #[serde(rename = "use")]
     key_use: String,
     x: String,
+    #[serde(default)]
+    y: Option<String>,
 }
 
 struct TestDir {
@@ -119,7 +121,7 @@ fn harar_real_topology_mint_verify_revoke_jwks_over_socket() {
     wait_for_connectable_socket(&socket);
 
     let jwks: Jwks = harar_json(["jwks", "--socket", socket_str(&socket)]);
-    assert_single_public_jwk(&jwks);
+    assert_public_jwks(&jwks);
 
     let minted: MintedToken = harar_json([
         "mint",
@@ -247,7 +249,7 @@ fn harar_no_socket_flag_uses_env_selected_socket_over_real_daemon() {
 
     let socket_env = [("HARAR_SOCKET", socket_str(&socket))];
     let jwks: Jwks = harar_json_with_env(["jwks"], &socket_env);
-    assert_single_public_jwk(&jwks);
+    assert_public_jwks(&jwks);
 
     let minted: MintedToken = harar_json_with_env(
         [
@@ -440,7 +442,7 @@ fn harar_default_socket_path_works_without_socket_overrides_when_available() {
     };
 
     let jwks: Jwks = harar_json_without_socket_env(["jwks"]);
-    assert_single_public_jwk(&jwks);
+    assert_public_jwks(&jwks);
 
     let minted: MintedToken = harar_json_without_socket_env([
         "mint",
@@ -728,15 +730,16 @@ fn parse_success_json<T: DeserializeOwned>(output: Output) -> T {
     })
 }
 
-fn assert_single_public_jwk(jwks: &Jwks) {
-    assert_eq!(jwks.keys.len(), 1, "{jwks:?}");
-    let key = &jwks.keys[0];
-    assert_eq!(key.kty, "OKP");
-    assert_eq!(key.crv, "Ed25519");
-    assert_eq!(key.alg, "EdDSA");
-    assert_eq!(key.key_use, "sig");
-    assert!(key.kid.starts_with("harar-"));
-    assert!(!key.x.is_empty());
+/// The issuer publishes its ES256 key, then its Ed25519 key, public parts only.
+fn assert_public_jwks(jwks: &Jwks) {
+    let shapes: Vec<_> = jwks.keys.iter().map(|k| (k.kty.as_str(), k.crv.as_str(), k.alg.as_str())).collect();
+    assert_eq!(shapes, [("EC", "P-256", "ES256"), ("OKP", "Ed25519", "EdDSA")], "{jwks:?}");
+    for key in &jwks.keys {
+        assert_eq!(key.key_use, "sig");
+        assert!(key.kid.starts_with("harar-"));
+        assert!(!key.x.is_empty());
+        assert_eq!(key.y.is_some(), key.kty == "EC");
+    }
 }
 
 fn forge_signature(token: &str) -> String {

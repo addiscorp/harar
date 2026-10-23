@@ -68,7 +68,6 @@ impl Issuer {
             .args(["--audit-log", &path(dir.path().join("audit.log"))])
             .args(["--replication-token-file", &path(replication)])
             .args(["--signing-key-file", &path(state.join("signing.key"))])
-            .args(["--es256-key-file", &path(state.join("es256.key"))])
             .args(["--issuer", &url, "--public-listen", &address])
             .env("GILD_VAULT_MASTER_KEY_PATH", &key)
             .stdout(Stdio::null())

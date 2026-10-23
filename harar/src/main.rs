@@ -38,7 +38,8 @@ const DEFAULT_STATE_PATH: &str = "/var/lib/harar/keys.age";
 const DEFAULT_AUDIT_LOG_PATH: &str = "/var/log/harar.log";
 const DEFAULT_REPLICATION_TOKEN_PATH: &str = "/etc/gild/vault-replication-token";
 const DEFAULT_SIGNING_KEY_PATH: &str = "/var/lib/harar/harar-signing.key";
-const DEFAULT_ES256_KEY_PATH: &str = "/var/lib/harar/harar-es256.key";
+/// The ES256 key lives next to the Ed25519 signing key unless told otherwise.
+const ES256_KEY_FILE_NAME: &str = "harar-es256.key";
 /// Where harar says its tokens come from. id.simien.dev is planned; until it
 /// exists, set HARAR_ISSUER to wherever the discovery document is served.
 const DEFAULT_ISSUER: &str = "https://id.simien.dev";
@@ -62,7 +63,7 @@ struct Config {
     upstream_url: Option<String>,
     replication_token_path: PathBuf,
     signing_key_path: PathBuf,
-    es256_key_path: PathBuf,
+    es256_key_path: Option<PathBuf>,
     issuer_url: String,
     /// A TCP address serving only the discovery document and JWKS.
     public_listen: Option<String>,
@@ -84,7 +85,7 @@ impl Config {
                 DEFAULT_REPLICATION_TOKEN_PATH,
             ),
             signing_key_path: env_path("HARAR_SIGNING_KEY_PATH", DEFAULT_SIGNING_KEY_PATH),
-            es256_key_path: env_path("HARAR_ES256_KEY_PATH", DEFAULT_ES256_KEY_PATH),
+            es256_key_path: std::env::var_os("HARAR_ES256_KEY_PATH").map(PathBuf::from),
             issuer_url: std::env::var("HARAR_ISSUER").unwrap_or_else(|_| DEFAULT_ISSUER.to_string()),
             public_listen: std::env::var("HARAR_PUBLIC_LISTEN").ok(),
             heartbeat_interval: Duration::from_secs(env_u64(
@@ -141,7 +142,7 @@ impl Config {
                 }
                 "--es256-key-file" => {
                     if let Some(value) = args.next() {
-                        config.es256_key_path = PathBuf::from(value);
+                        config.es256_key_path = Some(PathBuf::from(value));
                     }
                 }
                 "--issuer" => {
@@ -479,7 +480,11 @@ pub(crate) async fn run_daemon() -> Result<()> {
     let replication_log = load_replication_log(&replication_log_path)?;
     let replication_token = load_replication_token(&config.replication_token_path)?;
     let signing_key = load_or_create_signing_key(&config.signing_key_path)?;
-    let es256_key = load_or_create_es256_key(&config.es256_key_path)?;
+    let es256_key_path = config
+        .es256_key_path
+        .clone()
+        .unwrap_or_else(|| config.signing_key_path.with_file_name(ES256_KEY_FILE_NAME));
+    let es256_key = load_or_create_es256_key(&es256_key_path)?;
     let issuer = oidc::Issuer::new(config.issuer_url.clone(), es256_key, signing_key);
     let state = Arc::new(AppState {
         keys: Mutex::new(keys),
@@ -2644,7 +2649,7 @@ mod tests {
             upstream_url: None,
             replication_token_path: dir.join("vault-replication-token"),
             signing_key_path: dir.join("harar-signing.key"),
-            es256_key_path: dir.join("harar-es256.key"),
+            es256_key_path: None,
             issuer_url: "https://id.example.test".to_string(),
             public_listen: None,
             heartbeat_interval: Duration::from_millis(10),
@@ -3263,10 +3268,13 @@ mod tests {
 
         assert_eq!(reply.status, 200);
         assert!(reply.body.get("keys").is_some());
-        let jwk = &reply.body["keys"][0];
-        assert_eq!(jwk["kty"], "OKP");
-        assert!(jwk.get("x").is_some());
-        assert!(jwk.get("d").is_none());
+        let keys = reply.body["keys"].as_array().unwrap();
+        let types: Vec<_> = keys.iter().map(|jwk| jwk["kty"].as_str().unwrap()).collect();
+        assert_eq!(types, ["EC", "OKP"]);
+        for jwk in keys {
+            assert!(jwk.get("x").is_some());
+            assert!(jwk.get("d").is_none(), "a private key part was published: {jwk}");
+        }
         let body = reply.body.to_string();
         assert!(!body.contains("private"));
     }
