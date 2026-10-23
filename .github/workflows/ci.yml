@@ -29,3 +29,16 @@ jobs:
       - run: cargo check --locked --workspace --all-targets
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --locked --workspace
+
+  macos:
+    runs-on: macos-15
+    env:
+      # GitHub's macOS runners are VMs, which have no Secure Enclave. The
+      # enclave tests check this claim and skip; on a real Mac they run.
+      HARAR_TEST_NO_ENCLAVE: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - run: cargo check --locked --workspace --all-targets
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --workspace
