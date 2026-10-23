@@ -147,6 +147,17 @@ impl EnclaveKey {
         Ok(data.bytes().to_vec())
     }
 
+    /// ES256 over `message`: the raw 64-byte `r || s` a JWS carries. Asks for
+    /// presence first when the key was created with `Presence::Required`.
+    pub fn sign(&self, message: &[u8]) -> Result<[u8; 64]> {
+        let der = self
+            .key
+            .create_signature(Algorithm::ECDSASignatureMessageX962SHA256, message)
+            .map_err(|err| enclave_error("sign with Secure Enclave key", err))?;
+        let signature = p256::ecdsa::Signature::from_der(&der).context("Secure Enclave signature")?;
+        Ok(signature.to_bytes().into())
+    }
+
     pub fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
         let public = self
             .key
@@ -229,6 +240,16 @@ pub(crate) mod tests {
         sealed[last] ^= 1;
 
         assert!(key.open(&sealed).is_err());
+    }
+
+    #[test]
+    fn signatures_verify_with_the_public_key() {
+        use p256::ecdsa::signature::Verifier;
+        let Some(key) = test_key() else { return };
+        let public = p256::ecdsa::VerifyingKey::from_sec1_bytes(&key.public_key().unwrap()).unwrap();
+        let signature = p256::ecdsa::Signature::from_slice(&key.sign(b"host assertion").unwrap()).unwrap();
+        assert!(public.verify(b"host assertion", &signature).is_ok());
+        assert!(public.verify(b"something else", &signature).is_err());
     }
 
     #[test]

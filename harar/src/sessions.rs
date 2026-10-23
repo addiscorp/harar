@@ -246,8 +246,8 @@ mod tests {
         IdentityPolicy {
             workloads: vec![Workload { sub: "svc:gild@demon".into(), user: "gild".into(), sessions_for: vec!["agent:*".into()], runs_for: vec![] }],
             grants: vec![
-                Grant { sub: "svc:gild@demon".into(), audience: SIMIEN.into(), scopes: vec!["deploy:*".into()], may_act_for: vec!["agent:*".into()] },
-                Grant { sub: "svc:gild@demon".into(), audience: GILD.into(), scopes: vec!["repo:*".into()], may_act_for: vec!["agent:*".into()] },
+                Grant { sub: "svc:gild@demon".into(), audience: SIMIEN.into(), scopes: vec!["deploy:*".into()], may_act_for: vec!["agent:*".into()], hardware_only: false },
+                Grant { sub: "svc:gild@demon".into(), audience: GILD.into(), scopes: vec!["repo:*".into()], may_act_for: vec!["agent:*".into()], hardware_only: false },
             ],
         }
     }

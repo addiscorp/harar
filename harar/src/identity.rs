@@ -2,6 +2,7 @@
 //! workload may ask for. The rules are one vault entry, so they are encrypted
 //! and replicated with everything else.
 
+use harar_client::hosts::HostTier;
 use harar_client::oidc::{
     Actor, DEFAULT_TTL_SECONDS, Grant, IdentityPolicy, IdentityRequest, MAX_TTL_SECONDS, TokenAsk,
     Workload,
@@ -66,6 +67,7 @@ pub fn grant(policy: &mut IdentityPolicy, grant: Grant) -> Result<(), &'static s
             policy.grants.last_mut().expect("just pushed")
         }
     };
+    existing.hardware_only |= grant.hardware_only;
     for (into, from) in [(&mut existing.scopes, grant.scopes), (&mut existing.may_act_for, grant.may_act_for)] {
         into.extend(from);
         into.sort();
@@ -88,11 +90,25 @@ pub fn decide(policy: &IdentityPolicy, user: &str, ask: &TokenAsk) -> Result<Ide
         .iter()
         .find(|w| w.user == user)
         .ok_or("not_a_workload")?;
+    decide_subject(policy, &workload.sub, ask, None)
+}
+
+/// Decides what `sub` gets for `ask`. `host_tier` is set when an enrolled
+/// host asks for one of its workloads, and `None` on the issuer's own host.
+pub fn decide_subject(
+    policy: &IdentityPolicy,
+    sub: &str,
+    ask: &TokenAsk,
+    host_tier: Option<HostTier>,
+) -> Result<IdentityRequest, &'static str> {
     let grant = policy
         .grants
         .iter()
-        .find(|g| g.sub == workload.sub && g.audience == ask.audience)
+        .find(|g| g.sub == sub && g.audience == ask.audience)
         .ok_or("audience_not_granted")?;
+    if grant.hardware_only && host_tier.is_some_and(|tier| !tier.is_hardware()) {
+        return Err("hardware_required");
+    }
     let mut scopes = Vec::new();
     for scope in &ask.scopes {
         valid_scope(scope)?;
@@ -114,7 +130,7 @@ pub fn decide(policy: &IdentityPolicy, user: &str, ask: &TokenAsk) -> Result<Ide
         return Err("ttl_out_of_bounds");
     }
     Ok(IdentityRequest {
-        sub: workload.sub.clone(),
+        sub: sub.to_string(),
         aud: ask.audience.clone(),
         scopes,
         ttl_seconds,
@@ -188,6 +204,7 @@ mod tests {
                 audience: SIMIEN.into(),
                 scopes: vec!["deploy:*".into()],
                 may_act_for: vec!["agent:*".into()],
+                hardware_only: false,
             },
         )
         .unwrap();
@@ -242,7 +259,7 @@ mod tests {
         let mut policy = gild_policy();
         grant(
             &mut policy,
-            Grant { sub: "svc:gild@demon".into(), audience: SIMIEN.into(), scopes: vec!["logs:read".into(), "deploy:*".into()], may_act_for: vec![] },
+            Grant { sub: "svc:gild@demon".into(), audience: SIMIEN.into(), scopes: vec!["logs:read".into(), "deploy:*".into()], may_act_for: vec![], hardware_only: false },
         )
         .unwrap();
         assert_eq!(policy.grants.len(), 1);
@@ -268,14 +285,24 @@ mod tests {
     }
 
     #[test]
+    fn hardware_only_grants_refuse_hosts_with_software_keys() {
+        let mut policy = gild_policy();
+        policy.grants[0].hardware_only = true;
+        let sub = "svc:gild@demon";
+        assert_eq!(decide_subject(&policy, sub, &ask(&[]), Some(HostTier::Software)), Err("hardware_required"));
+        assert!(decide_subject(&policy, sub, &ask(&[]), Some(HostTier::SecureEnclave)).is_ok());
+        assert!(decide_subject(&policy, sub, &ask(&[]), None).is_ok(), "the issuer's own host");
+    }
+
+    #[test]
     fn names_are_checked() {
         let mut policy = IdentityPolicy::default();
         for sub in ["gild", ":x", "svc:", "svc:has space", "svc:a\"b"] {
             assert!(add_workload(&mut policy, Workload { sub: sub.into(), user: "u".into(), sessions_for: vec![], runs_for: vec![] }).is_err(), "{sub}");
         }
-        let bad = Grant { sub: "svc:a".into(), audience: "has space".into(), scopes: vec![], may_act_for: vec![] };
+        let bad = Grant { sub: "svc:a".into(), audience: "has space".into(), scopes: vec![], may_act_for: vec![], hardware_only: false };
         assert_eq!(grant(&mut policy, bad), Err("invalid_audience"));
-        let bad = Grant { sub: "svc:a".into(), audience: SIMIEN.into(), scopes: vec!["a*b".into()], may_act_for: vec![] };
+        let bad = Grant { sub: "svc:a".into(), audience: SIMIEN.into(), scopes: vec!["a*b".into()], may_act_for: vec![], hardware_only: false };
         assert_eq!(grant(&mut policy, bad), Err("invalid_pattern"));
     }
 

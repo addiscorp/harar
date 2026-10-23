@@ -12,6 +12,7 @@ use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
 pub mod broker;
+pub mod hosts;
 pub mod oidc;
 pub mod runs;
 
@@ -371,6 +372,17 @@ enum VaultRequest<'a> {
         id: &'a str,
     },
     Runs,
+    HostApprove {
+        name: &'a str,
+        code: &'a str,
+    },
+    HostReject {
+        name: &'a str,
+    },
+    HostRemove {
+        name: &'a str,
+    },
+    Hosts,
 }
 
 /// What `exchange` hands back to the child.
@@ -413,6 +425,7 @@ struct VaultResponse {
     runs: Option<runs::RunsState>,
     secrets: Option<std::collections::BTreeMap<String, String>>,
     run_token: Option<String>,
+    hosts: Option<hosts::HostsState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -991,6 +1004,30 @@ impl VaultClient {
 
     pub async fn run_finish(&self, id: &str) -> Result<runs::Run, VaultClientError> {
         self.run_request(&VaultRequest::RunFinish { id }).await
+    }
+
+    /// Approves a pending host if `code` is the one it showed.
+    pub async fn host_approve(&self, name: &str, code: &str) -> Result<hosts::HostsState, VaultClientError> {
+        self.hosts_request(&VaultRequest::HostApprove { name, code }).await
+    }
+
+    pub async fn host_reject(&self, name: &str) -> Result<hosts::HostsState, VaultClientError> {
+        self.hosts_request(&VaultRequest::HostReject { name }).await
+    }
+
+    pub async fn host_remove(&self, name: &str) -> Result<hosts::HostsState, VaultClientError> {
+        self.hosts_request(&VaultRequest::HostRemove { name }).await
+    }
+
+    pub async fn hosts(&self) -> Result<hosts::HostsState, VaultClientError> {
+        self.hosts_request(&VaultRequest::Hosts).await
+    }
+
+    async fn hosts_request(&self, request: &VaultRequest<'_>) -> Result<hosts::HostsState, VaultClientError> {
+        self.identity_request(request, "hosts_failed")
+            .await?
+            .hosts
+            .ok_or_else(|| VaultClientError::InvalidResponse("missing hosts".to_string()))
     }
 
     async fn runs_request(&self, request: &VaultRequest<'_>) -> Result<runs::RunsState, VaultClientError> {

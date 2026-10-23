@@ -30,6 +30,8 @@ mod agent;
 mod broker;
 mod cli;
 mod dotenv;
+mod host_key;
+mod hosts;
 mod identity;
 mod mask;
 mod runs;
@@ -227,6 +229,8 @@ struct AppState {
     replication_log: Mutex<Vec<ReplicationLogEntry>>,
     replication_token: String,
     issuer: oidc::Issuer,
+    /// Host assertion ids already used, until they expire.
+    host_assertions: std::sync::Mutex<HashMap<String, u64>>,
 }
 
 /// This record is intentionally stored separately from generic vault keys.
@@ -420,6 +424,17 @@ enum VaultRequest {
     },
     /// Env rules and the runs the caller may see.
     Runs,
+    HostApprove {
+        name: String,
+        code: String,
+    },
+    HostReject {
+        name: String,
+    },
+    HostRemove {
+        name: String,
+    },
+    Hosts,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -481,6 +496,8 @@ struct VaultResponse {
     secrets: Option<std::collections::BTreeMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     run_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hosts: Option<harar_client::hosts::HostsState>,
 }
 
 impl VaultResponse {
@@ -515,6 +532,7 @@ impl VaultResponse {
             runs: None,
             secrets: None,
             run_token: None,
+            hosts: None,
         }
     }
 
@@ -549,6 +567,7 @@ impl VaultResponse {
             runs: None,
             secrets: None,
             run_token: None,
+            hosts: None,
         }
     }
 }
@@ -623,6 +642,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
         replication_log: Mutex::new(replication_log),
         replication_token,
         issuer,
+        host_assertions: std::sync::Mutex::new(HashMap::new()),
     });
 
     if config.mode == Mode::Replica {
@@ -808,11 +828,12 @@ async fn serve_public(listener: TcpListener, state: Arc<AppState>) {
         let Ok((mut stream, _)) = listener.accept().await else { continue };
         let state = Arc::clone(&state);
         tokio::spawn(async move {
-            let head = tokio::time::timeout(Duration::from_secs(10), read_http_head(&mut stream)).await;
-            let reply = match head.map_err(anyhow::Error::from).and_then(|head| parse_http_request(&head?)) {
-                Ok(request) if request.method == "GET" => {
+            let read = tokio::time::timeout(Duration::from_secs(10), read_http_request(&mut stream)).await;
+            let reply = match read.map_err(anyhow::Error::from).and_then(|read| read) {
+                Ok((request, _)) if request.method == "GET" => {
                     public_reply(&state, &request).unwrap_or(None).unwrap_or_else(|| HttpReply::json_error(404, "not found"))
                 }
+                Ok((request, body)) if request.method == "POST" => public_post(&state, &request.path, &body).await,
                 Ok(_) => HttpReply::json_error(405, "method not allowed"),
                 Err(_) => HttpReply::json_error(400, "bad request"),
             };
@@ -821,6 +842,117 @@ async fn serve_public(listener: TcpListener, state: Arc<AppState>) {
             }
         });
     }
+}
+
+/// The largest body the public listener reads: enrollments and assertions
+/// are well under this.
+const MAX_PUBLIC_BODY_BYTES: usize = 16 * 1024;
+
+/// Reads one request from the public listener: its head, then exactly
+/// `content-length` bytes of body.
+async fn read_http_request(stream: &mut (impl AsyncRead + Unpin)) -> Result<(HttpRequest, Vec<u8>)> {
+    let bytes = read_http_head(stream).await?;
+    let request = parse_http_request(&bytes)?;
+    let start = bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map_or(bytes.len(), |at| at + 4);
+    let length: usize = match request.headers.get("content-length") {
+        Some(value) => value.parse().context("content-length")?,
+        None => 0,
+    };
+    if length > MAX_PUBLIC_BODY_BYTES {
+        return Err(anyhow!("request body too large"));
+    }
+    let mut body = bytes[start..].to_vec();
+    body.truncate(length);
+    while body.len() < length {
+        let mut chunk = vec![0_u8; length - body.len()];
+        let read = stream.read(&mut chunk).await.context("read request body")?;
+        if read == 0 {
+            return Err(anyhow!("request body ended early"));
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+    Ok((request, body))
+}
+
+/// POSTs anyone may make: asking to enroll a host, and an enrolled host
+/// trading a signed assertion for a token.
+async fn public_post(state: &AppState, path: &str, body: &[u8]) -> HttpReply {
+    let outcome = match path {
+        harar_client::hosts::ENROLL_PATH => enroll_host(state, body).await,
+        harar_client::hosts::TOKEN_PATH => host_token(state, body).await,
+        oidc::DISCOVERY_PATH | oidc::JWKS_PATH | "/v1/jwks" => return HttpReply::json_error(405, "method not allowed"),
+        _ => return HttpReply::json_error(404, "not found"),
+    };
+    match outcome {
+        Ok(reply) => reply,
+        Err(err) => {
+            eprintln!("harar public request error: {err:#}");
+            HttpReply::json_error(500, "internal error")
+        }
+    }
+}
+
+/// Who a public request came from, for the audit log.
+fn public_peer(name: &str) -> PeerCred {
+    PeerCred { uid: u32::MAX, pid: 0, username: Some(name.to_string()) }
+}
+
+async fn enroll_host(state: &AppState, body: &[u8]) -> Result<HttpReply> {
+    let Ok(ask) = serde_json::from_slice::<harar_client::hosts::EnrollAsk>(body) else {
+        return Ok(HttpReply::json_error(400, "bad request"));
+    };
+    if *state.mode.lock().await == Mode::Replica || *state.fenced.lock().await {
+        return Ok(HttpReply::json_error(409, "replica_read_only"));
+    }
+    let now = now_epoch_seconds()?;
+    let name = ask.name.clone();
+    let mut keys = state.keys.lock().await;
+    let enrolled = hosts::load(&keys).and_then(|mut all| Ok((hosts::enroll(&mut all, ask, now)?, all)));
+    let reply = match enrolled {
+        Ok((code, all)) => {
+            write_entry(state, &mut keys, hosts::HOSTS_KEY, hosts::store(&all)).await?;
+            HttpReply::json_value(200, serde_json::json!({ "code": code }))
+        }
+        Err(reason) => HttpReply::json_error(400, reason),
+    };
+    drop(keys);
+    let result = reply.body.get("error").and_then(|e| e.as_str()).unwrap_or("ok").to_string();
+    audit(state, "host_enroll", Some(&name), &public_peer("anyone"), &result)?;
+    Ok(reply)
+}
+
+async fn host_token(state: &AppState, body: &[u8]) -> Result<HttpReply> {
+    #[derive(Deserialize)]
+    struct Ask {
+        assertion: String,
+    }
+    let Ok(ask) = serde_json::from_slice::<Ask>(body) else {
+        return Ok(HttpReply::json_error(400, "bad request"));
+    };
+    let now = now_epoch_seconds()?;
+    let keys = state.keys.lock().await;
+    let mut caller = "unknown host".to_string();
+    let issued = hosts::load(&keys).and_then(|all| {
+        let mut seen = state.host_assertions.lock().expect("assertion cache");
+        let (host, assertion) = hosts::verify_assertion(&all, &ask.assertion, state.issuer.url(), &mut seen, now)?;
+        caller = format!("host:{}", host.name);
+        let mut request = identity::decide_subject(&identity::load(&keys)?, &assertion.sub, &assertion.ask, Some(host.tier))?;
+        sessions::bind_actor(&sessions::load(&keys)?, &mut request, now)?;
+        request.extra.insert("host".to_string(), host.name.clone().into());
+        request.extra.insert("host_tier".to_string(), serde_json::to_value(host.tier).expect("tier serializes"));
+        let alg = assertion.ask.alg.unwrap_or(Alg::ES256);
+        state.issuer.issue(&request, alg, now).map_err(|err| token_error_code(&err))
+    });
+    drop(keys);
+    let (reply, result) = match issued {
+        Ok((token, claims)) => (HttpReply::json_value(200, serde_json::json!({ "token": token, "claims": claims })), "ok"),
+        Err(reason) => (HttpReply::json_error(403, reason), reason),
+    };
+    audit(state, "host_token", None, &public_peer(&caller), result)?;
+    Ok(reply)
 }
 
 /// Reads up to the blank line ending an HTTP request's headers. Browsers and
@@ -950,6 +1082,9 @@ async fn handle_request(
             | VaultRequest::RunToken { .. }
             | VaultRequest::RunDecide { .. }
             | VaultRequest::RunFinish { .. }
+            | VaultRequest::HostApprove { .. }
+            | VaultRequest::HostReject { .. }
+            | VaultRequest::HostRemove { .. }
     ) {
         if *state.mode.lock().await == Mode::Replica {
             audit(
@@ -1374,6 +1509,19 @@ async fn handle_request(
                 Err(reason) => VaultResponse::error(reason),
             }
         }
+        VaultRequest::HostApprove { name, code } => {
+            let now = now_epoch_seconds()?;
+            update_hosts(state, |h| hosts::approve(h, &name, &code, now).map(|_| ())).await?
+        }
+        VaultRequest::HostReject { name } => update_hosts(state, |h| found(hosts::reject(h, &name))).await?,
+        VaultRequest::HostRemove { name } => update_hosts(state, |h| found(hosts::remove(h, &name))).await?,
+        VaultRequest::Hosts => match hosts::load(&*state.keys.lock().await) {
+            Ok(h) => VaultResponse {
+                hosts: Some(h),
+                ..VaultResponse::ok()
+            },
+            Err(reason) => VaultResponse::error(reason),
+        },
         VaultRequest::Health => {
             let keys = state.keys.lock().await;
             VaultResponse {
@@ -1445,6 +1593,26 @@ fn run_from_token(state: &AppState, all: &RunsState, token: &str, now: u64) -> R
         Some(run) if run.facts.subject() == claims.sub => Ok(id.to_string()),
         _ => Err("invalid_run_token"),
     }
+}
+
+async fn update_hosts(
+    state: &AppState,
+    change: impl FnOnce(&mut harar_client::hosts::HostsState) -> Result<(), &'static str>,
+) -> Result<VaultResponse> {
+    let mut keys = state.keys.lock().await;
+    let changed = hosts::load(&keys).and_then(|mut h| {
+        change(&mut h)?;
+        Ok(h)
+    });
+    let h = match changed {
+        Ok(h) => h,
+        Err(reason) => return Ok(VaultResponse::error(reason)),
+    };
+    write_entry(state, &mut keys, hosts::HOSTS_KEY, hosts::store(&h)).await?;
+    Ok(VaultResponse {
+        hosts: Some(h),
+        ..VaultResponse::ok()
+    })
 }
 
 fn runs_reply(r: &RunsState, (): ()) -> VaultResponse {
@@ -2452,6 +2620,10 @@ impl VaultRequest {
             Self::RunDecide { .. } => "run_decide",
             Self::RunFinish { .. } => "run_finish",
             Self::Runs => "runs",
+            Self::HostApprove { .. } => "host_approve",
+            Self::HostReject { .. } => "host_reject",
+            Self::HostRemove { .. } => "host_remove",
+            Self::Hosts => "hosts",
         }
     }
 
@@ -2487,7 +2659,8 @@ impl VaultRequest {
             Self::RunSecrets { env, .. } => Some(env),
             Self::RunToken { audience, .. } => Some(audience),
             Self::RunDecide { id, .. } | Self::RunFinish { id } => Some(id),
-            Self::Runs => None,
+            Self::Runs | Self::Hosts => None,
+            Self::HostApprove { name, .. } | Self::HostReject { name } | Self::HostRemove { name } => Some(name),
             Self::Token(ask) => Some(&ask.audience),
             Self::WorkloadAdd(Workload { sub, .. })
             | Self::Grant(Grant { sub, .. })
@@ -2527,7 +2700,13 @@ fn authorize(peer: &PeerCred, request: &VaultRequest) -> Decision {
         VaultRequest::BrokerPlaceholder { .. }
         | VaultRequest::BrokerRequest { .. }
         | VaultRequest::BrokerResolve { .. } => Decision::Allow,
-        VaultRequest::EnvRule(_) | VaultRequest::EnvRuleRemove { .. } | VaultRequest::RunDecide { .. } => {
+        VaultRequest::EnvRule(_)
+        | VaultRequest::EnvRuleRemove { .. }
+        | VaultRequest::RunDecide { .. }
+        | VaultRequest::HostApprove { .. }
+        | VaultRequest::HostReject { .. }
+        | VaultRequest::HostRemove { .. }
+        | VaultRequest::Hosts => {
             if is_admin(peer) {
                 Decision::Allow
             } else {
@@ -3345,6 +3524,7 @@ mod tests {
             replication_log: Mutex::new(Vec::new()),
             replication_token: "test-replication-token".to_string(),
             issuer: test_issuer(),
+            host_assertions: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -3402,6 +3582,7 @@ mod tests {
             replication_log: Mutex::new(Vec::new()),
             replication_token: "test-replication-token".to_string(),
             issuer: test_issuer(),
+            host_assertions: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -4207,6 +4388,7 @@ mod tests {
             replication_log: Mutex::new(Vec::new()),
             replication_token: "test-replication-token".to_string(),
             issuer: test_issuer(),
+            host_assertions: std::sync::Mutex::new(HashMap::new()),
         };
 
         let response = handle_request(
@@ -4507,6 +4689,7 @@ mod tests {
             replication_log: Mutex::new(Vec::new()),
             replication_token: "test-replication-token".to_string(),
             issuer: test_issuer(),
+            host_assertions: std::sync::Mutex::new(HashMap::new()),
         });
         attach_replica(
             &replica_state,

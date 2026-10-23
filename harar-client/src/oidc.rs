@@ -293,6 +293,9 @@ pub struct Grant {
     pub scopes: Vec<String>,
     #[serde(default)]
     pub may_act_for: Vec<String>,
+    /// Refuse requests from hosts whose key is not in hardware.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hardware_only: bool,
 }
 
 /// The issuer's rules.
@@ -354,7 +357,7 @@ pub fn verify_identity(
 
 /// Checks a JWT's signature against `jwks` and returns its payload bytes.
 /// Accepts ES256 and EdDSA, and only with a key of the matching type.
-pub(crate) fn verify_signature(jwks: &Jwks, token: &str) -> Result<Vec<u8>, TokenError> {
+pub fn verify_signature(jwks: &Jwks, token: &str) -> Result<Vec<u8>, TokenError> {
     let parts = token.split('.').collect::<Vec<_>>();
     if parts.len() != 3 {
         return Err(TokenError::InvalidToken(
@@ -408,7 +411,7 @@ pub(crate) fn verify_signature(jwks: &Jwks, token: &str) -> Result<Vec<u8>, Toke
             if jwk.kty != "EC" || jwk.crv != "P-256" {
                 return Err(TokenError::InvalidToken("unsupported jwk".to_string()));
             }
-            let key = es256_verifying_key(jwk)?;
+            let key = p256_key_from_jwk(jwk)?;
             let signature = p256::ecdsa::Signature::from_slice(&signature)
                 .map_err(|_| TokenError::InvalidToken("bad signature length".to_string()))?;
             key.verify(signing_input.as_bytes(), &signature)
@@ -444,10 +447,15 @@ fn es256_kid(key: &p256::ecdsa::VerifyingKey) -> String {
 }
 
 fn es256_jwk(key: &p256::ecdsa::VerifyingKey) -> Jwk {
+    p256_jwk(es256_kid(key), key)
+}
+
+/// The public JWK for a P-256 key, under `kid`.
+pub fn p256_jwk(kid: String, key: &p256::ecdsa::VerifyingKey) -> Jwk {
     let (x, y) = es256_coordinates(key);
     Jwk {
         kty: "EC".to_string(),
-        kid: es256_kid(key),
+        kid,
         crv: "P-256".to_string(),
         alg: "ES256".to_string(),
         key_use: "sig".to_string(),
@@ -456,7 +464,8 @@ fn es256_jwk(key: &p256::ecdsa::VerifyingKey) -> Jwk {
     }
 }
 
-fn es256_verifying_key(jwk: &Jwk) -> Result<p256::ecdsa::VerifyingKey, TokenError> {
+/// The P-256 key a JWK describes, checked to be a point on the curve.
+pub fn p256_key_from_jwk(jwk: &Jwk) -> Result<p256::ecdsa::VerifyingKey, TokenError> {
     let bad = || TokenError::InvalidToken("bad P-256 key".to_string());
     let x: [u8; 32] = b64_url_decode(&jwk.x)?.as_slice().try_into().map_err(|_| bad())?;
     let y: [u8; 32] = b64_url_decode(jwk.y.as_deref().ok_or_else(bad)?)?

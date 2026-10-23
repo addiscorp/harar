@@ -4,6 +4,7 @@ use std::path::PathBuf;
 pub mod agent;
 pub mod broker;
 pub mod get;
+pub mod hosts;
 pub mod identity;
 pub mod jwks;
 pub mod key;
@@ -55,6 +56,7 @@ enum Command {
     Approvals(broker::Approvals),
     Env(runs::EnvCmd),
     Runs(runs::RunsCmd),
+    Host(hosts::HostCmd),
     Mint(mint::Mint),
     Verify(verify::Verify),
     Revoke(revoke::Revoke),
@@ -105,6 +107,7 @@ pub async fn run() -> anyhow::Result<()> {
         Command::Approvals(cmd) => broker::approvals(cmd).await,
         Command::Env(cmd) => runs::env(cmd).await,
         Command::Runs(cmd) => runs::runs(cmd).await,
+        Command::Host(cmd) => hosts::host(cmd).await,
         Command::Mint(cmd) => mint::run(cmd).await,
         Command::Verify(cmd) => verify::run(cmd).await,
         Command::Revoke(cmd) => revoke::run(cmd).await,

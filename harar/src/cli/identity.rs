@@ -118,6 +118,9 @@ enum PolicyAction {
         scopes: Vec<String>,
         #[arg(long = "may-act-for")]
         may_act_for: Vec<String>,
+        /// Refuse enrolled hosts whose key is not in hardware.
+        #[arg(long)]
+        hardware_only: bool,
     },
     /// Remove everything SUB may ask of AUD.
     Remove {
@@ -141,8 +144,8 @@ enum PolicyAction {
 pub async fn policy(cmd: PolicyCmd) -> Result<()> {
     let client = VaultClient::from_socket_path(cmd.socket.socket);
     match cmd.action {
-        PolicyAction::Allow { sub, audience, scopes, may_act_for } => {
-            let policy = client.grant(&Grant { sub, audience, scopes, may_act_for }).await?;
+        PolicyAction::Allow { sub, audience, scopes, may_act_for, hardware_only } => {
+            let policy = client.grant(&Grant { sub, audience, scopes, may_act_for, hardware_only }).await?;
             print_json(&policy.grants)
         }
         PolicyAction::Remove { sub, audience } => print_json(&client.ungrant(&sub, &audience).await?.grants),
