@@ -2342,6 +2342,10 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
     fn peer(uid: u32, username: &str) -> PeerCred {
+        // `is_admin` trusts the uid running the tests, and GitHub's runner user
+        // is uid 1001, the same as `agent-amina` here. Move a colliding caller
+        // off it so it stays someone else.
+        let uid = if uid == unsafe { libc::geteuid() } { uid + 100_000 } else { uid };
         PeerCred {
             uid,
             pid: 1234,
