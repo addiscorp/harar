@@ -2,6 +2,7 @@ use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 pub mod agent;
+pub mod broker;
 pub mod get;
 pub mod identity;
 pub mod jwks;
@@ -48,6 +49,9 @@ enum Command {
     Policy(identity::PolicyCmd),
     Session(identity::SessionCmd),
     Exchange(identity::Exchange),
+    Broker(broker::BrokerCmd),
+    Request(broker::Request),
+    Approvals(broker::Approvals),
     Mint(mint::Mint),
     Verify(verify::Verify),
     Revoke(revoke::Revoke),
@@ -93,6 +97,9 @@ pub async fn run() -> anyhow::Result<()> {
         Command::Policy(cmd) => identity::policy(cmd).await,
         Command::Session(cmd) => identity::session(cmd).await,
         Command::Exchange(cmd) => identity::exchange(cmd).await,
+        Command::Broker(cmd) => broker::broker(cmd).await,
+        Command::Request(cmd) => broker::request(cmd).await,
+        Command::Approvals(cmd) => broker::approvals(cmd).await,
         Command::Mint(cmd) => mint::run(cmd).await,
         Command::Verify(cmd) => verify::run(cmd).await,
         Command::Revoke(cmd) => revoke::run(cmd).await,

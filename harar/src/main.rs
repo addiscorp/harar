@@ -6,6 +6,7 @@ use harar_client::{
     mint_token, signing_key_bytes, signing_key_from_bytes, validate_token_bindings,
     verify_token,
 };
+use harar_client::broker::{AccessRequest, BrokerGrant, BrokerService, BrokerState, Resolved};
 use harar_client::oidc::{
     self, Alg, ExchangeAsk, Grant, IdentityClaims, IdentityPolicy, IdentityRequest, Session, SessionGrant,
     SessionStartAsk, TokenAsk, Workload,
@@ -25,6 +26,7 @@ use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
 mod agent;
+mod broker;
 mod cli;
 mod dotenv;
 mod identity;
@@ -359,6 +361,39 @@ enum VaultRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sid: Option<String>,
     },
+    BrokerService(BrokerService),
+    BrokerServiceRemove {
+        name: String,
+    },
+    BrokerAllow(BrokerGrant),
+    BrokerDisallow(BrokerGrant),
+    /// Let a workload resolve placeholders: make it a broker.
+    BrokerTrust {
+        sub: String,
+    },
+    BrokerState,
+    /// A placeholder for a session's VM to hold instead of the real key.
+    BrokerPlaceholder {
+        sid: String,
+        service: String,
+    },
+    /// An agent asking for a service it wasn't granted.
+    BrokerRequest {
+        session_token: String,
+        service: String,
+        reason: String,
+    },
+    BrokerDecide {
+        id: String,
+        approve: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        for_seconds: Option<u64>,
+    },
+    /// What a placeholder stands for; only brokers may ask.
+    BrokerResolve {
+        placeholder: String,
+        service: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -406,6 +441,12 @@ struct VaultResponse {
     sessions: Option<Vec<Session>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     session_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    broker: Option<BrokerState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request: Option<AccessRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolved: Option<Resolved>,
 }
 
 impl VaultResponse {
@@ -433,6 +474,9 @@ impl VaultResponse {
             session: None,
             sessions: None,
             session_token: None,
+            broker: None,
+            request: None,
+            resolved: None,
         }
     }
 
@@ -460,6 +504,9 @@ impl VaultResponse {
             session: None,
             sessions: None,
             session_token: None,
+            broker: None,
+            request: None,
+            resolved: None,
         }
     }
 }
@@ -846,6 +893,14 @@ async fn handle_request(
             | VaultRequest::SessionStart(_)
             | VaultRequest::Exchange(_)
             | VaultRequest::SessionRevoke { .. }
+            | VaultRequest::BrokerService(_)
+            | VaultRequest::BrokerServiceRemove { .. }
+            | VaultRequest::BrokerAllow(_)
+            | VaultRequest::BrokerDisallow(_)
+            | VaultRequest::BrokerTrust { .. }
+            | VaultRequest::BrokerPlaceholder { .. }
+            | VaultRequest::BrokerRequest { .. }
+            | VaultRequest::BrokerDecide { .. }
     ) {
         if *state.mode.lock().await == Mode::Replica {
             audit(
@@ -1094,6 +1149,90 @@ async fn handle_request(
                 Err(reason) => VaultResponse::error(reason),
             }
         }
+        VaultRequest::BrokerService(service) => {
+            update_broker(state, |b, _, _| broker::add_service(b, service), state_reply).await?
+        }
+        VaultRequest::BrokerServiceRemove { name } => {
+            update_broker(state, |b, _, _| found(broker::remove_service(b, &name)), state_reply).await?
+        }
+        VaultRequest::BrokerAllow(grant) => {
+            update_broker(state, |b, _, _| broker::allow(b, grant), state_reply).await?
+        }
+        VaultRequest::BrokerDisallow(grant) => {
+            update_broker(state, |b, _, _| found(broker::disallow(b, &grant)), state_reply).await?
+        }
+        VaultRequest::BrokerTrust { sub } => {
+            update_broker(state, |b, _, _| broker::trust(b, sub), state_reply).await?
+        }
+        VaultRequest::BrokerState => match broker::load(&*state.keys.lock().await) {
+            Ok(b) => VaultResponse {
+                broker: Some(b),
+                ..VaultResponse::ok()
+            },
+            Err(reason) => VaultResponse::error(reason),
+        },
+        VaultRequest::BrokerPlaceholder { sid, service } => {
+            let now = now_epoch_seconds()?;
+            let placeholder = harar_client::broker::new_placeholder();
+            update_broker(
+                state,
+                |b, all, keys| {
+                    match all.get(&sid) {
+                        Some(session) if session_manager(keys, peer)?.may_manage(session) => {}
+                        _ => return Err("not_found"),
+                    }
+                    broker::placeholder(b, all, &sid, &service, &placeholder, now)
+                },
+                |_, ()| VaultResponse {
+                    value: Some(placeholder.clone()),
+                    ..VaultResponse::ok()
+                },
+            )
+            .await?
+        }
+        VaultRequest::BrokerRequest { session_token, service, reason } => {
+            let now = now_epoch_seconds()?;
+            update_broker(
+                state,
+                |b, all, _| {
+                    let sid = session_from_token(state, all, &session_token, now)?;
+                    broker::request(b, all, &sid, &service, &reason, harar_client::random_id("r_"), now)
+                },
+                |_, request| VaultResponse {
+                    request: Some(request),
+                    ..VaultResponse::ok()
+                },
+            )
+            .await?
+        }
+        VaultRequest::BrokerDecide { id, approve, for_seconds } => {
+            let now = now_epoch_seconds()?;
+            update_broker(
+                state,
+                |b, all, _| broker::decide(b, all, &id, approve, for_seconds, now),
+                |_, request| VaultResponse {
+                    request: Some(request),
+                    ..VaultResponse::ok()
+                },
+            )
+            .await?
+        }
+        VaultRequest::BrokerResolve { placeholder, service } => {
+            let now = now_epoch_seconds()?;
+            let keys = state.keys.lock().await;
+            let user = peer.username.as_deref().unwrap_or_default();
+            let resolved = identity::load(&keys).and_then(|policy| {
+                let caller = policy.workloads.iter().find(|w| w.user == user).ok_or("not_a_broker")?;
+                broker::resolve(&broker::load(&keys)?, &sessions::load(&keys)?, &keys, &caller.sub, &placeholder, &service, now)
+            });
+            match resolved {
+                Ok(resolved) => VaultResponse {
+                    resolved: Some(resolved),
+                    ..VaultResponse::ok()
+                },
+                Err(reason) => VaultResponse::error(reason),
+            }
+        }
         VaultRequest::Health => {
             let keys = state.keys.lock().await;
             VaultResponse {
@@ -1270,6 +1409,38 @@ async fn session_revoke(state: &AppState, peer: &PeerCred, sid: String) -> Resul
         sessions: Some(tree),
         ..VaultResponse::ok()
     })
+}
+
+fn found(changed: bool) -> Result<(), &'static str> {
+    if changed { Ok(()) } else { Err("not_found") }
+}
+
+fn state_reply(b: &BrokerState, (): ()) -> VaultResponse {
+    VaultResponse {
+        broker: Some(b.clone()),
+        ..VaultResponse::ok()
+    }
+}
+
+/// Changes the broker's state and stores it. `change` sees the sessions and
+/// the rest of the vault; `reply` builds the answer from what it returned.
+async fn update_broker<T>(
+    state: &AppState,
+    change: impl FnOnce(&mut BrokerState, &sessions::Sessions, &HashMap<String, String>) -> Result<T, &'static str>,
+    reply: impl FnOnce(&BrokerState, T) -> VaultResponse,
+) -> Result<VaultResponse> {
+    let mut keys = state.keys.lock().await;
+    let changed = broker::load(&keys).and_then(|mut b| {
+        let all = sessions::load(&keys)?;
+        let out = change(&mut b, &all, &keys)?;
+        Ok((b, out))
+    });
+    let (b, out) = match changed {
+        Ok(changed) => changed,
+        Err(reason) => return Ok(VaultResponse::error(reason)),
+    };
+    write_entry(state, &mut keys, broker::BROKER_KEY, broker::store(&b)).await?;
+    Ok(reply(&b, out))
 }
 
 /// Stores one vault entry the way every write does: on disk, then in the
@@ -2044,6 +2215,16 @@ impl VaultRequest {
             Self::Exchange(_) => "exchange",
             Self::SessionRevoke { .. } => "session_revoke",
             Self::Sessions { .. } => "sessions",
+            Self::BrokerService(_) => "broker_service",
+            Self::BrokerServiceRemove { .. } => "broker_service_remove",
+            Self::BrokerAllow(_) => "broker_allow",
+            Self::BrokerDisallow(_) => "broker_disallow",
+            Self::BrokerTrust { .. } => "broker_trust",
+            Self::BrokerState => "broker_state",
+            Self::BrokerPlaceholder { .. } => "broker_placeholder",
+            Self::BrokerRequest { .. } => "broker_request",
+            Self::BrokerDecide { .. } => "broker_decide",
+            Self::BrokerResolve { .. } => "broker_resolve",
         }
     }
 
@@ -2064,6 +2245,16 @@ impl VaultRequest {
             Self::SessionStart(ask) => Some(&ask.sub),
             Self::Exchange(ask) => Some(&ask.audience),
             Self::SessionRevoke { sid } | Self::Sessions { sid: Some(sid) } => Some(sid),
+            Self::BrokerState => None,
+            Self::BrokerService(BrokerService { name, .. })
+            | Self::BrokerServiceRemove { name }
+            | Self::BrokerAllow(BrokerGrant { service: name, .. })
+            | Self::BrokerDisallow(BrokerGrant { service: name, .. })
+            | Self::BrokerPlaceholder { service: name, .. }
+            | Self::BrokerRequest { service: name, .. }
+            | Self::BrokerResolve { service: name, .. } => Some(name),
+            Self::BrokerTrust { sub } => Some(sub),
+            Self::BrokerDecide { id, .. } => Some(id),
             Self::Token(ask) => Some(&ask.audience),
             Self::WorkloadAdd(Workload { sub, .. })
             | Self::Grant(Grant { sub, .. })
@@ -2085,6 +2276,24 @@ fn authorize(peer: &PeerCred, request: &VaultRequest) -> Decision {
         | VaultRequest::Exchange(_)
         | VaultRequest::SessionRevoke { .. }
         | VaultRequest::Sessions { .. } => Decision::Allow,
+        VaultRequest::BrokerService(_)
+        | VaultRequest::BrokerServiceRemove { .. }
+        | VaultRequest::BrokerAllow(_)
+        | VaultRequest::BrokerDisallow(_)
+        | VaultRequest::BrokerTrust { .. }
+        | VaultRequest::BrokerState
+        | VaultRequest::BrokerDecide { .. } => {
+            if is_admin(peer) {
+                Decision::Allow
+            } else {
+                Decision::Deny("forbidden")
+            }
+        }
+        // Decided in the handler: by session manager, session token, or
+        // broker trust.
+        VaultRequest::BrokerPlaceholder { .. }
+        | VaultRequest::BrokerRequest { .. }
+        | VaultRequest::BrokerResolve { .. } => Decision::Allow,
         VaultRequest::WorkloadAdd(_)
         | VaultRequest::WorkloadRemove { .. }
         | VaultRequest::Grant(_)

@@ -11,6 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
+pub mod broker;
 pub mod oidc;
 
 const DEFAULT_SOCKET_PATH: &str = "/run/tana-vault.sock";
@@ -319,6 +320,35 @@ enum VaultRequest<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         sid: Option<&'a str>,
     },
+    BrokerService(&'a broker::BrokerService),
+    BrokerServiceRemove {
+        name: &'a str,
+    },
+    BrokerAllow(&'a broker::BrokerGrant),
+    BrokerDisallow(&'a broker::BrokerGrant),
+    BrokerTrust {
+        sub: &'a str,
+    },
+    BrokerState,
+    BrokerPlaceholder {
+        sid: &'a str,
+        service: &'a str,
+    },
+    BrokerRequest {
+        session_token: &'a str,
+        service: &'a str,
+        reason: &'a str,
+    },
+    BrokerDecide {
+        id: &'a str,
+        approve: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        for_seconds: Option<u64>,
+    },
+    BrokerResolve {
+        placeholder: &'a str,
+        service: &'a str,
+    },
 }
 
 /// What `exchange` hands back to the child.
@@ -354,6 +384,9 @@ struct VaultResponse {
     session: Option<oidc::Session>,
     sessions: Option<Vec<oidc::Session>>,
     session_token: Option<String>,
+    broker: Option<broker::BrokerState>,
+    request: Option<broker::AccessRequest>,
+    resolved: Option<broker::Resolved>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -822,6 +855,79 @@ impl VaultClient {
     /// The caller's sessions, or the tree under `sid`.
     pub async fn sessions(&self, sid: Option<&str>) -> Result<Vec<oidc::Session>, VaultClientError> {
         self.sessions_request(&VaultRequest::Sessions { sid }).await
+    }
+
+    pub async fn broker_service(&self, service: &broker::BrokerService) -> Result<broker::BrokerState, VaultClientError> {
+        self.broker_state_request(&VaultRequest::BrokerService(service)).await
+    }
+
+    pub async fn broker_service_remove(&self, name: &str) -> Result<broker::BrokerState, VaultClientError> {
+        self.broker_state_request(&VaultRequest::BrokerServiceRemove { name }).await
+    }
+
+    pub async fn broker_allow(&self, grant: &broker::BrokerGrant) -> Result<broker::BrokerState, VaultClientError> {
+        self.broker_state_request(&VaultRequest::BrokerAllow(grant)).await
+    }
+
+    pub async fn broker_disallow(&self, grant: &broker::BrokerGrant) -> Result<broker::BrokerState, VaultClientError> {
+        self.broker_state_request(&VaultRequest::BrokerDisallow(grant)).await
+    }
+
+    /// Lets the workload `sub` resolve placeholders.
+    pub async fn broker_trust(&self, sub: &str) -> Result<broker::BrokerState, VaultClientError> {
+        self.broker_state_request(&VaultRequest::BrokerTrust { sub }).await
+    }
+
+    pub async fn broker_state(&self) -> Result<broker::BrokerState, VaultClientError> {
+        self.broker_state_request(&VaultRequest::BrokerState).await
+    }
+
+    /// A placeholder for `service` in session `sid`, to hand to its VM.
+    pub async fn broker_placeholder(&self, sid: &str, service: &str) -> Result<String, VaultClientError> {
+        self.identity_request(&VaultRequest::BrokerPlaceholder { sid, service }, "broker_failed")
+            .await?
+            .value
+            .ok_or_else(|| VaultClientError::InvalidResponse("missing placeholder".to_string()))
+    }
+
+    pub async fn broker_request(
+        &self,
+        session_token: &str,
+        service: &str,
+        reason: &str,
+    ) -> Result<broker::AccessRequest, VaultClientError> {
+        self.access_request(&VaultRequest::BrokerRequest { session_token, service, reason }).await
+    }
+
+    pub async fn broker_decide(
+        &self,
+        id: &str,
+        approve: bool,
+        for_seconds: Option<u64>,
+    ) -> Result<broker::AccessRequest, VaultClientError> {
+        self.access_request(&VaultRequest::BrokerDecide { id, approve, for_seconds }).await
+    }
+
+    /// What a placeholder stands for. Only a trusted broker may ask.
+    pub async fn broker_resolve(&self, placeholder: &str, service: &str) -> Result<broker::Resolved, VaultClientError> {
+        self.identity_request(&VaultRequest::BrokerResolve { placeholder, service }, "broker_failed")
+            .await?
+            .resolved
+            .ok_or_else(|| VaultClientError::InvalidResponse("missing resolution".to_string()))
+    }
+
+    async fn broker_state_request(&self, request: &VaultRequest<'_>) -> Result<broker::BrokerState, VaultClientError> {
+        self.identity_request(request, "broker_failed")
+            .await?
+            .broker
+            .ok_or_else(|| VaultClientError::InvalidResponse("missing broker state".to_string()))
+    }
+
+    async fn access_request(&self, request: &VaultRequest<'_>) -> Result<broker::AccessRequest, VaultClientError> {
+        self.identity_request(request, "broker_failed")
+            .await?
+            .request
+            .ok_or_else(|| VaultClientError::InvalidResponse("missing request".to_string()))
     }
 
     async fn sessions_request(&self, request: &VaultRequest<'_>) -> Result<Vec<oidc::Session>, VaultClientError> {

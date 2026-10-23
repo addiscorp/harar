@@ -270,7 +270,7 @@ fn parse_session_grant(value: &str) -> Result<SessionGrant> {
     })
 }
 
-fn parse_duration(value: &str) -> Result<u64> {
+pub(crate) fn parse_duration(value: &str) -> Result<u64> {
     let (digits, unit) = match value.find(|c: char| !c.is_ascii_digit()) {
         Some(at) => value.split_at(at),
         None => (value, "s"),
