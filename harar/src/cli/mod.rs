@@ -13,6 +13,7 @@ pub mod proxy;
 pub mod put;
 pub mod revoke;
 pub mod run;
+pub mod runs;
 pub mod secret_input;
 pub mod serve;
 pub mod setup;
@@ -52,6 +53,8 @@ enum Command {
     Broker(broker::BrokerCmd),
     Request(broker::Request),
     Approvals(broker::Approvals),
+    Env(runs::EnvCmd),
+    Runs(runs::RunsCmd),
     Mint(mint::Mint),
     Verify(verify::Verify),
     Revoke(revoke::Revoke),
@@ -100,6 +103,8 @@ pub async fn run() -> anyhow::Result<()> {
         Command::Broker(cmd) => broker::broker(cmd).await,
         Command::Request(cmd) => broker::request(cmd).await,
         Command::Approvals(cmd) => broker::approvals(cmd).await,
+        Command::Env(cmd) => runs::env(cmd).await,
+        Command::Runs(cmd) => runs::runs(cmd).await,
         Command::Mint(cmd) => mint::run(cmd).await,
         Command::Verify(cmd) => verify::run(cmd).await,
         Command::Revoke(cmd) => revoke::run(cmd).await,

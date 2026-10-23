@@ -7,6 +7,7 @@ use harar_client::{
     verify_token,
 };
 use harar_client::broker::{AccessRequest, BrokerGrant, BrokerService, BrokerState, Resolved};
+use harar_client::runs::{EnvRule, Run, RunRegisterAsk, RunsState};
 use harar_client::oidc::{
     self, Alg, ExchangeAsk, Grant, IdentityClaims, IdentityPolicy, IdentityRequest, Session, SessionGrant,
     SessionStartAsk, TokenAsk, Workload,
@@ -31,6 +32,7 @@ mod cli;
 mod dotenv;
 mod identity;
 mod mask;
+mod runs;
 mod screen;
 mod sessions;
 mod ssh;
@@ -394,6 +396,30 @@ enum VaultRequest {
         placeholder: String,
         service: String,
     },
+    EnvRule(EnvRule),
+    EnvRuleRemove {
+        name: String,
+    },
+    RunRegister(RunRegisterAsk),
+    /// A run's build secrets, for the holder of its run token.
+    RunSecrets {
+        run_token: String,
+        env: String,
+    },
+    /// A token for a run to present to a service, such as simien.
+    RunToken {
+        run_token: String,
+        audience: String,
+    },
+    RunDecide {
+        id: String,
+        approve: bool,
+    },
+    RunFinish {
+        id: String,
+    },
+    /// Env rules and the runs the caller may see.
+    Runs,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -447,6 +473,14 @@ struct VaultResponse {
     request: Option<AccessRequest>,
     #[serde(skip_serializing_if = "Option::is_none")]
     resolved: Option<Resolved>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run: Option<Run>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runs: Option<RunsState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secrets: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_token: Option<String>,
 }
 
 impl VaultResponse {
@@ -477,6 +511,10 @@ impl VaultResponse {
             broker: None,
             request: None,
             resolved: None,
+            run: None,
+            runs: None,
+            secrets: None,
+            run_token: None,
         }
     }
 
@@ -507,6 +545,10 @@ impl VaultResponse {
             broker: None,
             request: None,
             resolved: None,
+            run: None,
+            runs: None,
+            secrets: None,
+            run_token: None,
         }
     }
 }
@@ -901,6 +943,13 @@ async fn handle_request(
             | VaultRequest::BrokerPlaceholder { .. }
             | VaultRequest::BrokerRequest { .. }
             | VaultRequest::BrokerDecide { .. }
+            | VaultRequest::EnvRule(_)
+            | VaultRequest::EnvRuleRemove { .. }
+            | VaultRequest::RunRegister(_)
+            | VaultRequest::RunSecrets { .. }
+            | VaultRequest::RunToken { .. }
+            | VaultRequest::RunDecide { .. }
+            | VaultRequest::RunFinish { .. }
     ) {
         if *state.mode.lock().await == Mode::Replica {
             audit(
@@ -1233,6 +1282,98 @@ async fn handle_request(
                 Err(reason) => VaultResponse::error(reason),
             }
         }
+        VaultRequest::EnvRule(rule) => {
+            update_runs(state, |r, _| runs::set_rule(r, rule), runs_reply).await?
+        }
+        VaultRequest::EnvRuleRemove { name } => {
+            update_runs(state, |r, _| found(runs::remove_rule(r, &name)), runs_reply).await?
+        }
+        VaultRequest::RunRegister(ask) => {
+            let now = now_epoch_seconds()?;
+            let user = peer.username.as_deref().unwrap_or_default().to_string();
+            update_runs(
+                state,
+                |r, keys| {
+                    let run = runs::register(&identity::load(keys)?, r, &user, &ask, harar_client::random_id("run_"), now)?;
+                    let mut request = runs::run_identity(&run, now);
+                    request.aud = state.issuer.url().to_string();
+                    let token = issue(state, &request, now)?;
+                    Ok((run, token))
+                },
+                |_, (run, token)| VaultResponse {
+                    run: Some(run),
+                    run_token: Some(token),
+                    ..VaultResponse::ok()
+                },
+            )
+            .await?
+        }
+        VaultRequest::RunSecrets { run_token, env } => {
+            let now = now_epoch_seconds()?;
+            update_runs_always(state, |r, keys| {
+                let id = run_from_token(state, r, &run_token, now)?;
+                runs::secrets(r, keys, &id, &env, now)
+            })
+            .await?
+            .map_or_else(VaultResponse::error, |secrets| VaultResponse {
+                secrets: Some(secrets),
+                ..VaultResponse::ok()
+            })
+        }
+        VaultRequest::RunToken { run_token, audience } => {
+            let now = now_epoch_seconds()?;
+            update_runs_always(state, |r, _| {
+                let id = run_from_token(state, r, &run_token, now)?;
+                let request = runs::token(r, &id, &audience, now)?;
+                state.issuer.issue(&request, Alg::ES256, now).map_err(|err| token_error_code(&err))
+            })
+            .await?
+            .map_or_else(VaultResponse::error, |(token, claims)| VaultResponse {
+                token: Some(token),
+                claims: Some(claims),
+                ..VaultResponse::ok()
+            })
+        }
+        VaultRequest::RunDecide { id, approve } => {
+            update_runs(state, |r, _| runs::decide(r, &id, approve), |_, run| VaultResponse {
+                run: Some(run),
+                ..VaultResponse::ok()
+            })
+            .await?
+        }
+        VaultRequest::RunFinish { id } => {
+            let now = now_epoch_seconds()?;
+            update_runs(
+                state,
+                |r, keys| {
+                    let manager = session_manager(keys, peer)?;
+                    match r.runs.get(&id) {
+                        Some(run) if manager.may_manage_run(run) => runs::finish(r, &id, now),
+                        _ => Err("not_found"),
+                    }
+                },
+                |_, run| VaultResponse {
+                    run: Some(run),
+                    ..VaultResponse::ok()
+                },
+            )
+            .await?
+        }
+        VaultRequest::Runs => {
+            let keys = state.keys.lock().await;
+            let visible = runs::load(&keys).and_then(|mut r| {
+                let manager = session_manager(&keys, peer)?;
+                r.runs.retain(|_, run| manager.may_manage_run(run));
+                Ok(r)
+            });
+            match visible {
+                Ok(r) => VaultResponse {
+                    runs: Some(r),
+                    ..VaultResponse::ok()
+                },
+                Err(reason) => VaultResponse::error(reason),
+            }
+        }
         VaultRequest::Health => {
             let keys = state.keys.lock().await;
             VaultResponse {
@@ -1270,6 +1411,85 @@ impl SessionManager {
             Self::Workload(sub) => &session.started_by == sub,
         }
     }
+
+    fn may_manage_run(&self, run: &Run) -> bool {
+        match self {
+            Self::Admin => true,
+            Self::Workload(sub) => &run.registered_by == sub,
+        }
+    }
+}
+
+fn issue(state: &AppState, request: &IdentityRequest, now: u64) -> Result<String, &'static str> {
+    state
+        .issuer
+        .issue(request, Alg::ES256, now)
+        .map(|(token, _)| token)
+        .map_err(|err| token_error_code(&err))
+}
+
+/// Claims of a token this issuer signed for itself (session and run tokens).
+fn own_token_claims(state: &AppState, token: &str, now: u64) -> Option<IdentityClaims> {
+    oidc::verify_identity(&state.issuer.jwks(), token, state.issuer.url(), state.issuer.url(), now).ok()
+}
+
+/// The run a run token speaks for.
+fn run_from_token(state: &AppState, all: &RunsState, token: &str, now: u64) -> Result<String, &'static str> {
+    let claims = own_token_claims(state, token, now).ok_or("invalid_run_token")?;
+    let id = claims
+        .extra
+        .get(harar_client::runs::RUN_CLAIM)
+        .and_then(|id| id.as_str())
+        .ok_or("invalid_run_token")?;
+    match all.runs.get(id) {
+        Some(run) if run.facts.subject() == claims.sub => Ok(id.to_string()),
+        _ => Err("invalid_run_token"),
+    }
+}
+
+fn runs_reply(r: &RunsState, (): ()) -> VaultResponse {
+    VaultResponse {
+        runs: Some(r.clone()),
+        ..VaultResponse::ok()
+    }
+}
+
+/// Changes runs and env rules, saving only when `change` succeeds.
+async fn update_runs<T>(
+    state: &AppState,
+    change: impl FnOnce(&mut RunsState, &HashMap<String, String>) -> Result<T, &'static str>,
+    reply: impl FnOnce(&RunsState, T) -> VaultResponse,
+) -> Result<VaultResponse> {
+    let mut keys = state.keys.lock().await;
+    let changed = runs::load(&keys).and_then(|mut r| {
+        let out = change(&mut r, &keys)?;
+        Ok((r, out))
+    });
+    let (r, out) = match changed {
+        Ok(changed) => changed,
+        Err(reason) => return Ok(VaultResponse::error(reason)),
+    };
+    write_entry(state, &mut keys, runs::RUNS_KEY, runs::store(&r)).await?;
+    Ok(reply(&r, out))
+}
+
+/// Like `update_runs`, but saves whatever `change` returns: asking for
+/// secrets can mark a run pending even when the answer is no.
+async fn update_runs_always<T>(
+    state: &AppState,
+    change: impl FnOnce(&mut RunsState, &HashMap<String, String>) -> Result<T, &'static str>,
+) -> Result<Result<T, &'static str>> {
+    let mut keys = state.keys.lock().await;
+    let mut r = match runs::load(&keys) {
+        Ok(r) => r,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let before = r.clone();
+    let out = change(&mut r, &keys);
+    if r != before {
+        write_entry(state, &mut keys, runs::RUNS_KEY, runs::store(&r)).await?;
+    }
+    Ok(out)
 }
 
 fn session_manager(keys: &HashMap<String, String>, peer: &PeerCred) -> Result<SessionManager, &'static str> {
@@ -1315,8 +1535,7 @@ fn session_from_token(
     token: &str,
     now: u64,
 ) -> Result<String, &'static str> {
-    let claims = oidc::verify_identity(&state.issuer.jwks(), token, state.issuer.url(), state.issuer.url(), now)
-        .map_err(|_| "invalid_session_token")?;
+    let claims = own_token_claims(state, token, now).ok_or("invalid_session_token")?;
     let sid = claims
         .extra
         .get(oidc::SID_CLAIM)
@@ -2225,6 +2444,14 @@ impl VaultRequest {
             Self::BrokerRequest { .. } => "broker_request",
             Self::BrokerDecide { .. } => "broker_decide",
             Self::BrokerResolve { .. } => "broker_resolve",
+            Self::EnvRule(_) => "env_rule",
+            Self::EnvRuleRemove { .. } => "env_rule_remove",
+            Self::RunRegister(_) => "run_register",
+            Self::RunSecrets { .. } => "run_secrets",
+            Self::RunToken { .. } => "run_token",
+            Self::RunDecide { .. } => "run_decide",
+            Self::RunFinish { .. } => "run_finish",
+            Self::Runs => "runs",
         }
     }
 
@@ -2255,6 +2482,12 @@ impl VaultRequest {
             | Self::BrokerResolve { service: name, .. } => Some(name),
             Self::BrokerTrust { sub } => Some(sub),
             Self::BrokerDecide { id, .. } => Some(id),
+            Self::EnvRule(EnvRule { name, .. }) | Self::EnvRuleRemove { name } => Some(name),
+            Self::RunRegister(ask) => Some(&ask.facts.repo),
+            Self::RunSecrets { env, .. } => Some(env),
+            Self::RunToken { audience, .. } => Some(audience),
+            Self::RunDecide { id, .. } | Self::RunFinish { id } => Some(id),
+            Self::Runs => None,
             Self::Token(ask) => Some(&ask.audience),
             Self::WorkloadAdd(Workload { sub, .. })
             | Self::Grant(Grant { sub, .. })
@@ -2294,6 +2527,20 @@ fn authorize(peer: &PeerCred, request: &VaultRequest) -> Decision {
         VaultRequest::BrokerPlaceholder { .. }
         | VaultRequest::BrokerRequest { .. }
         | VaultRequest::BrokerResolve { .. } => Decision::Allow,
+        VaultRequest::EnvRule(_) | VaultRequest::EnvRuleRemove { .. } | VaultRequest::RunDecide { .. } => {
+            if is_admin(peer) {
+                Decision::Allow
+            } else {
+                Decision::Deny("forbidden")
+            }
+        }
+        // Decided in the handler: by the registering workload, or the run
+        // token presented.
+        VaultRequest::RunRegister(_)
+        | VaultRequest::RunSecrets { .. }
+        | VaultRequest::RunToken { .. }
+        | VaultRequest::RunFinish { .. }
+        | VaultRequest::Runs => Decision::Allow,
         VaultRequest::WorkloadAdd(_)
         | VaultRequest::WorkloadRemove { .. }
         | VaultRequest::Grant(_)

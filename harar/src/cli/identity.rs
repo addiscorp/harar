@@ -76,6 +76,9 @@ enum WorkloadAction {
         /// Subjects it may start sessions for, such as 'agent:*' (may repeat).
         #[arg(long = "sessions-for")]
         sessions_for: Vec<String>,
+        /// Repos it may register CI runs for, such as 'addiscorp/*' (may repeat).
+        #[arg(long = "runs-for")]
+        runs_for: Vec<String>,
     },
     /// Remove a workload and everything granted to it.
     Remove { sub: String },
@@ -85,8 +88,8 @@ enum WorkloadAction {
 pub async fn workload(cmd: WorkloadCmd) -> Result<()> {
     let client = VaultClient::from_socket_path(cmd.socket.socket);
     let policy = match cmd.action {
-        WorkloadAction::Add { sub, user, sessions_for } => {
-            client.workload_add(&Workload { sub, user, sessions_for }).await?
+        WorkloadAction::Add { sub, user, sessions_for, runs_for } => {
+            client.workload_add(&Workload { sub, user, sessions_for, runs_for }).await?
         }
         WorkloadAction::Remove { sub } => client.workload_remove(&sub).await?,
         WorkloadAction::List => client.identity().await?,

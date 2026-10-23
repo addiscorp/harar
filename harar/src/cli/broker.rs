@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use harar_client::VaultClient;
 use harar_client::broker::{BrokerGrant, BrokerService, RequestStatus};
+use harar_client::runs::Approval;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -136,7 +137,8 @@ pub async fn request(cmd: Request) -> Result<()> {
     print_json(&asked)
 }
 
-/// Requests from agents for services they weren't granted.
+/// What agents are waiting on: requests for services they weren't granted
+/// (`r_…`), and runs they started that need a person (`run_…`).
 #[derive(Debug, Args)]
 pub struct Approvals {
     #[command(flatten)]
@@ -149,7 +151,8 @@ pub struct Approvals {
 enum ApprovalAction {
     /// Pending requests.
     List,
-    /// Grant a request to that session only, for --for (default 1h).
+    /// Grant a request to that session only, for --for (default 1h), or let a
+    /// run have its environment.
     Approve {
         id: String,
         #[arg(long = "for", value_parser = parse_duration)]
@@ -163,10 +166,26 @@ pub async fn approvals(cmd: Approvals) -> Result<()> {
     match cmd.action {
         ApprovalAction::List => {
             let state = client.broker_state().await?;
-            let pending: Vec<_> = state.requests.values().filter(|r| r.status == RequestStatus::Pending).collect();
+            let mut pending: Vec<serde_json::Value> = state
+                .requests
+                .values()
+                .filter(|r| r.status == RequestStatus::Pending)
+                .map(serde_json::to_value)
+                .collect::<Result<_, _>>()?;
+            let runs = client.runs().await?;
+            for run in runs.runs.values().filter(|run| run.approval == Some(Approval::Pending)) {
+                pending.push(serde_json::to_value(run)?);
+            }
             print_json(&pending)
         }
+        ApprovalAction::Approve { id, for_seconds } if id.starts_with("run_") => {
+            if for_seconds.is_some() {
+                return Err(anyhow::anyhow!("a run is approved for as long as it runs; drop --for"));
+            }
+            print_json(&client.run_decide(&id, true).await?)
+        }
         ApprovalAction::Approve { id, for_seconds } => print_json(&client.broker_decide(&id, true, for_seconds).await?),
+        ApprovalAction::Deny { id } if id.starts_with("run_") => print_json(&client.run_decide(&id, false).await?),
         ApprovalAction::Deny { id } => print_json(&client.broker_decide(&id, false, None).await?),
     }
 }
