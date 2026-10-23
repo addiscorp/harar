@@ -61,7 +61,7 @@ pub(crate) fn load_master_key_file(path: &Path) -> Result<age::x25519::Identity>
         Ok(contents) => contents,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Err(anyhow!(
-                "missing harar master key at {}; create one with `age-keygen -o {}` (mode 0600) before starting harar",
+                "missing harar master key at {}; create one with `age-keygen -o {}` and `chmod 0400` it before starting harar",
                 path.display(),
                 path.display()
             ));
