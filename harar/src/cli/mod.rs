@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 pub mod agent;
 pub mod get;
+pub mod identity;
 pub mod jwks;
 pub mod key;
 pub mod mint;
@@ -42,6 +43,9 @@ enum Command {
     Ssh(ssh::Ssh),
     Get(get::Get),
     Put(put::Put),
+    Token(identity::Token),
+    Workload(identity::WorkloadCmd),
+    Policy(identity::PolicyCmd),
     Mint(mint::Mint),
     Verify(verify::Verify),
     Revoke(revoke::Revoke),
@@ -82,6 +86,9 @@ pub async fn run() -> anyhow::Result<()> {
         Command::Ssh(cmd) => ssh::run(cmd).await,
         Command::Get(cmd) => get::run(cmd).await,
         Command::Put(cmd) => put::run(cmd).await,
+        Command::Token(cmd) => identity::token(cmd).await,
+        Command::Workload(cmd) => identity::workload(cmd).await,
+        Command::Policy(cmd) => identity::policy(cmd).await,
         Command::Mint(cmd) => mint::run(cmd).await,
         Command::Verify(cmd) => verify::run(cmd).await,
         Command::Revoke(cmd) => revoke::run(cmd).await,

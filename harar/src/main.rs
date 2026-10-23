@@ -3,9 +3,10 @@ use anyhow::{Context, Result, anyhow};
 use harar_client::VaultClient;
 use harar_client::{
     HararTokenTemplate, MintTokenRequest, MintedToken, TokenError, generate_signing_key,
-    jwks_for_key, mint_token, signing_key_bytes, signing_key_from_bytes, validate_token_bindings,
+    mint_token, signing_key_bytes, signing_key_from_bytes, validate_token_bindings,
     verify_token,
 };
+use harar_client::oidc::{self, Alg, Grant, IdentityClaims, IdentityPolicy, TokenAsk, Workload};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -16,13 +17,14 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UnixListener, UnixStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
 mod agent;
 mod cli;
 mod dotenv;
+mod identity;
 mod mask;
 mod screen;
 mod ssh;
@@ -36,6 +38,10 @@ const DEFAULT_STATE_PATH: &str = "/var/lib/harar/keys.age";
 const DEFAULT_AUDIT_LOG_PATH: &str = "/var/log/harar.log";
 const DEFAULT_REPLICATION_TOKEN_PATH: &str = "/etc/gild/vault-replication-token";
 const DEFAULT_SIGNING_KEY_PATH: &str = "/var/lib/harar/harar-signing.key";
+const DEFAULT_ES256_KEY_PATH: &str = "/var/lib/harar/harar-es256.key";
+/// Where harar says its tokens come from. id.simien.dev is planned; until it
+/// exists, set HARAR_ISSUER to wherever the discovery document is served.
+const DEFAULT_ISSUER: &str = "https://id.simien.dev";
 const DEFAULT_HEARTBEAT_INTERVAL_SECONDS: u64 = 5;
 const DEFAULT_SYNC_INTERVAL_SECONDS: u64 = 30;
 const DEFAULT_PROMOTE_AFTER_FAILURES: u32 = 5;
@@ -56,6 +62,10 @@ struct Config {
     upstream_url: Option<String>,
     replication_token_path: PathBuf,
     signing_key_path: PathBuf,
+    es256_key_path: PathBuf,
+    issuer_url: String,
+    /// A TCP address serving only the discovery document and JWKS.
+    public_listen: Option<String>,
     heartbeat_interval: Duration,
     sync_interval: Duration,
     promote_after_failures: u32,
@@ -74,6 +84,9 @@ impl Config {
                 DEFAULT_REPLICATION_TOKEN_PATH,
             ),
             signing_key_path: env_path("HARAR_SIGNING_KEY_PATH", DEFAULT_SIGNING_KEY_PATH),
+            es256_key_path: env_path("HARAR_ES256_KEY_PATH", DEFAULT_ES256_KEY_PATH),
+            issuer_url: std::env::var("HARAR_ISSUER").unwrap_or_else(|_| DEFAULT_ISSUER.to_string()),
+            public_listen: std::env::var("HARAR_PUBLIC_LISTEN").ok(),
             heartbeat_interval: Duration::from_secs(env_u64(
                 "GILD_VAULT_HEARTBEAT_SECONDS",
                 DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
@@ -124,6 +137,21 @@ impl Config {
                 "--signing-key-file" => {
                     if let Some(value) = args.next() {
                         config.signing_key_path = PathBuf::from(value);
+                    }
+                }
+                "--es256-key-file" => {
+                    if let Some(value) = args.next() {
+                        config.es256_key_path = PathBuf::from(value);
+                    }
+                }
+                "--issuer" => {
+                    if let Some(value) = args.next() {
+                        config.issuer_url = value;
+                    }
+                }
+                "--public-listen" => {
+                    if let Some(value) = args.next() {
+                        config.public_listen = Some(value);
                     }
                 }
                 "--heartbeat-seconds" => {
@@ -189,7 +217,7 @@ struct AppState {
     fenced: Mutex<bool>,
     replication_log: Mutex<Vec<ReplicationLogEntry>>,
     replication_token: String,
-    signing_key: ed25519_dalek::SigningKey,
+    issuer: oidc::Issuer,
 }
 
 /// This record is intentionally stored separately from generic vault keys.
@@ -299,6 +327,19 @@ enum VaultRequest {
         jti: String,
     },
     Health,
+    /// An identity token for the calling workload.
+    Token(TokenAsk),
+    WorkloadAdd(Workload),
+    WorkloadRemove {
+        sub: String,
+    },
+    Grant(Grant),
+    Ungrant {
+        sub: String,
+        audience: String,
+    },
+    /// The issuer's workloads and grants.
+    Identity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -336,6 +377,10 @@ struct VaultResponse {
     valid: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sub: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claims: Option<IdentityClaims>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity: Option<IdentityPolicy>,
 }
 
 impl VaultResponse {
@@ -358,6 +403,8 @@ impl VaultResponse {
             scopes: None,
             valid: None,
             sub: None,
+            claims: None,
+            identity: None,
         }
     }
 
@@ -380,6 +427,8 @@ impl VaultResponse {
             scopes: None,
             valid: None,
             sub: None,
+            claims: None,
+            identity: None,
         }
     }
 }
@@ -430,6 +479,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
     let replication_log = load_replication_log(&replication_log_path)?;
     let replication_token = load_replication_token(&config.replication_token_path)?;
     let signing_key = load_or_create_signing_key(&config.signing_key_path)?;
+    let es256_key = load_or_create_es256_key(&config.es256_key_path)?;
+    let issuer = oidc::Issuer::new(config.issuer_url.clone(), es256_key, signing_key);
     let state = Arc::new(AppState {
         keys: Mutex::new(keys),
         once_records: Mutex::new(once_records),
@@ -447,7 +498,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
         fenced: Mutex::new(meta.fenced),
         replication_log: Mutex::new(replication_log),
         replication_token,
-        signing_key,
+        issuer,
     });
 
     if config.mode == Mode::Replica {
@@ -480,6 +531,13 @@ async fn serve(config: Config, state: Arc<AppState>) -> Result<()> {
     };
 
     eprintln!("harar listening on {}", config.socket_path.display());
+    if let Some(address) = &config.public_listen {
+        let public = TcpListener::bind(address)
+            .await
+            .with_context(|| format!("bind public listener {address}"))?;
+        eprintln!("harar serving discovery and JWKS on {address} as {}", state.issuer.url());
+        tokio::spawn(serve_public(public, Arc::clone(&state)));
+    }
 
     loop {
         let (stream, _) = listener.accept().await.context("accept unix connection")?;
@@ -573,9 +631,8 @@ async fn handle_http_request(
         return Ok(HttpReply::json_error(405, "method not allowed"));
     }
 
-    if request.path == "/v1/jwks" {
-        let jwks = jwks_for_key(&state.signing_key.verifying_key());
-        return Ok(HttpReply::json_value(200, serde_json::to_value(jwks)?));
+    if let Some(reply) = public_reply(state, &request)? {
+        return Ok(reply);
     }
 
     let Some(key) = request
@@ -609,6 +666,55 @@ async fn handle_http_request(
         (false, _, Some(error)) => Ok(HttpReply::json_error(500, error)),
         _ => Ok(HttpReply::json_error(500, "invalid response")),
     }
+}
+
+/// What anyone may fetch: the discovery document and the JWKS. This is all
+/// the public listener serves.
+fn public_reply(state: &AppState, request: &HttpRequest) -> Result<Option<HttpReply>> {
+    let body = match request.path.as_str() {
+        oidc::DISCOVERY_PATH => state.issuer.discovery(),
+        oidc::JWKS_PATH | "/v1/jwks" => serde_json::to_value(state.issuer.jwks())?,
+        _ => return Ok(None),
+    };
+    Ok(Some(HttpReply::json_value(200, body)))
+}
+
+async fn serve_public(listener: TcpListener, state: Arc<AppState>) {
+    loop {
+        let Ok((mut stream, _)) = listener.accept().await else { continue };
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let head = tokio::time::timeout(Duration::from_secs(10), read_http_head(&mut stream)).await;
+            let reply = match head.map_err(anyhow::Error::from).and_then(|head| parse_http_request(&head?)) {
+                Ok(request) if request.method == "GET" => {
+                    public_reply(&state, &request).unwrap_or(None).unwrap_or_else(|| HttpReply::json_error(404, "not found"))
+                }
+                Ok(_) => HttpReply::json_error(405, "method not allowed"),
+                Err(_) => HttpReply::json_error(400, "bad request"),
+            };
+            if let Err(err) = write_http_json(&mut stream, reply.status, reply.body).await {
+                eprintln!("harar public listener error: {err:#}");
+            }
+        });
+    }
+}
+
+/// Reads up to the blank line ending an HTTP request's headers. Browsers and
+/// curl keep the connection open, so EOF can't be the signal.
+async fn read_http_head(stream: &mut (impl AsyncRead + Unpin)) -> Result<Vec<u8>> {
+    let mut head = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+        if head.len() > MAX_REQUEST_BYTES {
+            return Err(anyhow!("HTTP request head too large"));
+        }
+        let read = stream.read(&mut chunk).await.context("read request")?;
+        if read == 0 {
+            break;
+        }
+        head.extend_from_slice(&chunk[..read]);
+    }
+    Ok(head)
 }
 
 async fn handle_replication_http_request(
@@ -698,6 +804,10 @@ async fn handle_request(
             | VaultRequest::StageOnce { .. }
             | VaultRequest::ConsumeOnce { .. }
             | VaultRequest::PurgeOnce { .. }
+            | VaultRequest::WorkloadAdd(_)
+            | VaultRequest::WorkloadRemove { .. }
+            | VaultRequest::Grant(_)
+            | VaultRequest::Ungrant { .. }
     ) {
         if *state.mode.lock().await == Mode::Replica {
             audit(
@@ -786,7 +896,7 @@ async fn handle_request(
             run_id,
             ttl_seconds,
         } => match mint_token(
-            &state.signing_key,
+            state.issuer.ed25519(),
             &MintTokenRequest {
                 template,
                 subject,
@@ -817,7 +927,7 @@ async fn handle_request(
             subject,
             run_id,
         } => {
-            let jwks = jwks_for_key(&state.signing_key.verifying_key());
+            let jwks = state.issuer.jwks();
             match verify_token(&jwks, &token, &audience, now_epoch_seconds()?) {
                 Ok(claims) => {
                     let validation =
@@ -860,6 +970,44 @@ async fn handle_request(
                 VaultResponse::ok()
             }
         }
+        VaultRequest::Token(ask) => {
+            let user = peer.username.as_deref().unwrap_or_default();
+            let decided = identity::load(&*state.keys.lock().await)
+                .and_then(|policy| identity::decide(&policy, user, &ask));
+            match decided {
+                Err(reason) => VaultResponse::error(reason),
+                Ok(request) => {
+                    let alg = ask.alg.unwrap_or(Alg::ES256);
+                    match state.issuer.issue(&request, alg, now_epoch_seconds()?) {
+                        Ok((token, claims)) => VaultResponse {
+                            token: Some(token),
+                            claims: Some(claims),
+                            ..VaultResponse::ok()
+                        },
+                        Err(err) => VaultResponse::error(token_error_code(&err)),
+                    }
+                }
+            }
+        }
+        VaultRequest::WorkloadAdd(workload) => {
+            update_identity(state, |policy| identity::add_workload(policy, workload).map(|()| true)).await?
+        }
+        VaultRequest::WorkloadRemove { sub } => {
+            update_identity(state, |policy| Ok(identity::remove_workload(policy, &sub))).await?
+        }
+        VaultRequest::Grant(grant) => {
+            update_identity(state, |policy| identity::grant(policy, grant).map(|()| true)).await?
+        }
+        VaultRequest::Ungrant { sub, audience } => {
+            update_identity(state, |policy| Ok(identity::ungrant(policy, &sub, &audience))).await?
+        }
+        VaultRequest::Identity => match identity::load(&*state.keys.lock().await) {
+            Ok(policy) => VaultResponse {
+                identity: Some(policy),
+                ..VaultResponse::ok()
+            },
+            Err(reason) => VaultResponse::error(reason),
+        },
         VaultRequest::Health => {
             let keys = state.keys.lock().await;
             VaultResponse {
@@ -881,6 +1029,32 @@ async fn handle_request(
     };
     audit(state, op, key_for_audit.as_deref(), peer, result)?;
     Ok(response)
+}
+
+/// Changes the identity policy and stores it like any other vault write.
+/// `change` returns whether anything changed; nothing changing is `not_found`.
+async fn update_identity(
+    state: &AppState,
+    change: impl FnOnce(&mut IdentityPolicy) -> Result<bool, &'static str>,
+) -> Result<VaultResponse> {
+    let mut keys = state.keys.lock().await;
+    let mut policy = match identity::load(&keys) {
+        Ok(policy) => policy,
+        Err(reason) => return Ok(VaultResponse::error(reason)),
+    };
+    match change(&mut policy) {
+        Err(reason) => return Ok(VaultResponse::error(reason)),
+        Ok(false) => return Ok(VaultResponse::error("not_found")),
+        Ok(true) => {}
+    }
+    let text = identity::store(&policy);
+    keys.insert(identity::POLICY_KEY.to_string(), text.clone());
+    persist_keys(&state.state_path, &state.master_recipient, &keys)?;
+    append_replication_log(state, "put", identity::POLICY_KEY, Some(text)).await?;
+    Ok(VaultResponse {
+        identity: Some(policy),
+        ..VaultResponse::ok()
+    })
 }
 
 async fn stage_once(
@@ -1613,6 +1787,12 @@ impl VaultRequest {
             Self::Verify { .. } => "verify",
             Self::Revoke { .. } => "revoke",
             Self::Health => "health",
+            Self::Token(_) => "token",
+            Self::WorkloadAdd(_) => "workload_add",
+            Self::WorkloadRemove { .. } => "workload_remove",
+            Self::Grant(_) => "grant",
+            Self::Ungrant { .. } => "ungrant",
+            Self::Identity => "identity",
         }
     }
 
@@ -1626,7 +1806,13 @@ impl VaultRequest {
             | Self::Mint { .. }
             | Self::Verify { .. }
             | Self::Revoke { .. }
-            | Self::Health => None,
+            | Self::Health
+            | Self::Identity => None,
+            Self::Token(ask) => Some(&ask.audience),
+            Self::WorkloadAdd(Workload { sub, .. })
+            | Self::Grant(Grant { sub, .. })
+            | Self::WorkloadRemove { sub }
+            | Self::Ungrant { sub, .. } => Some(sub),
         }
     }
 }
@@ -1634,6 +1820,19 @@ impl VaultRequest {
 fn authorize(peer: &PeerCred, request: &VaultRequest) -> Decision {
     match request {
         VaultRequest::Health | VaultRequest::Verify { .. } => Decision::Allow,
+        // Who gets what is the identity policy's call, made in the handler.
+        VaultRequest::Token(_) => Decision::Allow,
+        VaultRequest::WorkloadAdd(_)
+        | VaultRequest::WorkloadRemove { .. }
+        | VaultRequest::Grant(_)
+        | VaultRequest::Ungrant { .. }
+        | VaultRequest::Identity => {
+            if is_admin(peer) {
+                Decision::Allow
+            } else {
+                Decision::Deny("forbidden")
+            }
+        }
         VaultRequest::Mint { .. } | VaultRequest::Revoke { .. } => {
             if is_admin(peer) || is_gild(peer) {
                 Decision::Allow
@@ -1929,6 +2128,37 @@ fn load_or_create_signing_key(path: &Path) -> Result<ed25519_dalek::SigningKey> 
     }
 }
 
+fn load_or_create_es256_key(path: &Path) -> Result<p256::ecdsa::SigningKey> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("ES256 key path has no parent"))?;
+    ensure_operator_private_dir(parent, 0o700, "ES256 key parent")?;
+    match fs::read(path) {
+        Ok(bytes) => {
+            verify_operator_private_file(path, 0o600, "ES256 key")?;
+            oidc::es256_key_from_bytes(&bytes)
+                .map_err(|err| anyhow!("decode harar ES256 key at {}: {err}", path.display()))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let key = oidc::generate_es256_key();
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(path)
+                .with_context(|| format!("create harar ES256 key {}", path.display()))?;
+            file.write_all(&oidc::es256_key_bytes(&key))
+                .with_context(|| format!("write harar ES256 key {}", path.display()))?;
+            file.sync_all()
+                .with_context(|| format!("sync harar ES256 key {}", path.display()))?;
+            drop(file);
+            verify_operator_private_file(path, 0o600, "ES256 key")?;
+            Ok(key)
+        }
+        Err(err) => Err(err).with_context(|| format!("read {}", path.display())),
+    }
+}
+
 fn ensure_operator_private_dir(path: &Path, mode: u32, kind: &str) -> Result<()> {
     let existed = path.exists();
     fs::create_dir_all(path)
@@ -2210,7 +2440,7 @@ async fn write_json(stream: &mut UnixStream, response: &VaultResponse) -> Result
 }
 
 async fn write_http_json(
-    stream: &mut UnixStream,
+    stream: &mut (impl AsyncWrite + Unpin),
     status: u16,
     body: serde_json::Value,
 ) -> Result<()> {
@@ -2367,6 +2597,10 @@ mod tests {
         }
     }
 
+    fn test_issuer() -> oidc::Issuer {
+        oidc::Issuer::new("https://id.example.test", oidc::generate_es256_key(), generate_signing_key())
+    }
+
     fn test_state(dir: &Path) -> AppState {
         let master_key = age::x25519::Identity::generate();
         let state_path = dir.join("keys.age");
@@ -2391,7 +2625,7 @@ mod tests {
             fenced: Mutex::new(false),
             replication_log: Mutex::new(Vec::new()),
             replication_token: "test-replication-token".to_string(),
-            signing_key: generate_signing_key(),
+            issuer: test_issuer(),
         }
     }
 
@@ -2410,6 +2644,9 @@ mod tests {
             upstream_url: None,
             replication_token_path: dir.join("vault-replication-token"),
             signing_key_path: dir.join("harar-signing.key"),
+            es256_key_path: dir.join("harar-es256.key"),
+            issuer_url: "https://id.example.test".to_string(),
+            public_listen: None,
             heartbeat_interval: Duration::from_millis(10),
             sync_interval: Duration::from_millis(10),
             promote_after_failures: 2,
@@ -2445,7 +2682,7 @@ mod tests {
             fenced: Mutex::new(false),
             replication_log: Mutex::new(Vec::new()),
             replication_token: "test-replication-token".to_string(),
-            signing_key: generate_signing_key(),
+            issuer: test_issuer(),
         }
     }
 
@@ -2854,7 +3091,7 @@ mod tests {
         let state = test_state(dir.path());
 
         let expired = mint_token(
-            &state.signing_key,
+            state.issuer.ed25519(),
             &MintTokenRequest {
                 template: HararTokenTemplate::Service,
                 subject: "service:gild".to_string(),
@@ -3038,7 +3275,7 @@ mod tests {
     async fn mint_audit_does_not_export_token_or_signing_key() {
         let dir = tempdir().unwrap();
         let state = test_state(dir.path());
-        let signing_key = signing_key_bytes(&state.signing_key);
+        let signing_key = signing_key_bytes(state.issuer.ed25519());
         let signing_key_debug = format!("{signing_key:?}");
 
         let minted = handle_request(
@@ -3247,7 +3484,7 @@ mod tests {
             fenced: Mutex::new(false),
             replication_log: Mutex::new(Vec::new()),
             replication_token: "test-replication-token".to_string(),
-            signing_key: generate_signing_key(),
+            issuer: test_issuer(),
         };
 
         let response = handle_request(
@@ -3547,7 +3784,7 @@ mod tests {
             fenced: Mutex::new(false),
             replication_log: Mutex::new(Vec::new()),
             replication_token: "test-replication-token".to_string(),
-            signing_key: generate_signing_key(),
+            issuer: test_issuer(),
         });
         attach_replica(
             &replica_state,
