@@ -115,8 +115,27 @@ the keys at `<issuer>/.well-known/openid-configuration` → `jwks_uri`.
   `policy_version`, signed by its approver and chained to the previous version.
 - Approvals belong to **classes** defined in policy (`policy.widen`,
   `policy.narrow`, `deploy.production`, `broker.request`, …).
-- A human approves with their own hardware key (Secure Enclave with presence
-  required). Being logged in as an OS user is never an approval.
+- A human approves with one of their **approver devices**: a key that lives in
+  hardware they carry and only signs after Face ID, Touch ID or a PIN. Being
+  logged in as an OS user is never an approval.
+- An approval is a signature over the exact request (its id, actor, zone,
+  action, resource and expiry), so it can't be replayed onto anything else.
+  The primary verifies it against the human's enrolled device keys.
+- Device kinds, all the same to the primary:
+  - **phone app** (iOS Secure Enclave, Android StrongBox): a push notification
+    shows who is asking, from where, for what; Face ID signs.
+  - **passkey** (WebAuthn): an approval page served by the primary; any phone or
+    laptop with a passkey signs. No app to install.
+  - **Mac**: the Secure Enclave key `harar agent` already uses.
+- A human enrolls several devices, so losing one never locks the org out. An
+  offline recovery key enrolls replacements. The highest classes can require
+  two devices (`policy.widen`, enrolling a new approver device).
+- **Delegated approval.** A machine or agent may hold an approval class only
+  through its role, with limits: which classes, how many per hour, until when.
+  It can never approve `policy.widen`, a new approver device, or anything it is
+  in the actor chain of. The human can revoke the delegation from any device.
+- A phone approves; it never holds the vault's master key. Servers unlock
+  without anyone present, so the vault's keys stay on the primary.
 - An orchestrator agent may approve only the classes its role names, never a
   request where it or anything it started is in the actor chain, and never
   `policy.widen`.
