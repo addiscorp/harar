@@ -74,14 +74,16 @@ impl Issuer {
             .stderr(fs::File::create(dir.path().join("serve.log")).unwrap())
             .spawn()
             .expect("spawn harar serve");
+        // Hold it first, so a failed start below still stops the daemon.
+        let issuer = Issuer { child, socket, address, url, _dir: dir };
         // Generous: macOS scans a freshly built binary on its first runs.
         let deadline = Instant::now() + Duration::from_secs(30);
-        while std::os::unix::net::UnixStream::connect(&socket).is_err() || TcpStream::connect(&address).is_err() {
-            let log = fs::read_to_string(dir.path().join("serve.log")).unwrap_or_default();
+        while std::os::unix::net::UnixStream::connect(&issuer.socket).is_err() || TcpStream::connect(&issuer.address).is_err() {
+            let log = fs::read_to_string(issuer._dir.path().join("serve.log")).unwrap_or_default();
             assert!(Instant::now() < deadline, "harar serve did not start: {log}");
             std::thread::sleep(Duration::from_millis(25));
         }
-        Issuer { child, socket, address, url, _dir: dir }
+        issuer
     }
 
     pub fn harar(&self, args: &[&str]) -> Output {

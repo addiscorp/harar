@@ -82,12 +82,14 @@ fn start_broker(issuer: &Issuer, audit_log: &std::path::Path) -> BrokerProcess {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn harar broker");
+    // Hold it first, so a failed start below still stops the broker.
+    let broker = BrokerProcess { child, address };
     let deadline = Instant::now() + Duration::from_secs(30);
-    while TcpStream::connect(&address).is_err() {
+    while TcpStream::connect(&broker.address).is_err() {
         assert!(Instant::now() < deadline, "harar broker did not start");
         std::thread::sleep(Duration::from_millis(25));
     }
-    BrokerProcess { child, address }
+    broker
 }
 
 /// What an SDK in the VM sends: POST with the placeholder as its API key.
