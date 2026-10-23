@@ -3,7 +3,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-pub const DEFAULT_MASTER_KEY_PATH: &str = "/etc/gild/vault-master.key";
+pub const DEFAULT_MASTER_KEY_PATH: &str = "/etc/harar/master.key";
 
 pub trait MasterKeySource {
     fn load(&self) -> Result<Option<age::x25519::Identity>>;
@@ -61,7 +61,8 @@ pub(crate) fn load_master_key_file(path: &Path) -> Result<age::x25519::Identity>
         Ok(contents) => contents,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Err(anyhow!(
-                "missing gild-vault master key at {}; run `gild vault init` before starting gild-vault",
+                "missing harar master key at {}; create one with `age-keygen -o {}` (mode 0600) before starting harar",
+                path.display(),
                 path.display()
             ));
         }

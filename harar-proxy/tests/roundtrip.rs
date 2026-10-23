@@ -220,7 +220,7 @@ fn proxy_binary_refuses_to_bind_when_configured_socket_is_unreachable() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains(&format!(
-            "gild-vault health check failed on socket {}",
+            "harar health check failed on socket {}",
             missing_socket.display()
         )),
         "stderr did not include configured socket path: {stderr}"

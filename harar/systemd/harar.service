@@ -1,0 +1,35 @@
+[Unit]
+Description=harar vault daemon
+After=network.target
+Requires=harar.socket
+
+[Service]
+Type=simple
+User=harar
+Group=harar
+SupplementaryGroups=harar-clients
+RuntimeDirectory=harar
+RuntimeDirectoryMode=0700
+ExecStartPre=+/usr/bin/install -d -m 0750 -o harar -g harar-clients /var/lib/harar
+ExecStart=/usr/local/bin/harar serve --state-path /var/lib/harar/keys.age --audit-log /var/log/harar.log
+UMask=0007
+Restart=on-failure
+RestartSec=2s
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictRealtime=true
+ReadWritePaths=/run/harar /run/harar.sock /var/lib/harar /var/log/harar.log
+StandardOutput=append:/var/log/harar.log
+StandardError=append:/var/log/harar.log
+
+[Install]
+WantedBy=multi-user.target

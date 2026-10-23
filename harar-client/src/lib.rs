@@ -12,7 +12,7 @@ use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
 const DEFAULT_SOCKET_PATH: &str = "/run/tana-vault.sock";
-pub const DEFAULT_GILD_VAULT_SOCKET_PATH: &str = "/run/gild-vault.sock";
+pub const DEFAULT_GILD_VAULT_SOCKET_PATH: &str = "/run/harar.sock";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const ISSUER: &str = "harar";
 const MAX_SUBJECT_LEN: usize = 256;
@@ -1164,12 +1164,12 @@ impl fmt::Display for VaultClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             VaultClientError::EmptyKey => write!(f, "vault key cannot be empty"),
-            VaultClientError::Io(err) => write!(f, "gild-vault I/O error: {err}"),
+            VaultClientError::Io(err) => write!(f, "harar I/O error: {err}"),
             VaultClientError::InvalidResponse(message) => {
-                write!(f, "gild-vault returned an invalid response: {message}")
+                write!(f, "harar returned an invalid response: {message}")
             }
-            VaultClientError::Vault(err) => write!(f, "gild-vault rejected request: {err}"),
-            VaultClientError::Json(err) => write!(f, "gild-vault JSON error: {err}"),
+            VaultClientError::Vault(err) => write!(f, "harar rejected request: {err}"),
+            VaultClientError::Json(err) => write!(f, "harar JSON error: {err}"),
         }
     }
 }

@@ -57,7 +57,7 @@ impl AppState {
             Some((base_url, status)) => {
                 let old = self.upstream.read().await.label();
                 eprintln!(
-                    "gild-vault-proxy switching to replica: was={old}, now={}, epoch={}",
+                    "harar-proxy switching to replica: was={old}, now={}, epoch={}",
                     base_url, status.epoch
                 );
                 *self.upstream.write().await = VaultUpstream::PeerHttp {
@@ -67,7 +67,7 @@ impl AppState {
                 };
             }
             None => {
-                eprintln!("gild-vault-proxy no healthy vault peer found; serving retryable 503");
+                eprintln!("harar-proxy no healthy vault peer found; serving retryable 503");
             }
         }
     }
@@ -92,7 +92,7 @@ impl AppState {
                 }
                 Ok(_) => {}
                 Err(err) => eprintln!(
-                    "gild-vault-proxy peer health check failed for {}: {err}",
+                    "harar-proxy peer health check failed for {}: {err}",
                     peer.base_url
                 ),
             }
@@ -148,7 +148,7 @@ async fn audit_request(
             tls_client_cn: peer.as_ref().and_then(|peer| peer.tls_client_cn.as_deref()),
         };
         if let Err(err) = append_audit(path_buf, &event) {
-            eprintln!("gild-vault-proxy audit write failed: {err}");
+            eprintln!("harar-proxy audit write failed: {err}");
         }
     }
     response
