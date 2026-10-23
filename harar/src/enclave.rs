@@ -27,6 +27,18 @@ use security_framework_sys::item::{
     kSecAttrKeyTypeECSECPrimeRandom, kSecAttrTokenID, kSecAttrTokenIDSecureEnclave,
 };
 
+/// `errSecInteractionNotAllowed`: the Secure Enclave refuses while the Mac's
+/// screen is locked.
+const INTERACTION_NOT_ALLOWED: isize = -25308;
+
+fn enclave_error(action: &str, err: core_foundation::error::CFError) -> anyhow::Error {
+    if err.code() == INTERACTION_NOT_ALLOWED {
+        anyhow!("{action}: the Secure Enclave refuses while the screen is locked; unlock the Mac and try again")
+    } else {
+        anyhow!("{action}: {err}")
+    }
+}
+
 const ECIES: Algorithm = Algorithm::ECIESEncryptionCofactorVariableIVX963SHA256AESGCM;
 /// `kSecAttrTokenOID`, which security-framework-sys does not export.
 const TOKEN_OID: &str = "toid";
@@ -59,8 +71,7 @@ impl EnclaveKey {
             .set_size_in_bits(256)
             .set_token(Token::SecureEnclave)
             .set_access_control(access);
-        let key = SecKey::new(&options)
-            .map_err(|err| anyhow!("create Secure Enclave key: {err}"))?;
+        let key = SecKey::new(&options).map_err(|err| enclave_error("create Secure Enclave key", err))?;
         Ok(Self { key })
     }
 
@@ -151,7 +162,7 @@ impl EnclaveKey {
         self.key
             .decrypt_data(ECIES, sealed)
             .map(zeroize::Zeroizing::new)
-            .map_err(|err| anyhow!("open with Secure Enclave key: {err}"))
+            .map_err(|err| enclave_error("open with Secure Enclave key", err))
     }
 }
 
