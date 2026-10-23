@@ -27,6 +27,13 @@ pub struct Run {
     /// Pass the command's output through untouched, keeping its terminal.
     #[arg(long)]
     no_masking: bool,
+    /// Inside a CI run: load this environment's build secrets, as its env
+    /// rule allows, using the run token in --run-token-env.
+    #[arg(long)]
+    env: Option<String>,
+    /// The variable holding the run token. It is not passed to the command.
+    #[arg(long, default_value = "HARAR_RUN_TOKEN", requires = "env")]
+    run_token_env: String,
     #[arg(trailing_var_arg = true, required = true, value_name = "COMMAND")]
     command: Vec<String>,
 }
@@ -43,12 +50,37 @@ pub async fn run(cmd: Run) -> Result<()> {
 
     let client = VaultClient::from_socket_path(cmd.socket.socket);
     let mut secrets = Vec::new();
+    // In a run, the run's environment is all there is: references resolve
+    // within it, and nothing else in the vault is reachable.
+    let released = match &cmd.env {
+        None => None,
+        Some(name) => {
+            let token = env
+                .remove(&cmd.run_token_env)
+                .ok_or_else(|| anyhow!("--env needs the run token in {}", cmd.run_token_env))?;
+            let released = client
+                .run_secrets(&token, name)
+                .await
+                .with_context(|| format!("the {name} environment's secrets"))?;
+            for (name, value) in released_names(&released)? {
+                secrets.push(value.clone().into_bytes());
+                env.insert(name, value);
+            }
+            Some(released)
+        }
+    };
     for (name, value) in env.iter_mut() {
         if let Some(key) = dotenv::reference(value) {
-            let resolved = client
-                .get(key)
-                .await
-                .with_context(|| format!("{name} refers to {value}, which could not be read"))?;
+            let resolved = match &released {
+                Some(released) => released
+                    .get(key)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("{name} refers to {value}, which this run's environment doesn't include"))?,
+                None => client
+                    .get(key)
+                    .await
+                    .with_context(|| format!("{name} refers to {value}, which could not be read"))?,
+            };
             secrets.push(resolved.clone().into_bytes());
             *value = resolved;
         }
@@ -87,6 +119,18 @@ pub async fn run(cmd: Run) -> Result<()> {
     out.await??;
     err.await??;
     exit_like(status);
+}
+
+/// Environment variable names for released keys: each key's last segment.
+fn released_names(released: &BTreeMap<String, String>) -> Result<BTreeMap<String, String>> {
+    let mut names = BTreeMap::new();
+    for (key, value) in released {
+        let name = key.rsplit('/').next().unwrap_or(key);
+        if names.insert(name.to_string(), value.clone()).is_some() {
+            return Err(anyhow!("two released keys end in {name}; rename one"));
+        }
+    }
+    Ok(names)
 }
 
 async fn copy_masked<R, W>(mut from: R, mut to: W, mut masker: Masker) -> Result<()>

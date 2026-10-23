@@ -226,6 +226,9 @@ pub struct Workload {
     /// Subjects it may start sessions for, such as `agent:*`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sessions_for: Vec<String>,
+    /// Repos it may register CI runs for, such as `addiscorp/*`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runs_for: Vec<String>,
 }
 
 /// One audience a session may reach, and the scopes it may ask for there.

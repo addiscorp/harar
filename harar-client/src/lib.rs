@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 
 pub mod broker;
 pub mod oidc;
+pub mod runs;
 
 const DEFAULT_SOCKET_PATH: &str = "/run/tana-vault.sock";
 pub const DEFAULT_GILD_VAULT_SOCKET_PATH: &str = "/run/harar.sock";
@@ -349,6 +350,27 @@ enum VaultRequest<'a> {
         placeholder: &'a str,
         service: &'a str,
     },
+    EnvRule(&'a runs::EnvRule),
+    EnvRuleRemove {
+        name: &'a str,
+    },
+    RunRegister(&'a runs::RunRegisterAsk),
+    RunSecrets {
+        run_token: &'a str,
+        env: &'a str,
+    },
+    RunToken {
+        run_token: &'a str,
+        audience: &'a str,
+    },
+    RunDecide {
+        id: &'a str,
+        approve: bool,
+    },
+    RunFinish {
+        id: &'a str,
+    },
+    Runs,
 }
 
 /// What `exchange` hands back to the child.
@@ -387,6 +409,10 @@ struct VaultResponse {
     broker: Option<broker::BrokerState>,
     request: Option<broker::AccessRequest>,
     resolved: Option<broker::Resolved>,
+    run: Option<runs::Run>,
+    runs: Option<runs::RunsState>,
+    secrets: Option<std::collections::BTreeMap<String, String>>,
+    run_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -914,6 +940,71 @@ impl VaultClient {
             .await?
             .resolved
             .ok_or_else(|| VaultClientError::InvalidResponse("missing resolution".to_string()))
+    }
+
+    pub async fn env_rule(&self, rule: &runs::EnvRule) -> Result<runs::RunsState, VaultClientError> {
+        self.runs_request(&VaultRequest::EnvRule(rule)).await
+    }
+
+    pub async fn env_rule_remove(&self, name: &str) -> Result<runs::RunsState, VaultClientError> {
+        self.runs_request(&VaultRequest::EnvRuleRemove { name }).await
+    }
+
+    /// Env rules and the runs this caller may see.
+    pub async fn runs(&self) -> Result<runs::RunsState, VaultClientError> {
+        self.runs_request(&VaultRequest::Runs).await
+    }
+
+    /// Registers a run; returns it and its run token, for the run's VM.
+    pub async fn run_register(&self, ask: &runs::RunRegisterAsk) -> Result<(runs::Run, String), VaultClientError> {
+        let response = self.identity_request(&VaultRequest::RunRegister(ask), "run_failed").await?;
+        match (response.run, response.run_token) {
+            (Some(run), Some(token)) => Ok((run, token)),
+            _ => Err(VaultClientError::InvalidResponse("missing run".to_string())),
+        }
+    }
+
+    /// The build secrets for this run's environment, by vault key.
+    pub async fn run_secrets(
+        &self,
+        run_token: &str,
+        env: &str,
+    ) -> Result<std::collections::BTreeMap<String, String>, VaultClientError> {
+        self.identity_request(&VaultRequest::RunSecrets { run_token, env }, "run_failed")
+            .await?
+            .secrets
+            .ok_or_else(|| VaultClientError::InvalidResponse("missing secrets".to_string()))
+    }
+
+    /// A token for this run to present to `audience`.
+    pub async fn run_token(&self, run_token: &str, audience: &str) -> Result<(String, oidc::IdentityClaims), VaultClientError> {
+        let response = self.identity_request(&VaultRequest::RunToken { run_token, audience }, "run_failed").await?;
+        match (response.token, response.claims) {
+            (Some(token), Some(claims)) => Ok((token, claims)),
+            _ => Err(VaultClientError::InvalidResponse("missing token".to_string())),
+        }
+    }
+
+    pub async fn run_decide(&self, id: &str, approve: bool) -> Result<runs::Run, VaultClientError> {
+        self.run_request(&VaultRequest::RunDecide { id, approve }).await
+    }
+
+    pub async fn run_finish(&self, id: &str) -> Result<runs::Run, VaultClientError> {
+        self.run_request(&VaultRequest::RunFinish { id }).await
+    }
+
+    async fn runs_request(&self, request: &VaultRequest<'_>) -> Result<runs::RunsState, VaultClientError> {
+        self.identity_request(request, "run_failed")
+            .await?
+            .runs
+            .ok_or_else(|| VaultClientError::InvalidResponse("missing runs".to_string()))
+    }
+
+    async fn run_request(&self, request: &VaultRequest<'_>) -> Result<runs::Run, VaultClientError> {
+        self.identity_request(request, "run_failed")
+            .await?
+            .run
+            .ok_or_else(|| VaultClientError::InvalidResponse("missing run".to_string()))
     }
 
     async fn broker_state_request(&self, request: &VaultRequest<'_>) -> Result<broker::BrokerState, VaultClientError> {
