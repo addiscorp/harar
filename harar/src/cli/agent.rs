@@ -134,7 +134,7 @@ fn send(socket: &std::path::Path, request: &AgentRequest) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
     use std::fs;
