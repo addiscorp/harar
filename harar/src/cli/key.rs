@@ -3,7 +3,8 @@ use crate::cli::secret_input::SecretInput;
 use crate::master_key::{self, KeyTier};
 use anyhow::{Result, anyhow};
 use clap::{Args, Subcommand};
-use std::path::PathBuf;
+use age::secrecy::SecretString;
+use std::path::{Path, PathBuf};
 
 const MIN_PASSPHRASE_CHARS: usize = 12;
 
@@ -16,12 +17,13 @@ pub struct Key {
 
 #[derive(Debug, Subcommand)]
 enum KeyCommand {
-    /// Create a master key sealed to this Mac's Secure Enclave, plus a
-    /// recovery copy encrypted to a passphrase you keep offline.
+    /// Create a master key, sealed to this Mac's Secure Enclave when it has
+    /// one, plus a recovery copy encrypted to a passphrase you keep offline.
     Init(Init),
     /// Show how the master key is protected and what this machine supports.
     Status(Status),
-    /// Seal the master key from its recovery copy to a new Secure Enclave key.
+    /// Rebuild the master key from its recovery copy (sealed to this Mac's
+    /// Secure Enclave when it has one).
     Recover(Recover),
 }
 
@@ -96,68 +98,70 @@ fn secure_enclave_available() -> bool {
     false
 }
 
-#[cfg(target_os = "macos")]
 fn init(cmd: Init) -> Result<()> {
     let (path, recovery) = cmd.paths.resolve();
     if master_key::key_tier(&path)? != KeyTier::Missing {
         return Err(anyhow!("{} already exists; refusing to replace a master key", path.display()));
     }
-    if !crate::enclave::available() {
-        return Err(anyhow!("this Mac has no usable Secure Enclave (Apple silicon or an Intel Mac with a T2 chip is needed)"));
-    }
     let passphrase = read_passphrase(cmd.passphrase, true)?;
-    let identity = master_key::create_enclave_master_key(
-        &path,
-        &recovery,
-        passphrase,
-        crate::enclave::Presence::Required,
-    )?;
+    let (identity, tier) = if secure_enclave_available() {
+        (create_enclave_key(&path, &recovery, passphrase)?, KeyTier::SecureEnclave)
+    } else {
+        (master_key::create_file_master_key(&path, &recovery, passphrase)?, KeyTier::File)
+    };
     print_json(&serde_json::json!({
         "ok": true,
         "path": path,
         "recovery": recovery,
-        "tier": KeyTier::SecureEnclave,
+        "tier": tier,
         "recipient": identity.to_public().to_string(),
-        "next": "Move the recovery copy somewhere offline. It and its passphrase are the only way back if this Mac is lost.",
+        "next": "Move the recovery copy somewhere offline. It and its passphrase are the only way back if this machine is lost.",
     }))
 }
 
-#[cfg(target_os = "macos")]
 fn recover(cmd: Recover) -> Result<()> {
     let (path, recovery) = cmd.paths.resolve();
     let passphrase = read_passphrase(cmd.passphrase, false)?;
-    let identity = master_key::recover_enclave_master_key(
-        &recovery,
-        passphrase,
-        &path,
-        crate::enclave::Presence::Required,
-    )?;
+    let (identity, tier) = if secure_enclave_available() {
+        (recover_enclave_key(&recovery, passphrase, &path)?, KeyTier::SecureEnclave)
+    } else {
+        (master_key::recover_file_master_key(&recovery, passphrase, &path)?, KeyTier::File)
+    };
     print_json(&serde_json::json!({
         "ok": true,
         "path": path,
-        "tier": KeyTier::SecureEnclave,
+        "tier": tier,
         "recipient": identity.to_public().to_string(),
     }))
 }
 
-#[cfg(not(target_os = "macos"))]
-fn init(_: Init) -> Result<()> {
-    Err(anyhow!("`harar key init` needs a Mac with a Secure Enclave; on Linux create the key with `age-keygen`"))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn recover(_: Recover) -> Result<()> {
-    Err(anyhow!("`harar key recover` needs a Mac with a Secure Enclave"))
+#[cfg(target_os = "macos")]
+fn create_enclave_key(path: &Path, recovery: &Path, passphrase: SecretString) -> Result<age::x25519::Identity> {
+    master_key::create_enclave_master_key(path, recovery, passphrase, crate::enclave::Presence::Required)
 }
 
 #[cfg(target_os = "macos")]
-fn read_passphrase(input: SecretInput, confirm: bool) -> Result<age::secrecy::SecretString> {
+fn recover_enclave_key(recovery: &Path, passphrase: SecretString, path: &Path) -> Result<age::x25519::Identity> {
+    master_key::recover_enclave_master_key(recovery, passphrase, path, crate::enclave::Presence::Required)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn create_enclave_key(_: &Path, _: &Path, _: SecretString) -> Result<age::x25519::Identity> {
+    Err(anyhow!("this platform has no Secure Enclave"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn recover_enclave_key(_: &Path, _: SecretString, _: &Path) -> Result<age::x25519::Identity> {
+    Err(anyhow!("this platform has no Secure Enclave"))
+}
+
+fn read_passphrase(input: SecretInput, confirm: bool) -> Result<SecretString> {
     let prompt = "Recovery passphrase";
     let value = if confirm { input.read_confirmed(prompt)? } else { input.read(prompt)? };
     if confirm && value.chars().count() < MIN_PASSPHRASE_CHARS {
         return Err(anyhow!("the recovery passphrase needs at least {MIN_PASSPHRASE_CHARS} characters"));
     }
-    Ok(age::secrecy::SecretString::from(value))
+    Ok(SecretString::from(value))
 }
 
 #[cfg(test)]

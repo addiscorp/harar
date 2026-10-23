@@ -1,20 +1,22 @@
 use age::secrecy::{ExposeSecret, SecretString};
 use anyhow::{Context, Result, anyhow};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
-use serde::{Deserialize, Serialize};
+#[cfg(target_os = "macos")]
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use serde::Serialize;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_MASTER_KEY_PATH: &str = "/etc/harar/master.key";
+#[cfg(target_os = "macos")]
 const ENCLAVE_FORMAT: &str = "harar.enclave-master-key@1";
 const KEY_FILE_MODE: u32 = 0o400;
 
 /// A master key sealed to a Secure Enclave key. Only the Mac that created
 /// `handle` can open `sealed`.
-#[derive(Debug, Serialize, Deserialize)]
+#[cfg(target_os = "macos")]
+#[derive(Debug, Serialize, serde::Deserialize)]
 struct EnclaveEnvelope {
     format: String,
     /// Enclave-encrypted key handle (base64).
@@ -238,6 +240,47 @@ fn seal_to_new_enclave_key(
     write_new_key_file(path, &json)
 }
 
+/// Creates a new master key as a plain age identity file (mode 0400) at
+/// `path`, plus a recovery copy. For machines without a Secure Enclave.
+pub fn create_file_master_key(
+    path: &Path,
+    recovery_path: &Path,
+    passphrase: SecretString,
+) -> Result<age::x25519::Identity> {
+    for existing in [path, recovery_path] {
+        if existing.exists() {
+            return Err(anyhow!("{} already exists; refusing to replace a master key", existing.display()));
+        }
+    }
+    let identity = age::x25519::Identity::generate();
+    write_recovery(recovery_path, &identity, passphrase)?;
+    if let Err(err) = write_identity_file(path, &identity) {
+        let _ = fs::remove_file(recovery_path);
+        return Err(err);
+    }
+    Ok(identity)
+}
+
+pub fn recover_file_master_key(
+    recovery_path: &Path,
+    passphrase: SecretString,
+    path: &Path,
+) -> Result<age::x25519::Identity> {
+    if path.exists() {
+        return Err(anyhow!("{} already exists; move it away before recovering", path.display()));
+    }
+    let identity = open_recovery(recovery_path, passphrase)?;
+    write_identity_file(path, &identity)?;
+    Ok(identity)
+}
+
+fn write_identity_file(path: &Path, identity: &age::x25519::Identity) -> Result<()> {
+    let secret = identity.to_string();
+    let mut contents = zeroize::Zeroizing::new(secret.expose_secret().as_bytes().to_vec());
+    contents.push(b'\n');
+    write_new_key_file(path, &contents)
+}
+
 pub fn write_recovery(
     recovery_path: &Path,
     identity: &age::x25519::Identity,
@@ -323,6 +366,26 @@ mod tests {
 
         assert_eq!(key_tier(&file).unwrap(), KeyTier::File);
         assert_eq!(key_tier(&dir.path().join("none")).unwrap(), KeyTier::Missing);
+    }
+
+    #[test]
+    fn file_master_key_loads_and_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("harar/master.key");
+        let recovery = default_recovery_path(&path);
+        let created = create_file_master_key(&path, &recovery, passphrase("correct horse battery")).unwrap();
+
+        assert_eq!(key_tier(&path).unwrap(), KeyTier::File);
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o400);
+        assert_eq!(
+            load_master_key_file(&path).unwrap().to_public().to_string(),
+            created.to_public().to_string()
+        );
+        assert!(create_file_master_key(&path, &recovery, passphrase("x")).is_err());
+
+        fs::remove_file(&path).unwrap();
+        let recovered = recover_file_master_key(&recovery, passphrase("correct horse battery"), &path).unwrap();
+        assert_eq!(recovered.to_public().to_string(), created.to_public().to_string());
     }
 
     #[cfg(target_os = "macos")]
