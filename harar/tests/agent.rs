@@ -121,3 +121,83 @@ fn agent_refuses_to_start_without_a_master_key() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("harar key init"));
 }
+
+fn run_in(dir: &Path, args: &[&str], socket: &Path) -> Output {
+    harar()
+        .current_dir(dir)
+        .args(args)
+        .env("HARAR_SOCKET", socket)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn run_resolves_references_and_masks_them_in_output() {
+    let agent = start_agent();
+    json(&run(&["put", "dev/app/db"], &agent.socket, Some("postgres://u:s3cret-pw@db\n")));
+    let dir = agent.socket.parent().unwrap();
+    fs::write(dir.join(".env"), "DATABASE_URL=harar://dev/app/db\nPLAIN=visible\n").unwrap();
+
+    let masked = run_in(dir, &["run", "--env-file", ".env", "--", "sh", "-c", "echo url=$DATABASE_URL plain=$PLAIN; echo err=$DATABASE_URL >&2"], &agent.socket);
+    assert!(masked.status.success());
+    assert_eq!(String::from_utf8_lossy(&masked.stdout), "url=<concealed by harar> plain=visible\n");
+    assert_eq!(String::from_utf8_lossy(&masked.stderr), "err=<concealed by harar>\n");
+
+    let sees = run_in(dir, &["run", "--env-file", ".env", "--", "sh", "-c", "test \"$DATABASE_URL\" = 'postgres://u:s3cret-pw@db' && echo match"], &agent.socket);
+    assert_eq!(String::from_utf8_lossy(&sees.stdout), "match\n", "the command gets the real value");
+
+    let raw = run_in(dir, &["run", "--no-masking", "--env-file", ".env", "--", "sh", "-c", "echo $DATABASE_URL"], &agent.socket);
+    assert_eq!(String::from_utf8_lossy(&raw.stdout), "postgres://u:s3cret-pw@db\n");
+}
+
+#[test]
+fn run_passes_the_exit_code_through() {
+    let agent = start_agent();
+    json(&run(&["put", "dev/x"], &agent.socket, Some("v\n")));
+    let dir = agent.socket.parent().unwrap();
+    let out = run_in(dir, &["run", "--", "sh", "-c", "exit 7"], &agent.socket);
+    assert_eq!(out.status.code(), Some(7));
+}
+
+#[test]
+fn run_refuses_to_start_when_a_reference_is_missing() {
+    let agent = start_agent();
+    let dir = agent.socket.parent().unwrap();
+    let marker = dir.join("started");
+    fs::write(dir.join(".env"), "TOKEN=harar://dev/nope\n").unwrap();
+    let out = run_in(dir, &["run", "--env-file", ".env", "--", "touch", marker.to_str().unwrap()], &agent.socket);
+
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("TOKEN refers to harar://dev/nope"));
+    assert!(!marker.exists(), "the command must not start");
+}
+
+#[test]
+fn import_moves_values_into_the_vault_and_rewrites_the_file() {
+    let agent = start_agent();
+    let dir = agent.socket.parent().unwrap();
+    let env = dir.join(".env");
+    fs::write(&env, "# app settings\nAPI_KEY=sk_live_abc123\nexport REGION=\"us east\"\nALREADY=harar://dev/other\nEMPTY=\n").unwrap();
+    fs::set_permissions(&env, fs::Permissions::from_mode(0o640)).unwrap();
+
+    let out = json(&run_in(dir, &["import", ".env", "--prefix", "dev/site"], &agent.socket));
+    assert_eq!(out["stored"], serde_json::json!(["dev/site/API_KEY", "dev/site/REGION"]));
+
+    let text = fs::read_to_string(&env).unwrap();
+    assert_eq!(text, "# app settings\nAPI_KEY=harar://dev/site/API_KEY\nexport REGION=harar://dev/site/REGION\nALREADY=harar://dev/other\nEMPTY=\n");
+    assert!(!text.contains("sk_live_abc123"));
+    assert_eq!(fs::metadata(&env).unwrap().permissions().mode() & 0o777, 0o640);
+    assert_eq!(json(&run(&["get", "dev/site/REGION"], &agent.socket, None))["value"], "us east");
+}
+
+#[test]
+fn import_leaves_the_file_alone_when_the_vault_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = dir.path().join(".env");
+    fs::write(&env, "API_KEY=sk_live_abc123\n").unwrap();
+    let out = run_in(dir.path(), &["import", ".env"], &dir.path().join("no-agent.sock"));
+
+    assert!(!out.status.success());
+    assert_eq!(fs::read_to_string(&env).unwrap(), "API_KEY=sk_live_abc123\n");
+}

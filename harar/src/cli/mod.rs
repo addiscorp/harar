@@ -9,6 +9,7 @@ pub mod mint;
 pub mod proxy;
 pub mod put;
 pub mod revoke;
+pub mod run;
 pub mod secret_input;
 pub mod serve;
 pub mod setup;
@@ -32,6 +33,8 @@ enum Command {
     Lock(agent::Lock),
     Status(agent::Status),
     Proxy(proxy::Proxy),
+    Run(run::Run),
+    Import(run::Import),
     Get(get::Get),
     Put(put::Put),
     Mint(mint::Mint),
@@ -67,6 +70,8 @@ pub async fn run() -> anyhow::Result<()> {
         Command::Lock(cmd) => agent::lock(cmd).await,
         Command::Status(cmd) => agent::status(cmd).await,
         Command::Proxy(cmd) => proxy::run(cmd).await,
+        Command::Run(cmd) => run::run(cmd).await,
+        Command::Import(cmd) => run::import(cmd).await,
         Command::Get(cmd) => get::run(cmd).await,
         Command::Put(cmd) => put::run(cmd).await,
         Command::Mint(cmd) => mint::run(cmd).await,

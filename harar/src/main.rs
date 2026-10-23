@@ -22,6 +22,8 @@ use tokio::sync::Mutex;
 
 mod agent;
 mod cli;
+mod dotenv;
+mod mask;
 #[cfg(target_os = "macos")]
 mod enclave;
 mod master_key;
