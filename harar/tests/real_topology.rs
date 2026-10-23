@@ -586,6 +586,7 @@ fn spawn_git_server_vault(dir: &Path, socket: &Path) -> VaultDaemon {
             "994",
             "--",
             gild_vault_bin(),
+            "serve",
             "--socket",
             socket_str(socket),
             "--state-path",
