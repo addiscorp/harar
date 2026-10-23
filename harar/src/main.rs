@@ -684,20 +684,51 @@ fn public_reply(state: &AppState, request: &HttpRequest) -> Result<Option<HttpRe
     Ok(Some(HttpReply::json_value(200, body)))
 }
 
+/// Limits for the public listener, which anyone on the network can reach.
+#[derive(Clone, Copy)]
+struct PublicLimits {
+    /// Connections served at once. Past this, accepting waits, so a flood
+    /// queues in the kernel instead of using up this process's file handles.
+    connections: usize,
+    /// The whole exchange, reading and writing, must finish in this time.
+    exchange: Duration,
+}
+
+const PUBLIC_LIMITS: PublicLimits = PublicLimits { connections: 256, exchange: Duration::from_secs(10) };
+
 async fn serve_public(listener: TcpListener, state: Arc<AppState>) {
+    serve_public_with(listener, state, PUBLIC_LIMITS).await
+}
+
+async fn serve_public_with(listener: TcpListener, state: Arc<AppState>, limits: PublicLimits) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(limits.connections));
     loop {
-        let Ok((mut stream, _)) = listener.accept().await else { continue };
+        let slot = Arc::clone(&slots).acquire_owned().await.expect("the semaphore is never closed");
+        let mut stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(err) => {
+                // Out of file handles and similar: accept fails at once, so
+                // wait instead of spinning.
+                eprintln!("harar public listener: accept failed: {err}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let state = Arc::clone(&state);
         tokio::spawn(async move {
-            let head = tokio::time::timeout(Duration::from_secs(10), read_http_head(&mut stream)).await;
-            let reply = match head.map_err(anyhow::Error::from).and_then(|head| parse_http_request(&head?)) {
-                Ok(request) if request.method == "GET" => {
-                    public_reply(&state, &request).unwrap_or(None).unwrap_or_else(|| HttpReply::json_error(404, "not found"))
-                }
-                Ok(_) => HttpReply::json_error(405, "method not allowed"),
-                Err(_) => HttpReply::json_error(400, "bad request"),
+            let _slot = slot;
+            let exchange = async {
+                let reply = match read_http_head(&mut stream).await.and_then(|head| parse_http_request(&head)) {
+                    Ok(request) if request.method == "GET" => public_reply(&state, &request)
+                        .unwrap_or(None)
+                        .unwrap_or_else(|| HttpReply::json_error(404, "not found")),
+                    Ok(_) => HttpReply::json_error(405, "method not allowed"),
+                    Err(_) => HttpReply::json_error(400, "bad request"),
+                };
+                write_http_json(&mut stream, reply.status, reply.body).await
             };
-            if let Err(err) = write_http_json(&mut stream, reply.status, reply.body).await {
+            // A timeout just drops the connection.
+            if let Ok(Err(err)) = tokio::time::timeout(limits.exchange, exchange).await {
                 eprintln!("harar public listener error: {err:#}");
             }
         });
@@ -709,17 +740,21 @@ async fn serve_public(listener: TcpListener, state: Arc<AppState>) {
 async fn read_http_head(stream: &mut (impl AsyncRead + Unpin)) -> Result<Vec<u8>> {
     let mut head = Vec::new();
     let mut chunk = [0_u8; 1024];
-    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+    loop {
         if head.len() > MAX_REQUEST_BYTES {
             return Err(anyhow!("HTTP request head too large"));
         }
         let read = stream.read(&mut chunk).await.context("read request")?;
         if read == 0 {
-            break;
+            return Ok(head);
         }
+        // Only the new bytes, plus three before them, can complete the end.
+        let from = head.len().saturating_sub(3);
         head.extend_from_slice(&chunk[..read]);
+        if head[from..].windows(4).any(|window| window == b"\r\n\r\n") {
+            return Ok(head);
+        }
     }
-    Ok(head)
 }
 
 async fn handle_replication_http_request(
@@ -4366,5 +4401,37 @@ mod tests {
         assert_eq!(response.version.as_deref(), Some("0.1.0"));
 
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_public_listener_caps_connections_and_drops_idle_ones() {
+        let dir = tempdir().unwrap();
+        let state = Arc::new(test_state(dir.path()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let limits = PublicLimits { connections: 2, exchange: Duration::from_millis(400) };
+        tokio::spawn(serve_public_with(listener, state, limits));
+
+        // Two callers connect and send nothing, filling both slots.
+        let mut idle = [TcpStream::connect(address).await.unwrap(), TcpStream::connect(address).await.unwrap()];
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let started = Instant::now();
+        let mut caller = TcpStream::connect(address).await.unwrap();
+        let request = format!("GET {} HTTP/1.1\r\nHost: x\r\n\r\n", oidc::JWKS_PATH);
+        caller.write_all(request.as_bytes()).await.unwrap();
+        let mut reply = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), caller.read_to_end(&mut reply))
+            .await
+            .expect("served once an idle caller timed out")
+            .unwrap();
+        assert!(reply.starts_with(b"HTTP/1.1 200"), "{}", String::from_utf8_lossy(&reply));
+        assert!(started.elapsed() >= Duration::from_millis(300), "it waited for a free slot");
+
+        for stream in &mut idle {
+            let mut rest = Vec::new();
+            let closed = tokio::time::timeout(Duration::from_secs(1), stream.read_to_end(&mut rest)).await;
+            assert!(closed.is_ok(), "an idle caller is dropped after the exchange limit");
+        }
     }
 }
