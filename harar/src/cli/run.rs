@@ -181,3 +181,55 @@ fn replace_file(path: &Path, contents: &str) -> Result<()> {
     fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))?;
     Ok(())
 }
+
+/// Fill `{{ harar://key }}` placeholders in a template.
+#[derive(Debug, Args)]
+pub struct Inject {
+    #[command(flatten)]
+    socket: SocketArgs,
+    /// Template file.
+    #[arg(short = 'i', long = "in")]
+    input: PathBuf,
+    /// Output file, written with mode 0600. Default: standard output.
+    #[arg(short = 'o', long = "out")]
+    output: Option<PathBuf>,
+}
+
+pub async fn inject(cmd: Inject) -> Result<()> {
+    let template = fs::read_to_string(&cmd.input).with_context(|| format!("read {}", cmd.input.display()))?;
+    let client = VaultClient::from_socket_path(cmd.socket.socket);
+    let mut values = BTreeMap::new();
+    for key in crate::template::references(&template).with_context(|| format!("parse {}", cmd.input.display()))? {
+        let value = client
+            .get(&key)
+            .await
+            .with_context(|| format!("harar://{key} could not be read"))?;
+        values.insert(key, value);
+    }
+    let filled = crate::template::fill(&template, |key| values.get(key).cloned())?;
+    match cmd.output {
+        None => {
+            use std::io::Write;
+            std::io::stdout().write_all(filled.as_bytes())?;
+        }
+        Some(path) => write_private(&path, &filled)?,
+    }
+    Ok(())
+}
+
+/// Atomically writes `path` with mode 0600, whatever was there before.
+fn write_private(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = path.with_extension(format!("harar-tmp-{}", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .with_context(|| format!("create {}", tmp.display()))?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    fs::rename(&tmp, path).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
