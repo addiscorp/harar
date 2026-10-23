@@ -15,6 +15,7 @@ use harar_client::{VaultClient, VaultClientError};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+pub mod broker;
 pub mod runner;
 
 #[cfg(test)]

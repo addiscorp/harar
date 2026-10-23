@@ -5,6 +5,7 @@
 //! Like the identity rules, sessions are one vault entry.
 
 use harar_client::oidc::{Actor, IdentityPolicy, IdentityRequest, MAX_ACTOR_DEPTH, Session, SessionGrant, SessionStartAsk};
+use crate::identity::matches;
 use std::collections::{BTreeMap, HashMap};
 
 pub const SESSIONS_KEY: &str = "harar:sessions";
@@ -54,14 +55,6 @@ pub fn chain_above(sessions: &Sessions, session: &Session) -> Option<Actor> {
     match &session.parent {
         Some(parent) => actor_for(sessions, parent),
         None => session.for_sub.as_ref().map(|sub| Actor { sub: sub.clone(), sid: None, act: None }),
-    }
-}
-
-/// An exact value or a `*`-ended prefix, as in identity grants.
-fn matches(pattern: &str, value: &str) -> bool {
-    match pattern.strip_suffix('*') {
-        Some(prefix) => value.starts_with(prefix),
-        None => pattern == value,
     }
 }
 

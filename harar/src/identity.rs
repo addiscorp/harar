@@ -124,7 +124,7 @@ pub fn decide(policy: &IdentityPolicy, user: &str, ask: &TokenAsk) -> Result<Ide
 }
 
 /// An exact value, or a prefix ending in `*`.
-fn matches(pattern: &str, value: &str) -> bool {
+pub(crate) fn matches(pattern: &str, value: &str) -> bool {
     match pattern.strip_suffix('*') {
         Some(prefix) => value.starts_with(prefix),
         None => pattern == value,
