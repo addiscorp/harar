@@ -201,3 +201,23 @@ fn import_leaves_the_file_alone_when_the_vault_refuses() {
     assert!(!out.status.success());
     assert_eq!(fs::read_to_string(&env).unwrap(), "API_KEY=sk_live_abc123\n");
 }
+
+#[test]
+fn inject_fills_a_template_into_a_private_file() {
+    let agent = start_agent();
+    json(&run(&["put", "dev/cf/token"], &agent.socket, Some("cf-token-xyz\n")));
+    let dir = agent.socket.parent().unwrap();
+    fs::write(dir.join("wrangler.tpl.toml"), "name = \"site\"\napi_token = \"{{ harar://dev/cf/token }}\"\n").unwrap();
+    fs::write(dir.join("wrangler.toml"), "stale").unwrap();
+    fs::set_permissions(dir.join("wrangler.toml"), fs::Permissions::from_mode(0o644)).unwrap();
+
+    let out = run_in(dir, &["inject", "-i", "wrangler.tpl.toml", "-o", "wrangler.toml"], &agent.socket);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(fs::read_to_string(dir.join("wrangler.toml")).unwrap(), "name = \"site\"\napi_token = \"cf-token-xyz\"\n");
+    assert_eq!(fs::metadata(dir.join("wrangler.toml")).unwrap().permissions().mode() & 0o777, 0o600);
+
+    fs::write(dir.join("bad.tpl"), "x = \"{{ harar://dev/missing }}\"\n").unwrap();
+    let bad = run_in(dir, &["inject", "-i", "bad.tpl", "-o", "bad.out"], &agent.socket);
+    assert!(!bad.status.success());
+    assert!(!dir.join("bad.out").exists(), "nothing is written when a reference is missing");
+}
