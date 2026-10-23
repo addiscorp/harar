@@ -18,6 +18,19 @@ pub struct SecretInput {
 }
 
 impl SecretInput {
+    /// Like `read`, but a person typing at a prompt types it twice.
+    pub fn read_confirmed(self, prompt: &str) -> Result<String> {
+        let prompts = !self.secret_stdin
+            && self.secret_file.is_none()
+            && self.secret_env.is_none()
+            && std::io::stdin().is_terminal();
+        let value = self.read(prompt)?;
+        if prompts && prompt_no_echo(&format!("{prompt} again"))?.trim() != value {
+            return Err(anyhow!("the two entries did not match"));
+        }
+        Ok(value)
+    }
+
     pub fn read(self, prompt: &str) -> Result<String> {
         let value = if self.secret_stdin {
             read_stdin()?

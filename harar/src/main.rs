@@ -21,6 +21,8 @@ use tokio::net::{TcpStream, UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
 mod cli;
+#[cfg(target_os = "macos")]
+mod enclave;
 mod master_key;
 
 const DEFAULT_SOCKET_PATH: &str = "/run/harar.sock";

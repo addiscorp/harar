@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 pub mod get;
 pub mod jwks;
+pub mod key;
 pub mod mint;
 pub mod proxy;
 pub mod put;
@@ -32,6 +33,7 @@ enum Command {
     Verify(verify::Verify),
     Revoke(revoke::Revoke),
     Jwks(jwks::Jwks),
+    Key(key::Key),
     Setup(setup::Setup),
     Version(version::Version),
 }
@@ -52,6 +54,7 @@ pub async fn run() -> anyhow::Result<()> {
         Command::Verify(cmd) => verify::run(cmd).await,
         Command::Revoke(cmd) => revoke::run(cmd).await,
         Command::Jwks(cmd) => jwks::run(cmd).await,
+        Command::Key(cmd) => key::run(cmd).await,
         Command::Setup(cmd) => setup::run(cmd).await,
         Command::Version(cmd) => version::run(cmd),
     }
