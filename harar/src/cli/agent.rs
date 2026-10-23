@@ -43,20 +43,10 @@ pub async fn run(cmd: Agent) -> Result<()> {
         return Ok(());
     }
     agent::disable_core_dumps()?;
-    let tier = master_key::key_tier(&cmd.key)?;
-    if tier == KeyTier::Missing {
+    if master_key::key_tier(&cmd.key)? == KeyTier::Missing {
         return Err(anyhow!("no master key at {}; create one with `harar key init`", cmd.key.display()));
     }
-    let unlock_path = cmd.key.clone();
-    let approve_path = cmd.key.clone();
-    let (approve, approvals): (agent::Approve, &'static str) = match tier {
-        // Opening the sealed key again asks the person, which is the approval.
-        KeyTier::SecureEnclave => (
-            Box::new(move || master_key::load_master_key_file(&approve_path).map(drop)),
-            "secure-enclave",
-        ),
-        KeyTier::File | KeyTier::Missing => (Box::new(|| Ok(())), "none"),
-    };
+    let (unlock, approve, approvals) = key_closures(master_key::MasterKeyFile::read(&cmd.key)?);
     let vault = Vault::new(
         VaultConfig {
             state_path: cmd.state,
@@ -66,13 +56,27 @@ pub async fn run(cmd: Agent) -> Result<()> {
             session_idle: Duration::from_secs(cmd.session_idle_minutes * 60),
             approvals,
         },
-        Box::new(move || master_key::load_master_key_file(&unlock_path)),
+        unlock,
         approve,
         Instant::now(),
     );
     let listener = agent::bind(&cmd.socket)?;
     eprintln!("harar agent listening on {} (locked)", cmd.socket.display());
     agent::serve(listener, vault).await
+}
+
+/// Unlocks and approvals both open the key file as the agent read it at start,
+/// never the path again: swapping the file for a plain key must not turn an
+/// approval into one that never asks.
+fn key_closures(key: master_key::MasterKeyFile) -> (agent::Unlock, agent::Approve, &'static str) {
+    let key = std::sync::Arc::new(key);
+    let unlock_key = std::sync::Arc::clone(&key);
+    let unlock: agent::Unlock = Box::new(move || unlock_key.open());
+    match key.tier() {
+        // Opening the sealed key again asks the person, which is the approval.
+        KeyTier::SecureEnclave => (unlock, Box::new(move || key.open().map(drop)), "secure-enclave"),
+        KeyTier::File | KeyTier::Missing => (unlock, Box::new(|| Ok(())), "none"),
+    }
 }
 
 #[derive(Debug, Args)]
@@ -128,4 +132,40 @@ fn send(socket: &std::path::Path, request: &AgentRequest) -> Result<()> {
         return Err(anyhow!("{}", reply["error"].as_str().unwrap_or("agent refused the request")));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn swapping_the_key_file_never_changes_what_the_agent_opens() {
+        if crate::enclave::tests::test_key().is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("harar/master.key");
+        let sealed = master_key::create_enclave_master_key(
+            &path,
+            &master_key::default_recovery_path(&path),
+            "correct horse battery".to_string().into(),
+            crate::enclave::Presence::NotRequired,
+        )
+        .unwrap();
+        let (unlock, approve, approvals) = key_closures(master_key::MasterKeyFile::read(&path).unwrap());
+        assert_eq!(approvals, "secure-enclave");
+
+        // Another process of this user swaps in a plain key it made itself.
+        let planted = age::x25519::Identity::generate();
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, format!("{}\n", age::secrecy::ExposeSecret::expose_secret(&planted.to_string()))).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+
+        assert_eq!(unlock().unwrap().to_public().to_string(), sealed.to_public().to_string());
+        fs::remove_file(&path).unwrap();
+        approve().expect("approval opens the sealed key read at start, not the path");
+        assert_eq!(unlock().unwrap().to_public().to_string(), sealed.to_public().to_string());
+    }
 }

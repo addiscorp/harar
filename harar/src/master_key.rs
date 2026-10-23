@@ -106,39 +106,60 @@ pub fn load_master_key() -> Result<age::x25519::Identity> {
 }
 
 pub(crate) fn load_master_key_file(path: &Path) -> Result<age::x25519::Identity> {
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+    MasterKeyFile::read(path)?.open()
+}
+
+/// A master key file as it was read once. Opening it again never goes back to
+/// the path, so a file swapped in later is never the one opened.
+pub(crate) struct MasterKeyFile {
+    path: PathBuf,
+    contents: String,
+}
+
+impl MasterKeyFile {
+    pub(crate) fn read(path: &Path) -> Result<Self> {
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(anyhow!(
+                    "missing harar master key at {}; create one with `age-keygen -o {}` and `chmod 0400` it before starting harar",
+                    path.display(),
+                    path.display()
+                ));
+            }
+            Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+        };
+
+        let metadata = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != 0o400 {
             return Err(anyhow!(
-                "missing harar master key at {}; create one with `age-keygen -o {}` and `chmod 0400` it before starting harar",
+                "{} must be mode 0400; found {:03o}",
                 path.display(),
-                path.display()
+                mode
             ));
         }
-        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
-    };
-
-    let metadata = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
-    let mode = metadata.permissions().mode() & 0o777;
-    if mode != 0o400 {
-        return Err(anyhow!(
-            "{} must be mode 0400; found {:03o}",
-            path.display(),
-            mode
-        ));
+        Ok(MasterKeyFile { path: path.to_path_buf(), contents })
     }
 
-    if contents.trim_start().starts_with('{') {
-        return open_enclave_envelope(&contents, path);
+    pub(crate) fn tier(&self) -> KeyTier {
+        if self.contents.trim_start().starts_with('{') { KeyTier::SecureEnclave } else { KeyTier::File }
     }
 
-    contents
-        .lines()
-        .find(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
-        .ok_or_else(|| anyhow!("{} does not contain an age x25519 identity", path.display()))?
-        .trim()
-        .parse::<age::x25519::Identity>()
-        .map_err(|err| anyhow!("parse age x25519 identity from {}: {err}", path.display()))
+    /// Opens the key. A Secure Enclave key asks the person each time.
+    pub(crate) fn open(&self) -> Result<age::x25519::Identity> {
+        let path = &self.path;
+        if self.tier() == KeyTier::SecureEnclave {
+            return open_enclave_envelope(&self.contents, path);
+        }
+        self.contents
+            .lines()
+            .find(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+            .ok_or_else(|| anyhow!("{} does not contain an age x25519 identity", path.display()))?
+            .trim()
+            .parse::<age::x25519::Identity>()
+            .map_err(|err| anyhow!("parse age x25519 identity from {}: {err}", path.display()))
+    }
 }
 
 pub fn key_tier(path: &Path) -> Result<KeyTier> {
