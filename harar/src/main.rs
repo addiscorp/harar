@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 #[cfg(test)]
 use harar_client::VaultClient;
 use harar_client::{
@@ -427,7 +428,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
     let replication_meta_path = replication_meta_path(&config.state_path);
     let replication_log_path = replication_log_path(&config.state_path);
     let meta = load_replication_meta(&replication_meta_path)?;
-    let replication_log = load_replication_log(&replication_log_path)?;
+    let replication_log = load_replication_log(&replication_log_path, &master_key)?;
     let replication_token = load_replication_token(&config.replication_token_path)?;
     let signing_key = load_or_create_signing_key(&config.signing_key_path)?;
     let state = Arc::new(AppState {
@@ -1054,7 +1055,7 @@ async fn append_replication_log(
         key: key.to_string(),
         value,
     };
-    append_persistent_replication_log(&state.replication_log_path, &entry)?;
+    append_persistent_replication_log(&state.replication_log_path, &state.master_recipient, &entry)?;
     state.replication_log.lock().await.push(entry);
     persist_replication_meta(
         &state.replication_meta_path,
@@ -2034,29 +2035,82 @@ async fn persist_current_replication_meta(state: &AppState) -> Result<()> {
     )
 }
 
-fn load_replication_log(path: &Path) -> Result<Vec<ReplicationLogEntry>> {
+/// Reads the replication log. Each line is one entry encrypted to the master
+/// key, because entries carry the values they replicate. Lines written in plain
+/// JSON by older versions are read once and the file is rewritten encrypted.
+fn load_replication_log(path: &Path, identity: &age::x25519::Identity) -> Result<Vec<ReplicationLogEntry>> {
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
     };
-    contents
+    let mut plain_lines = false;
+    let entries = contents
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
-            serde_json::from_str::<ReplicationLogEntry>(line)
-                .with_context(|| format!("decode replication log entry in {}", path.display()))
+            let json = if line.trim_start().starts_with('{') {
+                plain_lines = true;
+                line.as_bytes().to_vec()
+            } else {
+                let sealed = BASE64
+                    .decode(line.trim())
+                    .with_context(|| format!("decode replication log entry in {}", path.display()))?;
+                age::decrypt(identity, &sealed)
+                    .with_context(|| format!("decrypt replication log entry in {}", path.display()))?
+            };
+            serde_json::from_slice::<ReplicationLogEntry>(&json)
+                .with_context(|| format!("parse replication log entry in {}", path.display()))
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    if plain_lines {
+        rewrite_replication_log(path, &identity.to_public(), &entries)?;
+    }
+    Ok(entries)
 }
 
-fn append_persistent_replication_log(path: &Path, entry: &ReplicationLogEntry) -> Result<()> {
+fn sealed_replication_line(recipient: &age::x25519::Recipient, entry: &ReplicationLogEntry) -> Result<String> {
+    let json = serde_json::to_vec(entry).context("encode replication log entry")?;
+    let sealed = age::encrypt(recipient, &json).context("encrypt replication log entry")?;
+    Ok(format!("{}\n", BASE64.encode(sealed)))
+}
+
+/// Replaces the log with the same entries, encrypted, leaving no plain copy.
+fn rewrite_replication_log(
+    path: &Path,
+    recipient: &age::x25519::Recipient,
+    entries: &[ReplicationLogEntry],
+) -> Result<()> {
+    let mut text = String::new();
+    for entry in entries {
+        text.push_str(&sealed_replication_line(recipient, entry)?);
+    }
+    let tmp = path.with_extension(format!("rewrite-{}", std::process::id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .with_context(|| format!("create {}", tmp.display()))?;
+    file.write_all(text.as_bytes()).context("write replication log")?;
+    file.sync_all().context("sync replication log")?;
+    fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))?;
+    try_chown(path, Some("gild-vault"), None);
+    Ok(())
+}
+
+fn append_persistent_replication_log(
+    path: &Path,
+    recipient: &age::x25519::Recipient,
+    entry: &ReplicationLogEntry,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
         fs::set_permissions(parent, fs::Permissions::from_mode(0o750))
             .with_context(|| format!("chmod 0750 {}", parent.display()))?;
         try_chown(parent, Some("gild-vault"), Some("gild"));
     }
+    let line = sealed_replication_line(recipient, entry)?;
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -2064,9 +2118,7 @@ fn append_persistent_replication_log(path: &Path, entry: &ReplicationLogEntry) -
         .open(path)
         .with_context(|| format!("open {}", path.display()))?;
     try_chown(path, Some("gild-vault"), None);
-    serde_json::to_writer(&mut file, entry).context("encode replication log entry")?;
-    file.write_all(b"\n")
-        .context("write replication log newline")?;
+    file.write_all(line.as_bytes()).context("write replication log entry")?;
     file.sync_all().context("sync replication log")?;
     Ok(())
 }
@@ -3614,13 +3666,63 @@ mod tests {
 
         assert!(response.ok);
         let meta = load_replication_meta(&state.replication_meta_path).unwrap();
-        let log = load_replication_log(&state.replication_log_path).unwrap();
+        let log = load_replication_log(&state.replication_log_path, &state.master_identity).unwrap();
         assert_eq!(meta.version, 1);
         assert_eq!(meta.epoch, 0);
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].version, 1);
         assert_eq!(log[0].op, "put");
         assert_eq!(log[0].value.as_deref(), Some("new-value"));
+    }
+
+    fn files_containing(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                found.extend(files_containing(&path, needle));
+            } else if fs::read(&path).unwrap().windows(needle.len()).any(|w| w == needle) {
+                found.push(path);
+            }
+        }
+        found
+    }
+
+    #[tokio::test]
+    async fn a_stored_value_is_in_no_file_on_disk() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path());
+        let value = "plain-text-must-not-reach-disk-7c1e";
+        let response = handle_request(
+            &state,
+            &peer(0, "root"),
+            VaultRequest::Put { key: "NEW_SECRET".to_string(), value: value.to_string(), shop_id: None },
+        )
+        .await
+        .unwrap();
+        assert!(response.ok);
+        assert!(state.replication_log_path.exists(), "the put was replicated");
+        assert_eq!(files_containing(dir.path(), value.as_bytes()), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn a_plain_replication_log_from_an_older_version_is_rewritten_sealed() {
+        let dir = tempdir().unwrap();
+        let identity = age::x25519::Identity::generate();
+        let path = dir.path().join("keys.age.replication.log");
+        let entry = ReplicationLogEntry {
+            version: 3,
+            timestamp: 1,
+            op: "put".to_string(),
+            key: "OLD".to_string(),
+            value: Some("old-plain-value".to_string()),
+        };
+        fs::write(&path, format!("{}\n", serde_json::to_string(&entry).unwrap())).unwrap();
+
+        assert_eq!(load_replication_log(&path, &identity).unwrap(), vec![entry.clone()]);
+        assert_eq!(files_containing(dir.path(), b"old-plain-value"), Vec::<PathBuf>::new());
+        assert_eq!(load_replication_log(&path, &identity).unwrap(), vec![entry]);
+        assert!(load_replication_log(&path, &age::x25519::Identity::generate()).is_err(), "another key can't read it");
     }
 
     #[tokio::test]
