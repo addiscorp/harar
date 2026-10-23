@@ -11,6 +11,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
+pub mod model;
+
 const DEFAULT_SOCKET_PATH: &str = "/run/tana-vault.sock";
 pub const DEFAULT_GILD_VAULT_SOCKET_PATH: &str = "/run/harar.sock";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
