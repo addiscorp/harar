@@ -6,6 +6,7 @@ pub mod get;
 pub mod jwks;
 pub mod key;
 pub mod mint;
+pub mod plugin;
 pub mod proxy;
 pub mod put;
 pub mod revoke;
@@ -36,6 +37,7 @@ enum Command {
     Run(run::Run),
     Import(run::Import),
     Inject(run::Inject),
+    Plugin(plugin::Plugin),
     Get(get::Get),
     Put(put::Put),
     Mint(mint::Mint),
@@ -74,6 +76,7 @@ pub async fn run() -> anyhow::Result<()> {
         Command::Run(cmd) => run::run(cmd).await,
         Command::Import(cmd) => run::import(cmd).await,
         Command::Inject(cmd) => run::inject(cmd).await,
+        Command::Plugin(cmd) => plugin::run(cmd).await,
         Command::Get(cmd) => get::run(cmd).await,
         Command::Put(cmd) => put::run(cmd).await,
         Command::Mint(cmd) => mint::run(cmd).await,

@@ -221,3 +221,37 @@ fn inject_fills_a_template_into_a_private_file() {
     assert!(!bad.status.success());
     assert!(!dir.join("bad.out").exists(), "nothing is written when a reference is missing");
 }
+
+#[test]
+fn plugin_hands_the_token_to_the_tool_for_that_call_only() {
+    let agent = start_agent();
+    let dir = agent.socket.parent().unwrap();
+    let bin = dir.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let record = dir.join("seen");
+    fs::write(bin.join("gh"), format!("#!/bin/sh\nprintf '%s|%s' \"$GH_TOKEN\" \"$*\" > {}\n", record.display())).unwrap();
+    fs::set_permissions(bin.join("gh"), fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut init = harar()
+        .args(["plugin", "init", "gh", "--secret-stdin"])
+        .env("HARAR_SOCKET", &agent.socket)
+        .env("HOME", dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    init.stdin.take().unwrap().write_all(b"ghp_example_token\n").unwrap();
+    let init = json(&init.wait_with_output().unwrap());
+    assert_eq!(init["alias"], "alias gh='harar plugin run gh --'");
+
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let out = harar()
+        .args(["plugin", "run", "gh", "--", "pr", "list", "--limit", "5"])
+        .env("HARAR_SOCKET", &agent.socket)
+        .env("PATH", path)
+        .env_remove("GH_TOKEN")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(fs::read_to_string(&record).unwrap(), "ghp_example_token|pr list --limit 5");
+}
