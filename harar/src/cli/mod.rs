@@ -21,6 +21,7 @@ pub mod setup;
 pub mod ssh;
 pub mod verify;
 pub mod version;
+pub mod vm;
 
 const DEFAULT_SOCKET_PATH: &str = "/run/harar.sock";
 
@@ -57,6 +58,7 @@ enum Command {
     Env(runs::EnvCmd),
     Runs(runs::RunsCmd),
     Host(hosts::HostCmd),
+    Vm(vm::VmCmd),
     Mint(mint::Mint),
     Verify(verify::Verify),
     Revoke(revoke::Revoke),
@@ -108,6 +110,7 @@ pub async fn run() -> anyhow::Result<()> {
         Command::Env(cmd) => runs::env(cmd).await,
         Command::Runs(cmd) => runs::runs(cmd).await,
         Command::Host(cmd) => hosts::host(cmd).await,
+        Command::Vm(cmd) => vm::vm(cmd).await,
         Command::Mint(cmd) => mint::run(cmd).await,
         Command::Verify(cmd) => verify::run(cmd).await,
         Command::Revoke(cmd) => revoke::run(cmd).await,

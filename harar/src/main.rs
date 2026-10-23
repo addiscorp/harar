@@ -39,6 +39,9 @@ mod screen;
 mod sessions;
 mod ssh;
 mod template;
+#[cfg(target_os = "linux")]
+mod vm;
+mod vms;
 #[cfg(target_os = "macos")]
 mod enclave;
 mod master_key;
@@ -435,6 +438,25 @@ enum VaultRequest {
         name: String,
     },
     Hosts,
+    VmRegister {
+        cid: u32,
+        name: String,
+        runs_for: harar_client::vms::VmFor,
+    },
+    VmForget {
+        cid: u32,
+    },
+    /// From the host's vsock service: a token for the VM at `cid`.
+    VmToken {
+        cid: u32,
+        ask: TokenAsk,
+    },
+    /// From the host's vsock service: build secrets for the run VM at `cid`.
+    VmSecrets {
+        cid: u32,
+        env: String,
+    },
+    Vms,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -498,6 +520,8 @@ struct VaultResponse {
     run_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     hosts: Option<harar_client::hosts::HostsState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vms: Option<harar_client::vms::VmsState>,
 }
 
 impl VaultResponse {
@@ -533,6 +557,7 @@ impl VaultResponse {
             secrets: None,
             run_token: None,
             hosts: None,
+            vms: None,
         }
     }
 
@@ -568,6 +593,7 @@ impl VaultResponse {
             secrets: None,
             run_token: None,
             hosts: None,
+            vms: None,
         }
     }
 }
@@ -1085,6 +1111,10 @@ async fn handle_request(
             | VaultRequest::HostApprove { .. }
             | VaultRequest::HostReject { .. }
             | VaultRequest::HostRemove { .. }
+            | VaultRequest::VmRegister { .. }
+            | VaultRequest::VmForget { .. }
+            | VaultRequest::VmToken { .. }
+            | VaultRequest::VmSecrets { .. }
     ) {
         if *state.mode.lock().await == Mode::Replica {
             audit(
@@ -1522,6 +1552,96 @@ async fn handle_request(
             },
             Err(reason) => VaultResponse::error(reason),
         },
+        VaultRequest::VmRegister { cid, name, runs_for } => {
+            let now = now_epoch_seconds()?;
+            let mut keys = state.keys.lock().await;
+            let registered = caller_workload(&keys, peer).and_then(|caller| {
+                let manages = match &runs_for {
+                    harar_client::vms::VmFor::Session(sid) => {
+                        sessions::load(&keys)?.get(sid).is_some_and(|s| s.started_by == caller)
+                    }
+                    harar_client::vms::VmFor::Run(id) => runs::load(&keys)?.runs.get(id).is_some_and(|r| r.registered_by == caller),
+                };
+                if !manages {
+                    return Err("not_found");
+                }
+                let mut all = vms::load(&keys)?;
+                vms::register(&mut all, &caller, cid, &name, runs_for, now)?;
+                Ok(all)
+            });
+            match registered {
+                Ok(all) => {
+                    write_entry(state, &mut keys, vms::VMS_KEY, vms::store(&all)).await?;
+                    VaultResponse { vms: Some(all), ..VaultResponse::ok() }
+                }
+                Err(reason) => VaultResponse::error(reason),
+            }
+        }
+        VaultRequest::VmForget { cid } => {
+            let mut keys = state.keys.lock().await;
+            let forgotten = caller_workload(&keys, peer).and_then(|caller| {
+                let mut all = vms::load(&keys)?;
+                found(vms::forget(&mut all, &caller, cid))?;
+                Ok(all)
+            });
+            match forgotten {
+                Ok(all) => {
+                    write_entry(state, &mut keys, vms::VMS_KEY, vms::store(&all)).await?;
+                    VaultResponse { vms: Some(all), ..VaultResponse::ok() }
+                }
+                Err(reason) => VaultResponse::error(reason),
+            }
+        }
+        VaultRequest::VmToken { cid, ask } => {
+            let now = now_epoch_seconds()?;
+            update_runs_always(state, |r, keys| {
+                let caller = caller_workload(keys, peer)?;
+                let all = vms::load(keys)?;
+                let vm = vms::find(&all, &caller, cid)?;
+                let request = match &vm.runs_for {
+                    harar_client::vms::VmFor::Session(_) => vms::session_token(&sessions::load(keys)?, vm, &ask, now)?,
+                    harar_client::vms::VmFor::Run(_) => vms::run_token(r, vm, &ask, now)?,
+                };
+                let alg = ask.alg.unwrap_or(Alg::ES256);
+                state.issuer.issue(&request, alg, now).map_err(|err| token_error_code(&err))
+            })
+            .await?
+            .map_or_else(VaultResponse::error, |(token, claims)| VaultResponse {
+                token: Some(token),
+                claims: Some(claims),
+                ..VaultResponse::ok()
+            })
+        }
+        VaultRequest::VmSecrets { cid, env } => {
+            let now = now_epoch_seconds()?;
+            update_runs_always(state, |r, keys| {
+                let caller = caller_workload(keys, peer)?;
+                let all = vms::load(keys)?;
+                let harar_client::vms::VmFor::Run(run) = &vms::find(&all, &caller, cid)?.runs_for else {
+                    return Err("not_a_run_vm");
+                };
+                runs::secrets(r, keys, run, &env, now)
+            })
+            .await?
+            .map_or_else(VaultResponse::error, |secrets| VaultResponse {
+                secrets: Some(secrets),
+                ..VaultResponse::ok()
+            })
+        }
+        VaultRequest::Vms => {
+            let keys = state.keys.lock().await;
+            let visible = vms::load(&keys).and_then(|mut all| {
+                if !is_admin(peer) {
+                    let caller = caller_workload(&keys, peer)?;
+                    all.vms.retain(|_, vm| vm.host_workload == caller);
+                }
+                Ok(all)
+            });
+            match visible {
+                Ok(all) => VaultResponse { vms: Some(all), ..VaultResponse::ok() },
+                Err(reason) => VaultResponse::error(reason),
+            }
+        }
         VaultRequest::Health => {
             let keys = state.keys.lock().await;
             VaultResponse {
@@ -1566,6 +1686,17 @@ impl SessionManager {
             Self::Workload(sub) => &run.registered_by == sub,
         }
     }
+}
+
+/// The workload the calling OS user speaks as.
+fn caller_workload(keys: &HashMap<String, String>, peer: &PeerCred) -> Result<String, &'static str> {
+    let user = peer.username.as_deref().unwrap_or_default();
+    identity::load(keys)?
+        .workloads
+        .into_iter()
+        .find(|w| w.user == user)
+        .map(|w| w.sub)
+        .ok_or("not_a_workload")
 }
 
 fn issue(state: &AppState, request: &IdentityRequest, now: u64) -> Result<String, &'static str> {
@@ -2624,6 +2755,11 @@ impl VaultRequest {
             Self::HostReject { .. } => "host_reject",
             Self::HostRemove { .. } => "host_remove",
             Self::Hosts => "hosts",
+            Self::VmRegister { .. } => "vm_register",
+            Self::VmForget { .. } => "vm_forget",
+            Self::VmToken { .. } => "vm_token",
+            Self::VmSecrets { .. } => "vm_secrets",
+            Self::Vms => "vms",
         }
     }
 
@@ -2659,7 +2795,10 @@ impl VaultRequest {
             Self::RunSecrets { env, .. } => Some(env),
             Self::RunToken { audience, .. } => Some(audience),
             Self::RunDecide { id, .. } | Self::RunFinish { id } => Some(id),
-            Self::Runs | Self::Hosts => None,
+            Self::Runs | Self::Hosts | Self::Vms | Self::VmForget { .. } => None,
+            Self::VmRegister { name, .. } => Some(name),
+            Self::VmToken { ask, .. } => Some(&ask.audience),
+            Self::VmSecrets { env, .. } => Some(env),
             Self::HostApprove { name, .. } | Self::HostReject { name } | Self::HostRemove { name } => Some(name),
             Self::Token(ask) => Some(&ask.audience),
             Self::WorkloadAdd(Workload { sub, .. })
@@ -2720,6 +2859,12 @@ fn authorize(peer: &PeerCred, request: &VaultRequest) -> Decision {
         | VaultRequest::RunToken { .. }
         | VaultRequest::RunFinish { .. }
         | VaultRequest::Runs => Decision::Allow,
+        // Decided in the handler: by the workload that manages the VM.
+        VaultRequest::VmRegister { .. }
+        | VaultRequest::VmForget { .. }
+        | VaultRequest::VmToken { .. }
+        | VaultRequest::VmSecrets { .. }
+        | VaultRequest::Vms => Decision::Allow,
         VaultRequest::WorkloadAdd(_)
         | VaultRequest::WorkloadRemove { .. }
         | VaultRequest::Grant(_)
