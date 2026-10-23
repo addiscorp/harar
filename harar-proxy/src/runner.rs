@@ -20,8 +20,8 @@ use tokio_rustls::TlsAcceptor;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 const DEFAULT_PORT: u16 = 9444;
-const DEFAULT_AUDIT_LOG_PATH: &str = "/var/log/gild-vault-proxy-audit.log";
-pub const DEFAULT_SOCKET_PATH: &str = "/run/gild-vault/sock";
+const DEFAULT_AUDIT_LOG_PATH: &str = "/var/log/harar-proxy-audit.log";
+pub const DEFAULT_SOCKET_PATH: &str = "/run/harar/sock";
 
 pub async fn run_from_env_and_args() -> Result<()> {
     // Other workspace dependencies enable both Rustls providers. Select the provider used
@@ -59,7 +59,7 @@ pub async fn run_from_env_and_args() -> Result<()> {
 async fn smoke_check_vault(vault: &VaultClient, socket_path: &Path) -> Result<()> {
     vault.health().await.with_context(|| {
         format!(
-            "gild-vault health check failed on socket {}; refusing to bind",
+            "harar health check failed on socket {}; refusing to bind",
             socket_path.display()
         )
     })?;
@@ -212,7 +212,7 @@ async fn serve_plain(addr: SocketAddr, state: AppState) -> Result<()> {
         .with_context(|| format!("bind {addr}"))?;
     serve_accepted(listener, state, None)
         .await
-        .context("serve plain gild-vault-proxy")
+        .context("serve plain harar-proxy")
 }
 
 async fn serve_tls(config: TlsConfig, state: AppState) -> Result<()> {
@@ -228,7 +228,7 @@ async fn serve_tls(config: TlsConfig, state: AppState) -> Result<()> {
             let tls_stream = match acceptor.accept(stream).await {
                 Ok(stream) => stream,
                 Err(err) => {
-                    eprintln!("gild-vault-proxy tls handshake failed from {remote_addr}: {err}");
+                    eprintln!("harar-proxy tls handshake failed from {remote_addr}: {err}");
                     return;
                 }
             };
@@ -247,7 +247,7 @@ async fn serve_tls(config: TlsConfig, state: AppState) -> Result<()> {
                 .serve_connection(io, TowerToHyperService::new(service))
                 .await
             {
-                eprintln!("gild-vault-proxy tls connection error from {remote_addr}: {err}");
+                eprintln!("harar-proxy tls connection error from {remote_addr}: {err}");
             }
         });
     }
@@ -272,7 +272,7 @@ async fn serve_accepted(
                 .serve_connection(io, TowerToHyperService::new(service))
                 .await
             {
-                eprintln!("gild-vault-proxy connection error from {remote_addr}: {err}");
+                eprintln!("harar-proxy connection error from {remote_addr}: {err}");
             }
         });
     }

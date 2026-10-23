@@ -23,11 +23,11 @@ use tokio::sync::Mutex;
 mod cli;
 mod master_key;
 
-const DEFAULT_SOCKET_PATH: &str = "/run/gild-vault.sock";
-const DEFAULT_STATE_PATH: &str = "/var/lib/gild-vault/keys.age";
-const DEFAULT_AUDIT_LOG_PATH: &str = "/var/log/gild-vault.log";
+const DEFAULT_SOCKET_PATH: &str = "/run/harar.sock";
+const DEFAULT_STATE_PATH: &str = "/var/lib/harar/keys.age";
+const DEFAULT_AUDIT_LOG_PATH: &str = "/var/log/harar.log";
 const DEFAULT_REPLICATION_TOKEN_PATH: &str = "/etc/gild/vault-replication-token";
-const DEFAULT_SIGNING_KEY_PATH: &str = "/var/lib/gild-vault/harar-signing.key";
+const DEFAULT_SIGNING_KEY_PATH: &str = "/var/lib/harar/harar-signing.key";
 const DEFAULT_HEARTBEAT_INTERVAL_SECONDS: u64 = 5;
 const DEFAULT_SYNC_INTERVAL_SECONDS: u64 = 30;
 const DEFAULT_PROMOTE_AFTER_FAILURES: u32 = 5;
@@ -471,14 +471,14 @@ async fn serve(config: Config, state: Arc<AppState>) -> Result<()> {
         }
     };
 
-    eprintln!("gild-vault listening on {}", config.socket_path.display());
+    eprintln!("harar listening on {}", config.socket_path.display());
 
     loop {
         let (stream, _) = listener.accept().await.context("accept unix connection")?;
         let state = Arc::clone(&state);
         tokio::spawn(async move {
             if let Err(err) = handle_connection(stream, state).await {
-                eprintln!("gild-vault connection error: {err:#}");
+                eprintln!("harar connection error: {err:#}");
             }
         });
     }
@@ -525,7 +525,7 @@ async fn handle_connection(mut stream: UnixStream, state: Arc<AppState>) -> Resu
         match response {
             Ok(reply) => write_http_json(&mut stream, reply.status, reply.body).await?,
             Err(err) => {
-                eprintln!("gild-vault HTTP request error: {err:#}");
+                eprintln!("harar HTTP request error: {err:#}");
                 write_http_json(
                     &mut stream,
                     400,
@@ -1156,15 +1156,15 @@ async fn heartbeat_loop(
                 if let Err(err) =
                     adopt_higher_epoch_if_needed(&state, response.epoch, &upstream_url).await
                 {
-                    eprintln!("gild-vault replica epoch reconciliation failed: {err:#}");
+                    eprintln!("harar replica epoch reconciliation failed: {err:#}");
                 }
             }
             Err(err) => {
                 failures += 1;
-                eprintln!("gild-vault replica heartbeat failed ({failures}): {err:#}");
+                eprintln!("harar replica heartbeat failed ({failures}): {err:#}");
                 if failures >= promote_after_failures {
                     if let Err(err) = promote_replica(&state).await {
-                        eprintln!("gild-vault replica promotion audit failed: {err:#}");
+                        eprintln!("harar replica promotion audit failed: {err:#}");
                     }
                     return;
                 }
@@ -1192,26 +1192,26 @@ async fn sync_loop(state: Arc<AppState>, upstream_url: String, interval: Duratio
                 if let Err(err) =
                     adopt_higher_epoch_if_needed(&state, response.epoch, &upstream_url).await
                 {
-                    eprintln!("gild-vault replica epoch reconciliation failed: {err:#}");
+                    eprintln!("harar replica epoch reconciliation failed: {err:#}");
                     continue;
                 }
                 *state.version.lock().await = response.version;
                 if let Err(err) = persist_current_replication_meta(&state).await {
-                    eprintln!("gild-vault replica metadata persist failed: {err:#}");
+                    eprintln!("harar replica metadata persist failed: {err:#}");
                 }
             }
             Ok(response) => {
                 if let Err(err) =
                     adopt_higher_epoch_if_needed(&state, response.epoch, &upstream_url).await
                 {
-                    eprintln!("gild-vault replica epoch reconciliation failed: {err:#}");
+                    eprintln!("harar replica epoch reconciliation failed: {err:#}");
                     continue;
                 }
                 if let Err(err) = apply_replication_entries(&state, response).await {
-                    eprintln!("gild-vault replica log apply failed: {err:#}");
+                    eprintln!("harar replica log apply failed: {err:#}");
                 }
             }
-            Err(err) => eprintln!("gild-vault replica sync failed: {err:#}"),
+            Err(err) => eprintln!("harar replica sync failed: {err:#}"),
         }
     }
 }
@@ -1248,7 +1248,7 @@ async fn check_authoritative_boot_epoch(state: &AppState, upstream_url: &str) ->
         Ok(response) => response,
         Err(err) => {
             eprintln!(
-                "gild-vault authoritative boot epoch check could not reach peer at {upstream_url}; accepting writes fail-open: {err:#}"
+                "harar authoritative boot epoch check could not reach peer at {upstream_url}; accepting writes fail-open: {err:#}"
             );
             if let Err(audit_err) = append_audit(
                 &state.audit_log_path,
@@ -1261,7 +1261,7 @@ async fn check_authoritative_boot_epoch(state: &AppState, upstream_url: &str) ->
                     result: "peer_unreachable_fail_open",
                 },
             ) {
-                eprintln!("gild-vault boot epoch check audit failed: {audit_err:#}");
+                eprintln!("harar boot epoch check audit failed: {audit_err:#}");
             }
             return Ok(false);
         }
@@ -1269,7 +1269,7 @@ async fn check_authoritative_boot_epoch(state: &AppState, upstream_url: &str) ->
     let local_epoch = *state.epoch.lock().await;
     if response.epoch > local_epoch {
         eprintln!(
-            "gild-vault {HIGHER_EPOCH_PEER_RESULT}: local_epoch={local_epoch}, peer_epoch={}",
+            "harar {HIGHER_EPOCH_PEER_RESULT}: local_epoch={local_epoch}, peer_epoch={}",
             response.epoch
         );
         demote_for_higher_epoch(state, response.epoch).await?;
@@ -1277,7 +1277,7 @@ async fn check_authoritative_boot_epoch(state: &AppState, upstream_url: &str) ->
         *state.fenced.lock().await = true;
         persist_current_replication_meta(state).await?;
         eprintln!(
-            "gild-vault boot epoch reconciliation attached follower to {upstream_url}: epoch={}",
+            "harar boot epoch reconciliation attached follower to {upstream_url}: epoch={}",
             response.epoch
         );
         append_audit(
@@ -1751,15 +1751,26 @@ fn is_replica(peer: &PeerCred) -> bool {
 }
 
 fn peer_credentials(stream: &UnixStream) -> Result<PeerCred> {
+    let (uid, pid) = peer_uid_pid(stream.as_raw_fd())?;
+    Ok(PeerCred {
+        uid,
+        pid,
+        username: username_for_uid(uid),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn peer_uid_pid(fd: std::os::fd::RawFd) -> Result<(u32, i32)> {
     let mut cred = libc::ucred {
         pid: 0,
         uid: 0,
         gid: 0,
     };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `cred` and `len` are valid for writes and sized for SO_PEERCRED.
     let rc = unsafe {
         libc::getsockopt(
-            stream.as_raw_fd(),
+            fd,
             libc::SOL_SOCKET,
             libc::SO_PEERCRED,
             &mut cred as *mut _ as *mut libc::c_void,
@@ -1769,27 +1780,50 @@ fn peer_credentials(stream: &UnixStream) -> Result<PeerCred> {
     if rc != 0 {
         return Err(anyhow!(std::io::Error::last_os_error()));
     }
-
-    Ok(PeerCred {
-        uid: cred.uid,
-        pid: cred.pid,
-        username: username_for_uid(cred.uid),
-    })
+    Ok((cred.uid, cred.pid))
 }
 
+#[cfg(target_os = "macos")]
+fn peer_uid_pid(fd: std::os::fd::RawFd) -> Result<(u32, i32)> {
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    // SAFETY: `uid` and `gid` are valid out-pointers for getpeereid.
+    if unsafe { libc::getpeereid(fd, &mut uid, &mut gid) } != 0 {
+        return Err(anyhow!(std::io::Error::last_os_error()));
+    }
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: `pid` and `len` are valid for writes and sized for LOCAL_PEERPID.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            &mut pid as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(anyhow!(std::io::Error::last_os_error()));
+    }
+    Ok((uid, pid))
+}
+
+/// Looks the account up through the system user database, so it also finds
+/// macOS accounts, which are not listed in /etc/passwd.
 fn username_for_uid(uid: u32) -> Option<String> {
-    let passwd = fs::read_to_string("/etc/passwd").ok()?;
-    passwd.lines().find_map(|line| {
-        let mut fields = line.split(':');
-        let name = fields.next()?;
-        let _password = fields.next()?;
-        let raw_uid = fields.next()?;
-        if raw_uid.parse::<u32>().ok()? == uid {
-            Some(name.to_string())
-        } else {
-            None
-        }
-    })
+    let mut buf = vec![0 as libc::c_char; 4096];
+    // SAFETY: an all-zero passwd is a valid out-parameter for getpwuid_r.
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: every pointer is valid and `buf` outlives the call and the read of `pw_name`.
+    let rc = unsafe { libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result) };
+    if rc != 0 || result.is_null() || pwd.pw_name.is_null() {
+        return None;
+    }
+    // SAFETY: on success `pw_name` points to a NUL-terminated string inside `buf`.
+    let name = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) };
+    Some(name.to_string_lossy().into_owned())
 }
 
 fn load_keys(path: &Path, identity: &age::x25519::Identity) -> Result<HashMap<String, String>> {
@@ -2285,6 +2319,10 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
     fn peer(uid: u32, username: &str) -> PeerCred {
+        // `is_admin` trusts the uid running the tests, and GitHub's runner user
+        // is uid 1001, the same as `agent-amina` here. Move a colliding caller
+        // off it so it stays someone else.
+        let uid = if uid == unsafe { libc::geteuid() } { uid + 100_000 } else { uid };
         PeerCred {
             uid,
             pid: 1234,
@@ -2617,15 +2655,30 @@ mod tests {
         assert!(loaded.is_empty());
     }
 
+    #[tokio::test]
+    async fn peer_credentials_name_the_connecting_process() {
+        let (server, _client) = UnixStream::pair().unwrap();
+        let peer = peer_credentials(&server).unwrap();
+
+        // SAFETY: geteuid has no preconditions.
+        assert_eq!(peer.uid, unsafe { libc::geteuid() });
+        assert_eq!(peer.pid, std::process::id() as i32);
+        assert!(peer.username.as_deref().is_some_and(|name| !name.is_empty()));
+    }
+
     #[test]
     fn missing_master_key_file_has_operator_error() {
         let dir = tempdir().unwrap();
-        let err = match master_key::load_master_key_file(&dir.path().join("missing.key")) {
+        let path = dir.path().join("missing.key");
+        let err = match master_key::load_master_key_file(&path) {
             Ok(_) => panic!("missing master key should fail"),
             Err(err) => err,
         };
 
-        assert!(err.to_string().contains("gild vault init"));
+        assert!(
+            err.to_string()
+                .contains(&format!("age-keygen -o {}", path.display()))
+        );
     }
 
     #[test]

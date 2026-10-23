@@ -1,4 +1,5 @@
 use age::secrecy::ExposeSecret;
+#[cfg(target_os = "linux")]
 use harar_client::{ConsumeOnceRequest, PurgeOnceRequest, StageOnceRequest, VaultClient};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -12,7 +13,7 @@ use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const DEFAULT_SOCKET: &str = "/run/gild-vault.sock";
+const DEFAULT_SOCKET: &str = "/run/harar.sock";
 const MAX_TEST_SOCKET_PATH_BYTES: usize = 104;
 
 #[derive(Debug, Deserialize)]
@@ -83,6 +84,7 @@ impl Drop for TestDir {
 struct VaultDaemon {
     child: Child,
     cleanup_socket: Option<PathBuf>,
+    #[cfg(target_os = "linux")]
     stderr_path: PathBuf,
 }
 
@@ -103,6 +105,7 @@ impl VaultDaemon {
         let _ = self.child.wait();
     }
 
+    #[cfg(target_os = "linux")]
     fn stderr(&self) -> String {
         fs::read_to_string(&self.stderr_path).expect("read daemon stderr")
     }
@@ -283,6 +286,8 @@ fn harar_no_socket_flag_uses_env_selected_socket_over_real_daemon() {
 /// from the connected Unix socket and harar-client serializes the v2 custody
 /// envelopes. The daemon runs in a user namespace which maps this test's host
 /// uid to the real `git-server` uid (994), so there is no injected PeerCred.
+/// Linux only: unprivileged user namespaces (`unshare -U`) do not exist on macOS.
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "current_thread")]
 async fn harar_real_topology_one_time_custody_v2_over_unix_socket() {
     let dir = TestDir::new("harar-custody-v2-topology");
@@ -546,10 +551,12 @@ fn spawn_vault(dir: &Path, socket: &Path, cleanup_socket: Option<PathBuf>) -> Va
     VaultDaemon {
         child,
         cleanup_socket,
+        #[cfg(target_os = "linux")]
         stderr_path,
     }
 }
 
+#[cfg(target_os = "linux")]
 fn spawn_git_server_vault(dir: &Path, socket: &Path) -> VaultDaemon {
     let master_key = dir.join("vault-master.key");
     let replication_token = dir.join("vault-replication-token");
@@ -579,6 +586,7 @@ fn spawn_git_server_vault(dir: &Path, socket: &Path) -> VaultDaemon {
             "994",
             "--",
             gild_vault_bin(),
+            "serve",
             "--socket",
             socket_str(socket),
             "--state-path",
@@ -599,10 +607,12 @@ fn spawn_git_server_vault(dir: &Path, socket: &Path) -> VaultDaemon {
     VaultDaemon {
         child,
         cleanup_socket: Some(socket.to_path_buf()),
+        #[cfg(target_os = "linux")]
         stderr_path,
     }
 }
 
+#[cfg(target_os = "linux")]
 fn assert_terminal(result: Result<String, harar_client::VaultClientError>) {
     assert!(
         result.is_err(),

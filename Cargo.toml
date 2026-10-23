@@ -3,6 +3,7 @@ members = [
     "harar",
     "harar-client",
     "harar-proxy",
+    "seam_ir",
 ]
 resolver = "2"
 

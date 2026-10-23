@@ -1,0 +1,12 @@
+[Unit]
+Description=harar vault socket
+
+[Socket]
+ListenStream=/run/harar.sock
+SocketMode=0660
+SocketUser=harar
+SocketGroup=harar-clients
+RemoveOnStop=true
+
+[Install]
+WantedBy=sockets.target

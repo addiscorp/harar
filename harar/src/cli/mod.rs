@@ -8,13 +8,12 @@ pub mod proxy;
 pub mod put;
 pub mod revoke;
 pub mod secret_input;
-pub mod self_cmd;
 pub mod serve;
 pub mod setup;
 pub mod verify;
 pub mod version;
 
-const DEFAULT_SOCKET_PATH: &str = "/run/gild-vault.sock";
+const DEFAULT_SOCKET_PATH: &str = "/run/harar.sock";
 
 #[derive(Debug, Parser)]
 #[command(name = "harar", about = "Harar vault and token administration")]
@@ -35,8 +34,6 @@ enum Command {
     Jwks(jwks::Jwks),
     Setup(setup::Setup),
     Version(version::Version),
-    #[command(name = "self")]
-    SelfCmd(self_cmd::SelfCommand),
 }
 
 #[derive(Debug, Args)]
@@ -57,7 +54,6 @@ pub async fn run() -> anyhow::Result<()> {
         Command::Jwks(cmd) => jwks::run(cmd).await,
         Command::Setup(cmd) => setup::run(cmd).await,
         Command::Version(cmd) => version::run(cmd),
-        Command::SelfCmd(cmd) => self_cmd::run(cmd).await,
     }
 }
 
@@ -102,7 +98,6 @@ mod tests {
     #[test]
     fn credential_commands_reject_secret_values_in_argv() {
         for argv in [
-            vec!["harar", "self", "login", "--token", "tg_usr_leak"],
             vec![
                 "harar",
                 "verify",
