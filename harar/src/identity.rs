@@ -28,6 +28,9 @@ pub fn add_workload(policy: &mut IdentityPolicy, workload: Workload) -> Result<(
     if workload.user.is_empty() || workload.user.len() > MAX_NAME_LEN || workload.user.contains(char::is_whitespace) {
         return Err("invalid_user");
     }
+    for pattern in &workload.sessions_for {
+        valid_pattern(pattern)?;
+    }
     if policy.workloads.iter().any(|w| w.user == workload.user && w.sub != workload.sub) {
         return Err("user_already_a_workload");
     }
@@ -135,7 +138,7 @@ fn name_chars(value: &str) -> bool {
 }
 
 /// `kind:name`, such as `svc:gild@demon` or `agent:ava`.
-fn valid_subject(sub: &str) -> Result<(), &'static str> {
+pub(crate) fn valid_subject(sub: &str) -> Result<(), &'static str> {
     let ok = sub.len() <= MAX_NAME_LEN
         && name_chars(sub)
         && sub.split_once(':').is_some_and(|(kind, name)| !kind.is_empty() && !name.is_empty());
@@ -158,12 +161,12 @@ fn valid_audience(audience: &str) -> Result<(), &'static str> {
     if ok { Ok(()) } else { Err("invalid_audience") }
 }
 
-fn valid_scope(scope: &str) -> Result<(), &'static str> {
+pub(crate) fn valid_scope(scope: &str) -> Result<(), &'static str> {
     let ok = !scope.is_empty() && scope.len() <= MAX_NAME_LEN && name_chars(scope);
     if ok { Ok(()) } else { Err("invalid_scope") }
 }
 
-fn valid_pattern(pattern: &str) -> Result<(), &'static str> {
+pub(crate) fn valid_pattern(pattern: &str) -> Result<(), &'static str> {
     let body = pattern.strip_suffix('*').unwrap_or(pattern);
     let ok = pattern.len() <= MAX_NAME_LEN && !pattern.is_empty() && name_chars(body);
     if ok { Ok(()) } else { Err("invalid_pattern") }
@@ -177,7 +180,7 @@ mod tests {
 
     fn gild_policy() -> IdentityPolicy {
         let mut policy = IdentityPolicy::default();
-        add_workload(&mut policy, Workload { sub: "svc:gild@demon".into(), user: "gild".into() }).unwrap();
+        add_workload(&mut policy, Workload { sub: "svc:gild@demon".into(), user: "gild".into(), sessions_for: vec![] }).unwrap();
         grant(
             &mut policy,
             Grant {
@@ -256,10 +259,10 @@ mod tests {
     fn one_user_speaks_as_one_subject() {
         let mut policy = gild_policy();
         assert_eq!(
-            add_workload(&mut policy, Workload { sub: "svc:other".into(), user: "gild".into() }),
+            add_workload(&mut policy, Workload { sub: "svc:other".into(), user: "gild".into(), sessions_for: vec![] }),
             Err("user_already_a_workload")
         );
-        add_workload(&mut policy, Workload { sub: "svc:gild@demon".into(), user: "gild2".into() }).unwrap();
+        add_workload(&mut policy, Workload { sub: "svc:gild@demon".into(), user: "gild2".into(), sessions_for: vec![] }).unwrap();
         assert_eq!(decide(&policy, "gild", &ask(&[])), Err("not_a_workload"));
         assert!(decide(&policy, "gild2", &ask(&[])).is_ok());
     }
@@ -268,7 +271,7 @@ mod tests {
     fn names_are_checked() {
         let mut policy = IdentityPolicy::default();
         for sub in ["gild", ":x", "svc:", "svc:has space", "svc:a\"b"] {
-            assert!(add_workload(&mut policy, Workload { sub: sub.into(), user: "u".into() }).is_err(), "{sub}");
+            assert!(add_workload(&mut policy, Workload { sub: sub.into(), user: "u".into(), sessions_for: vec![] }).is_err(), "{sub}");
         }
         let bad = Grant { sub: "svc:a".into(), audience: "has space".into(), scopes: vec![], may_act_for: vec![] };
         assert_eq!(grant(&mut policy, bad), Err("invalid_audience"));

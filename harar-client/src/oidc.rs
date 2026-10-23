@@ -223,6 +223,61 @@ pub struct TokenAsk {
 pub struct Workload {
     pub sub: String,
     pub user: String,
+    /// Subjects it may start sessions for, such as `agent:*`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions_for: Vec<String>,
+}
+
+/// One audience a session may reach, and the scopes it may ask for there.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionGrant {
+    pub audience: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
+
+/// An agent's session. A child session can never reach further than its
+/// parent, and dies with it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Session {
+    pub sid: String,
+    pub sub: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// The workload that started it, or for a child, the parent's.
+    pub started_by: String,
+    /// Who a top-level session acts for, such as `user:sami`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_sub: Option<String>,
+    pub grants: Vec<SessionGrant>,
+    pub created_at: u64,
+    pub expires_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionStartAsk {
+    pub sub: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_sub: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds: Option<u64>,
+    pub grants: Vec<SessionGrant>,
+}
+
+/// Trade a session token for a narrower child: a child session, and a token
+/// for one audience.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExchangeAsk {
+    pub session_token: String,
+    /// The child's name; its subject becomes `<parent sub>/<name>`.
+    pub name: String,
+    pub audience: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds: Option<u64>,
 }
 
 /// What `sub` may ask for from one audience. `scopes` and `may_act_for` hold
@@ -245,6 +300,9 @@ pub struct IdentityPolicy {
     #[serde(default)]
     pub grants: Vec<Grant>,
 }
+
+/// The claim carrying a session's id in session and exchanged tokens.
+pub const SID_CLAIM: &str = "sid";
 
 pub fn discovery_document(issuer: &str) -> serde_json::Value {
     let issuer = issuer.trim_end_matches('/');
