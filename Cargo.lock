@@ -1020,6 +1020,7 @@ dependencies = [
  "harar-proxy",
  "libc",
  "p256",
+ "reqwest",
  "security-framework",
  "security-framework-sys",
  "serde",

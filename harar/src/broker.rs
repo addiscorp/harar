@@ -240,7 +240,7 @@ mod tests {
     fn sessions() -> Sessions {
         let policy = IdentityPolicy {
             workloads: vec![Workload { sub: "svc:gild".into(), user: "gild".into(), sessions_for: vec!["agent:*".into()], runs_for: vec![] }],
-            grants: vec![Grant { sub: "svc:gild".into(), audience: "https://gild.gg".into(), scopes: vec![], may_act_for: vec![] }],
+            grants: vec![Grant { sub: "svc:gild".into(), audience: "https://gild.gg".into(), scopes: vec![], may_act_for: vec![], hardware_only: false }],
         };
         let mut all = Sessions::new();
         let ask = SessionStartAsk {
