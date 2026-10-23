@@ -133,6 +133,22 @@ impl Vault {
         Ok(())
     }
 
+    /// The vault's entries, for a caller who is the owner and whose terminal
+    /// is approved (asking if needed). Used by the SSH agent.
+    pub(crate) fn entries_for(
+        &mut self,
+        peer: &PeerCred,
+        session: i32,
+        now: Instant,
+    ) -> Result<&HashMap<String, String>> {
+        if peer.uid != self.owner_uid {
+            return Err(anyhow!("not_owner"));
+        }
+        self.expire(now);
+        self.admit(session, now)?;
+        Ok(&self.unlocked.as_ref().expect("admit unlocked the vault").keys)
+    }
+
     pub(crate) fn handle(
         &mut self,
         peer: &PeerCred,
@@ -206,7 +222,7 @@ pub(crate) enum AgentReply {
 
 /// The terminal session a process belongs to. Every process started from one
 /// terminal window shares the session of that window's shell.
-fn session_of(pid: i32) -> i32 {
+pub(crate) fn session_of(pid: i32) -> i32 {
     // SAFETY: getsid has no memory-safety preconditions.
     let sid = unsafe { libc::getsid(pid) };
     if sid > 0 { sid } else { pid }
@@ -216,6 +232,10 @@ fn session_of(pid: i32) -> i32 {
 /// `$XDG_RUNTIME_DIR/harar` on Linux.
 pub(crate) fn default_socket_path() -> PathBuf {
     agent_dir().join("agent.sock")
+}
+
+pub(crate) fn default_ssh_socket_path() -> PathBuf {
+    agent_dir().join("ssh.sock")
 }
 
 pub(crate) fn default_state_path() -> PathBuf {
@@ -262,8 +282,9 @@ pub(crate) fn bind(socket_path: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
-pub(crate) async fn serve(listener: UnixListener, vault: Vault) -> Result<()> {
+pub(crate) async fn serve(listener: UnixListener, ssh: UnixListener, vault: Vault) -> Result<()> {
     let vault = Arc::new(Mutex::new(vault));
+    tokio::spawn(crate::ssh::serve(ssh, Arc::clone(&vault)));
     let mut tick = tokio::time::interval(Duration::from_secs(15));
     loop {
         tokio::select! {

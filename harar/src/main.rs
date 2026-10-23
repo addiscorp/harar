@@ -24,6 +24,7 @@ mod agent;
 mod cli;
 mod dotenv;
 mod mask;
+mod ssh;
 mod template;
 #[cfg(target_os = "macos")]
 mod enclave;

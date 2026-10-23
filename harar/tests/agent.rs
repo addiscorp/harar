@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 struct Agent {
     child: Child,
     socket: PathBuf,
+    ssh_socket: PathBuf,
     state: PathBuf,
     _dir: tempfile::TempDir,
 }
@@ -33,10 +34,13 @@ fn start_agent() -> Agent {
     fs::write(&key, age::x25519::Identity::generate().to_string().expose_secret()).unwrap();
     fs::set_permissions(&key, fs::Permissions::from_mode(0o400)).unwrap();
     let socket = dir.path().join("agent.sock");
+    let ssh_socket = dir.path().join("ssh.sock");
     let state = dir.path().join("vault.age");
     let child = harar()
         .args(["agent", "--socket"])
         .arg(&socket)
+        .arg("--ssh-socket")
+        .arg(&ssh_socket)
         .arg("--state")
         .arg(&state)
         .arg("--key")
@@ -50,7 +54,7 @@ fn start_agent() -> Agent {
         assert!(Instant::now() < deadline, "agent did not listen on {}", socket.display());
         std::thread::sleep(Duration::from_millis(25));
     }
-    Agent { child, socket, state, _dir: dir }
+    Agent { child, socket, ssh_socket, state, _dir: dir }
 }
 
 fn run(args: &[&str], socket: &Path, stdin: Option<&str>) -> Output {
@@ -100,6 +104,8 @@ fn a_second_agent_on_the_same_socket_is_refused() {
     let output = harar()
         .args(["agent", "--socket"])
         .arg(&agent.socket)
+        .arg("--ssh-socket")
+        .arg(agent.socket.with_file_name("ssh2.sock"))
         .arg("--key")
         .arg(agent.socket.with_file_name("master.key"))
         .output()
@@ -114,6 +120,8 @@ fn agent_refuses_to_start_without_a_master_key() {
     let output = harar()
         .args(["agent", "--socket"])
         .arg(dir.path().join("a.sock"))
+        .arg("--ssh-socket")
+        .arg(dir.path().join("s.sock"))
         .arg("--key")
         .arg(dir.path().join("missing.key"))
         .output()
@@ -254,4 +262,44 @@ fn plugin_hands_the_token_to_the_tool_for_that_call_only() {
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(fs::read_to_string(&record).unwrap(), "ghp_example_token|pr list --limit 5");
+}
+
+#[test]
+fn openssh_lists_and_signs_with_a_vault_key_like_git_does() {
+    let agent = start_agent();
+    let dir = agent.socket.parent().unwrap();
+    let made = json(&run(&["ssh", "keygen", "git-signing", "--comment", "sami@imac"], &agent.socket, None));
+    let public = made["public_key"].as_str().unwrap().to_string();
+    assert!(public.starts_with("ssh-ed25519 ") && public.ends_with(" sami@imac"));
+
+    let listed = Command::new("ssh-add").arg("-L").env("SSH_AUTH_SOCK", &agent.ssh_socket).output().unwrap();
+    assert!(listed.status.success(), "{}", String::from_utf8_lossy(&listed.stderr));
+    assert_eq!(String::from_utf8_lossy(&listed.stdout).trim(), public);
+
+    // `git commit -S` with gpg.format=ssh runs exactly this.
+    let pubkey = dir.join("signing.pub");
+    fs::write(&pubkey, format!("{public}\n")).unwrap();
+    let message = dir.join("commit.txt");
+    fs::write(&message, "tree 4b825dc\n\nsigned by harar\n").unwrap();
+    let signed = Command::new("ssh-keygen")
+        .args(["-Y", "sign", "-n", "git", "-f"])
+        .arg(&pubkey)
+        .arg(&message)
+        .env("SSH_AUTH_SOCK", &agent.ssh_socket)
+        .output()
+        .unwrap();
+    assert!(signed.status.success(), "{}", String::from_utf8_lossy(&signed.stderr));
+
+    let allowed = dir.join("allowed_signers");
+    fs::write(&allowed, format!("sami@imac {public}\n")).unwrap();
+    let verified = Command::new("ssh-keygen")
+        .args(["-Y", "verify", "-n", "git", "-I", "sami@imac", "-f"])
+        .arg(&allowed)
+        .arg("-s")
+        .arg(message.with_extension("txt.sig"))
+        .stdin(fs::File::open(&message).unwrap())
+        .output()
+        .unwrap();
+    assert!(verified.status.success(), "{}", String::from_utf8_lossy(&verified.stderr));
+    assert!(String::from_utf8_lossy(&verified.stdout).contains("Good \"git\" signature for sami@imac"));
 }

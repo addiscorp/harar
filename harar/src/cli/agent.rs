@@ -14,6 +14,9 @@ pub struct Agent {
     command: Option<AgentCommand>,
     #[arg(long, default_value_os_t = agent::default_socket_path())]
     socket: PathBuf,
+    /// SSH agent socket, for SSH_AUTH_SOCK or IdentityAgent.
+    #[arg(long, default_value_os_t = agent::default_ssh_socket_path())]
+    ssh_socket: PathBuf,
     /// Encrypted vault file.
     #[arg(long, default_value_os_t = agent::default_state_path())]
     state: PathBuf,
@@ -71,8 +74,13 @@ pub async fn run(cmd: Agent) -> Result<()> {
         Instant::now(),
     );
     let listener = agent::bind(&cmd.socket)?;
-    eprintln!("harar agent listening on {} (locked)", cmd.socket.display());
-    agent::serve(listener, vault).await
+    let ssh = agent::bind(&cmd.ssh_socket)?;
+    eprintln!(
+        "harar agent listening on {} and {} (locked)",
+        cmd.socket.display(),
+        cmd.ssh_socket.display()
+    );
+    agent::serve(listener, ssh, vault).await
 }
 
 #[derive(Debug, Args)]

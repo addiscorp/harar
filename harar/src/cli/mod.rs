@@ -14,6 +14,7 @@ pub mod run;
 pub mod secret_input;
 pub mod serve;
 pub mod setup;
+pub mod ssh;
 pub mod verify;
 pub mod version;
 
@@ -38,6 +39,7 @@ enum Command {
     Import(run::Import),
     Inject(run::Inject),
     Plugin(plugin::Plugin),
+    Ssh(ssh::Ssh),
     Get(get::Get),
     Put(put::Put),
     Mint(mint::Mint),
@@ -77,6 +79,7 @@ pub async fn run() -> anyhow::Result<()> {
         Command::Import(cmd) => run::import(cmd).await,
         Command::Inject(cmd) => run::inject(cmd).await,
         Command::Plugin(cmd) => plugin::run(cmd).await,
+        Command::Ssh(cmd) => ssh::run(cmd).await,
         Command::Get(cmd) => get::run(cmd).await,
         Command::Put(cmd) => put::run(cmd).await,
         Command::Mint(cmd) => mint::run(cmd).await,
