@@ -1,6 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
+pub mod agent;
 pub mod get;
 pub mod jwks;
 pub mod key;
@@ -26,6 +27,10 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Serve(serve::Serve),
+    Agent(agent::Agent),
+    Unlock(agent::Unlock),
+    Lock(agent::Lock),
+    Status(agent::Status),
     Proxy(proxy::Proxy),
     Get(get::Get),
     Put(put::Put),
@@ -40,13 +45,27 @@ enum Command {
 
 #[derive(Debug, Args)]
 pub struct SocketArgs {
-    #[arg(long, env = "HARAR_SOCKET", default_value = DEFAULT_SOCKET_PATH)]
+    #[arg(long, env = "HARAR_SOCKET", default_value_os_t = default_socket())]
     socket: PathBuf,
+}
+
+/// On macOS harar runs as the signed-in user, so commands talk to that user's
+/// agent; elsewhere to the system daemon.
+fn default_socket() -> PathBuf {
+    if cfg!(target_os = "macos") {
+        crate::agent::default_socket_path()
+    } else {
+        PathBuf::from(DEFAULT_SOCKET_PATH)
+    }
 }
 
 pub async fn run() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Serve(cmd) => serve::run(cmd).await,
+        Command::Agent(cmd) => agent::run(cmd).await,
+        Command::Unlock(cmd) => agent::unlock(cmd).await,
+        Command::Lock(cmd) => agent::lock(cmd).await,
+        Command::Status(cmd) => agent::status(cmd).await,
         Command::Proxy(cmd) => proxy::run(cmd).await,
         Command::Get(cmd) => get::run(cmd).await,
         Command::Put(cmd) => put::run(cmd).await,
@@ -81,7 +100,7 @@ mod tests {
 
         let cli = SocketOnly::try_parse_from(["harar"]).unwrap();
 
-        assert_eq!(cli.socket.socket, PathBuf::from(DEFAULT_SOCKET_PATH));
+        assert_eq!(cli.socket.socket, default_socket());
         restore_env("HARAR_SOCKET", previous);
     }
 
