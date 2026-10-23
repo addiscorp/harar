@@ -9,7 +9,8 @@
 //!   Secure Enclave key needs the person at the Mac; that approval also covers
 //!   the terminal session that asked.
 //! - Any other terminal session needs its own approval, which asks again.
-//! - After `idle_lock` without use it forgets the key and every approval.
+//! - After `idle_lock` without use it forgets the key and every approval, and
+//!   on macOS it does the same within 15 seconds of the screen locking.
 
 use crate::{PeerCred, VaultResponse, load_keys, peer_credentials, read_request_bytes, write_encrypted_keys};
 use anyhow::{Context, Result, anyhow};
@@ -105,7 +106,7 @@ impl Vault {
             .retain(|_, last| now.duration_since(*last) < session_idle);
     }
 
-    fn lock(&mut self) {
+    pub(crate) fn lock(&mut self) {
         self.unlocked = None;
         self.sessions.clear();
     }
@@ -298,7 +299,12 @@ pub(crate) async fn serve(listener: UnixListener, ssh: UnixListener, vault: Vaul
                 });
             }
             _ = tick.tick() => {
-                vault.lock().expect("agent state lock").expire(Instant::now());
+                let mut vault = vault.lock().expect("agent state lock");
+                if crate::screen::is_locked() == Some(true) {
+                    vault.lock();
+                } else {
+                    vault.expire(Instant::now());
+                }
             }
         }
     }

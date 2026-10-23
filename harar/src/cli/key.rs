@@ -50,6 +50,10 @@ impl Paths {
 struct Init {
     #[command(flatten)]
     paths: Paths,
+    /// Write a plain key file even where a Secure Enclave exists, for
+    /// machines nobody is at to approve (CI, servers).
+    #[arg(long)]
+    file_tier: bool,
     /// Where the recovery passphrase comes from (prompted twice by default).
     #[command(flatten)]
     passphrase: SecretInput,
@@ -104,7 +108,7 @@ fn init(cmd: Init) -> Result<()> {
         return Err(anyhow!("{} already exists; refusing to replace a master key", path.display()));
     }
     let passphrase = read_passphrase(cmd.passphrase, true)?;
-    let (identity, tier) = if secure_enclave_available() {
+    let (identity, tier) = if !cmd.file_tier && secure_enclave_available() {
         (create_enclave_key(&path, &recovery, passphrase)?, KeyTier::SecureEnclave)
     } else {
         (master_key::create_file_master_key(&path, &recovery, passphrase)?, KeyTier::File)
