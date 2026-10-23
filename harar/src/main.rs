@@ -20,6 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
+mod agent;
 mod cli;
 #[cfg(target_os = "macos")]
 mod enclave;
@@ -2077,8 +2078,21 @@ fn persist_keys(
     fs::set_permissions(parent, fs::Permissions::from_mode(0o750))
         .with_context(|| format!("chmod 0750 {}", parent.display()))?;
     try_chown(parent, Some("gild-vault"), Some("gild"));
+    write_encrypted_keys(path, recipient, keys, Some("gild-vault"))
+}
 
-    let plaintext = serde_json::to_vec(keys).context("encode gild-vault state")?;
+/// Encrypts `keys` to `recipient` and atomically replaces `path` (mode 0600).
+/// Shared by the fleet daemon and the per-user agent, so both read one format.
+fn write_encrypted_keys(
+    path: &Path,
+    recipient: &age::x25519::Recipient,
+    keys: &HashMap<String, String>,
+    owner: Option<&str>,
+) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Err(anyhow!("state path must have a parent"));
+    };
+    let plaintext = zeroize::Zeroizing::new(serde_json::to_vec(keys).context("encode gild-vault state")?);
     let ciphertext =
         age::encrypt(recipient, &plaintext).context("encrypt gild-vault state with age")?;
 
@@ -2090,7 +2104,9 @@ fn persist_keys(
         .mode(0o600)
         .open(&tmp_path)
         .with_context(|| format!("open {}", tmp_path.display()))?;
-    try_chown(&tmp_path, Some("gild-vault"), None);
+    if owner.is_some() {
+        try_chown(&tmp_path, owner, None);
+    }
     file.write_all(&ciphertext)
         .context("write encrypted gild-vault state")?;
     file.sync_all().context("sync gild-vault state")?;
@@ -2098,7 +2114,9 @@ fn persist_keys(
         .with_context(|| format!("rename {} to {}", tmp_path.display(), path.display()))?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
         .with_context(|| format!("chmod 0600 {}", path.display()))?;
-    try_chown(path, Some("gild-vault"), None);
+    if owner.is_some() {
+        try_chown(path, owner, None);
+    }
     fs::File::open(parent)
         .and_then(|dir| dir.sync_all())
         .with_context(|| format!("sync {}", parent.display()))?;
