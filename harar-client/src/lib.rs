@@ -15,6 +15,7 @@ pub mod broker;
 pub mod hosts;
 pub mod oidc;
 pub mod runs;
+pub mod vms;
 
 const DEFAULT_SOCKET_PATH: &str = "/run/tana-vault.sock";
 pub const DEFAULT_GILD_VAULT_SOCKET_PATH: &str = "/run/harar.sock";
@@ -383,6 +384,23 @@ enum VaultRequest<'a> {
         name: &'a str,
     },
     Hosts,
+    VmRegister {
+        cid: u32,
+        name: &'a str,
+        runs_for: &'a vms::VmFor,
+    },
+    VmForget {
+        cid: u32,
+    },
+    VmToken {
+        cid: u32,
+        ask: &'a oidc::TokenAsk,
+    },
+    VmSecrets {
+        cid: u32,
+        env: &'a str,
+    },
+    Vms,
 }
 
 /// What `exchange` hands back to the child.
@@ -426,6 +444,7 @@ struct VaultResponse {
     secrets: Option<std::collections::BTreeMap<String, String>>,
     run_token: Option<String>,
     hosts: Option<hosts::HostsState>,
+    vms: Option<vms::VmsState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1021,6 +1040,44 @@ impl VaultClient {
 
     pub async fn hosts(&self) -> Result<hosts::HostsState, VaultClientError> {
         self.hosts_request(&VaultRequest::Hosts).await
+    }
+
+    /// Registers the VM at vsock `cid` on this host as running for a session
+    /// or a run this caller manages.
+    pub async fn vm_register(&self, cid: u32, name: &str, runs_for: &vms::VmFor) -> Result<vms::VmsState, VaultClientError> {
+        self.vms_request(&VaultRequest::VmRegister { cid, name, runs_for }).await
+    }
+
+    pub async fn vm_forget(&self, cid: u32) -> Result<vms::VmsState, VaultClientError> {
+        self.vms_request(&VaultRequest::VmForget { cid }).await
+    }
+
+    pub async fn vms(&self) -> Result<vms::VmsState, VaultClientError> {
+        self.vms_request(&VaultRequest::Vms).await
+    }
+
+    /// For the host's vsock service: a token for the VM at `cid`.
+    pub async fn vm_token(&self, cid: u32, ask: &oidc::TokenAsk) -> Result<(String, oidc::IdentityClaims), VaultClientError> {
+        let response = self.identity_request(&VaultRequest::VmToken { cid, ask }, "vm_failed").await?;
+        match (response.token, response.claims) {
+            (Some(token), Some(claims)) => Ok((token, claims)),
+            _ => Err(VaultClientError::InvalidResponse("missing token".to_string())),
+        }
+    }
+
+    /// For the host's vsock service: build secrets for the run VM at `cid`.
+    pub async fn vm_secrets(&self, cid: u32, env: &str) -> Result<std::collections::BTreeMap<String, String>, VaultClientError> {
+        self.identity_request(&VaultRequest::VmSecrets { cid, env }, "vm_failed")
+            .await?
+            .secrets
+            .ok_or_else(|| VaultClientError::InvalidResponse("missing secrets".to_string()))
+    }
+
+    async fn vms_request(&self, request: &VaultRequest<'_>) -> Result<vms::VmsState, VaultClientError> {
+        self.identity_request(request, "vm_failed")
+            .await?
+            .vms
+            .ok_or_else(|| VaultClientError::InvalidResponse("missing vms".to_string()))
     }
 
     async fn hosts_request(&self, request: &VaultRequest<'_>) -> Result<hosts::HostsState, VaultClientError> {

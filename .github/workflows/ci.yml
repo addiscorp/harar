@@ -30,6 +30,8 @@ jobs:
       - run: |
           getent passwd 994 || sudo useradd --system --uid 994 --no-create-home git-server
           test "$(getent passwd 994 | cut -d: -f1)" = git-server
+      # The VM identity test talks to itself over vsock loopback (CID 1).
+      - run: sudo modprobe vsock_loopback
       - run: cargo check --locked --workspace --all-targets
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --locked --workspace

@@ -34,6 +34,12 @@ pub struct Run {
     /// The variable holding the run token. It is not passed to the command.
     #[arg(long, default_value = "HARAR_RUN_TOKEN", requires = "env")]
     run_token_env: String,
+    /// Inside a VM: get the environment from the host over vsock instead of
+    /// with a run token. The host knows which VM is asking.
+    #[arg(long, requires = "env")]
+    from_host: bool,
+    #[command(flatten)]
+    host: crate::cli::vm::HostAddress,
     #[arg(trailing_var_arg = true, required = true, value_name = "COMMAND")]
     command: Vec<String>,
 }
@@ -54,6 +60,16 @@ pub async fn run(cmd: Run) -> Result<()> {
     // within it, and nothing else in the vault is reachable.
     let released = match &cmd.env {
         None => None,
+        Some(name) if cmd.from_host => {
+            let released = crate::cli::vm::secrets_from_host(name, &cmd.host)
+                .await
+                .with_context(|| format!("the {name} environment's secrets"))?;
+            for (name, value) in released_names(&released)? {
+                secrets.push(value.clone().into_bytes());
+                env.insert(name, value);
+            }
+            Some(released)
+        }
         Some(name) => {
             let token = env
                 .remove(&cmd.run_token_env)
