@@ -45,7 +45,7 @@ no proof yet is marked **planned**.
 | T5 | A secret passed as a command-line argument leaks via `ps` or shell history | CLI refuses secret values in argv; reads them from stdin, a file descriptor or a prompt | `credential_commands_reject_secret_values_in_argv` |
 | T6 | A4 copies the store and the wrapped vault key | Vault key wrapped to a Secure Enclave or TPM key that cannot leave the device; recovery copy wrapped to an offline passphrase | planned: #4 |
 | T7 | A4 reads the unlocked key from swap or a core dump | Key held in `mlock`ed memory; core dumps disabled; daemon refuses to start if either fails | planned: port from the TS vault |
-| T8 | A5 uses the stolen, powered device | Every unlock needs user presence (Touch ID, password or Watch); agent locks on sleep and idle; `harar device remove` revokes the device and rotates the vault key | planned: #4, #5 |
+| T8 | A5 uses the stolen, powered device | Every unlock needs user presence (Touch ID, password or Watch); the Secure Enclave refuses entirely while the screen is locked; agent locks on idle (screen-lock locking planned); `harar device remove` revokes the device and rotates the vault key | #14 (enclave, verified on a locked T2 iMac), #15 (idle lock, approvals) |
 | T9 | A2/A3 exfiltrates a provider key held by the agent | Real keys never enter the VM; placeholders only work through the broker, from that VM, for that session | planned: phase 3 |
 | T10 | A2/A3 sends data to an attacker's host | Broker allows only hosts on the secret's allowlist; everything else is blocked, logged and alerted | planned: phase 3 |
 | T11 | A3 claims to be another VM or service | VM identity comes from the host over vsock, not from anything the VM says; service identity from the kernel uid | planned: phase 3 |
