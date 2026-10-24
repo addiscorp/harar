@@ -167,6 +167,9 @@ impl Issuer {
                 cap_seconds: MAX_TTL_SECONDS,
             });
         }
+        if let Some(bad) = request.scopes.iter().find(|scope| !crate::model::valid_scope(scope)) {
+            return Err(TokenError::InvalidToken(format!("{bad:?} is not one scope")));
+        }
         if request.act.as_ref().is_some_and(|act| act.depth() > MAX_ACTOR_DEPTH) {
             return Err(TokenError::InvalidToken("act chain is too deep".to_string()));
         }
@@ -451,6 +454,13 @@ mod tests {
             assert!(claims.has_scope("deploy:staging"));
             assert_eq!(claims.act.unwrap().chain(), vec!["agent:ava", "user:sami"]);
         }
+    }
+
+    #[test]
+    fn a_scope_with_a_space_is_never_signed() {
+        let mut smuggled = request();
+        smuggled.scopes = vec!["deploy:x admin".into()];
+        assert!(issuer().issue(&smuggled, Alg::ES256, NOW).is_err());
     }
 
     #[test]

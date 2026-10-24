@@ -4,19 +4,12 @@ use std::path::PathBuf;
 pub mod agent;
 pub mod get;
 pub mod identity;
-pub mod jwks;
 pub mod key;
-pub mod mint;
 pub mod plugin;
-pub mod proxy;
 pub mod put;
-pub mod revoke;
 pub mod run;
 pub mod secret_input;
-pub mod serve;
-pub mod setup;
 pub mod ssh;
-pub mod verify;
 pub mod version;
 
 const DEFAULT_SOCKET_PATH: &str = "/run/harar.sock";
@@ -30,12 +23,12 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    Serve(serve::Serve),
+    /// Run an org's primary: its policy, secrets and identity tokens.
+    Serve(crate::primary::Serve),
     Agent(agent::Agent),
     Unlock(agent::Unlock),
     Lock(agent::Lock),
     Status(agent::Status),
-    Proxy(proxy::Proxy),
     Run(run::Run),
     Import(run::Import),
     Inject(run::Inject),
@@ -44,14 +37,8 @@ enum Command {
     Get(get::Get),
     Put(put::Put),
     Token(identity::Token),
-    Workload(identity::WorkloadCmd),
     Policy(identity::PolicyCmd),
-    Mint(mint::Mint),
-    Verify(verify::Verify),
-    Revoke(revoke::Revoke),
-    Jwks(jwks::Jwks),
     Key(key::Key),
-    Setup(setup::Setup),
     Version(version::Version),
 }
 
@@ -73,12 +60,11 @@ fn default_socket() -> PathBuf {
 
 pub async fn run() -> anyhow::Result<()> {
     match Cli::parse().command {
-        Command::Serve(cmd) => serve::run(cmd).await,
+        Command::Serve(cmd) => crate::primary::run(cmd).await,
         Command::Agent(cmd) => agent::run(cmd).await,
         Command::Unlock(cmd) => agent::unlock(cmd).await,
         Command::Lock(cmd) => agent::lock(cmd).await,
         Command::Status(cmd) => agent::status(cmd).await,
-        Command::Proxy(cmd) => proxy::run(cmd).await,
         Command::Run(cmd) => run::run(cmd).await,
         Command::Import(cmd) => run::import(cmd).await,
         Command::Inject(cmd) => run::inject(cmd).await,
@@ -87,14 +73,8 @@ pub async fn run() -> anyhow::Result<()> {
         Command::Get(cmd) => get::run(cmd).await,
         Command::Put(cmd) => put::run(cmd).await,
         Command::Token(cmd) => identity::token(cmd).await,
-        Command::Workload(cmd) => identity::workload(cmd).await,
         Command::Policy(cmd) => identity::policy(cmd).await,
-        Command::Mint(cmd) => mint::run(cmd).await,
-        Command::Verify(cmd) => verify::run(cmd).await,
-        Command::Revoke(cmd) => revoke::run(cmd).await,
-        Command::Jwks(cmd) => jwks::run(cmd).await,
         Command::Key(cmd) => key::run(cmd).await,
-        Command::Setup(cmd) => setup::run(cmd).await,
         Command::Version(cmd) => version::run(cmd),
     }
 }
@@ -139,19 +119,7 @@ mod tests {
 
     #[test]
     fn credential_commands_reject_secret_values_in_argv() {
-        for argv in [
-            vec![
-                "harar",
-                "verify",
-                "--token",
-                "eyJhbGciOiJFZERTQSJ9.leak",
-                "--audience",
-                "linkhash",
-            ],
-            vec!["harar", "put", "DATABASE_URL", "postgres://secret@db"],
-        ] {
-            assert!(Cli::try_parse_from(argv).is_err());
-        }
+        assert!(Cli::try_parse_from(["harar", "put", "DATABASE_URL", "postgres://secret@db"]).is_err());
     }
 
     #[derive(Debug, Parser)]

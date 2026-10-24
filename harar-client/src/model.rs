@@ -475,6 +475,11 @@ impl TryFrom<PolicyData> for Policy {
             if !seen.insert(role.name.clone()) {
                 return Err(PolicyError(format!("role {} appears twice", role.name)));
             }
+            // A pattern is a scope, `*`, or a scope prefix ending in `*`.
+            let pattern = |scope: &str| scope == "*" || valid_scope(scope.strip_suffix('*').unwrap_or(scope));
+            if let Some(bad) = role.allows.iter().flat_map(|permission| &permission.scopes).find(|scope| !pattern(scope)) {
+                return Err(PolicyError(format!("role {} has a scope that isn't one: {bad:?}", role.name)));
+            }
         }
         for profile in &data.profiles {
             check(&profile.name, Kind::Profile, "profile")?;
@@ -539,6 +544,13 @@ pub fn valid_secret_path(path: &str) -> bool {
     path.split('/').all(|segment| !segment.is_empty() && segment != "." && segment != "..")
 }
 
+/// A scope is one RFC 6749 scope-token: printable ASCII without spaces,
+/// quotes or backslashes. A space would split it into more scopes in the
+/// signed token than the policy ever matched.
+pub fn valid_scope(scope: &str) -> bool {
+    !scope.is_empty() && scope.bytes().all(|b| b == 0x21 || (0x23..=0x5b).contains(&b) || (0x5d..=0x7e).contains(&b))
+}
+
 /// What a session lets the actor do: a subset of what its starter could.
 /// A session only narrows (rule 3); it never adds.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -572,6 +584,7 @@ pub enum Denied {
     ZoneNotLive,
     WrongBroker,
     BadPath,
+    BadScope,
     NoBinding,
     OutsideSession,
     /// App users only get tokens, whatever a binding says.
@@ -587,6 +600,7 @@ impl Denied {
             Denied::ZoneNotLive => "zone_not_live",
             Denied::WrongBroker => "wrong_broker",
             Denied::BadPath => "bad_path",
+            Denied::BadScope => "bad_scope",
             Denied::NoBinding => "no_binding",
             Denied::OutsideSession => "outside_session",
             Denied::UsersOnlyGetTokens => "users_only_get_tokens",
@@ -677,6 +691,11 @@ impl Policy {
         if let Action::Read { path } | Action::Write { path } = request.action {
             if !valid_secret_path(path) {
                 return Decision::Deny(Denied::BadPath);
+            }
+        }
+        if let Action::Token { scopes, .. } = request.action {
+            if !scopes.iter().all(|scope| valid_scope(scope)) {
+                return Decision::Deny(Denied::BadScope);
             }
         }
         let Some(zone) = self.zones.get(request.zone) else {
@@ -1201,6 +1220,25 @@ mod tests {
         assert!(matches!(decide(&policy, "gg.addis.agent.ava", VM, &token("https://api.simien.dev", &["deploy:site"])), Decision::Allow { .. }));
         assert_eq!(decide(&policy, "gg.addis.agent.ava", VM, &token("https://api.simien.dev", &["deploy:site", "admin"])), denied(Denied::NoBinding));
         assert_eq!(decide(&policy, "gg.addis.agent.ava", VM, &token("https://gild.gg", &["deploy:site"])), denied(Denied::NoBinding));
+        // `deploy:*` matches the text "deploy:x admin", which a token would
+        // carry as two scopes: one scope must be one scope-token.
+        for smuggled in ["deploy:x admin", "deploy:x\tadmin", "deploy:x\nadmin", "", "deploy:\"x\"", "deploy:é"] {
+            assert_eq!(decide(&policy, "gg.addis.agent.ava", VM, &token("https://api.simien.dev", &[smuggled])), denied(Denied::BadScope), "{smuggled:?}");
+        }
+    }
+
+    #[test]
+    fn a_policy_with_a_scope_that_isnt_one_does_not_load() {
+        let mut data = serde_json::to_value(addis()).unwrap();
+        build_scopes(&mut data, serde_json::json!(["deploy:* admin"]));
+        assert!(serde_json::from_value::<Policy>(data.clone()).is_err());
+        build_scopes(&mut data, serde_json::json!(["*", "deploy:*", "read:own"]));
+        assert!(serde_json::from_value::<Policy>(data).is_ok());
+    }
+
+    fn build_scopes(data: &mut serde_json::Value, scopes: serde_json::Value) {
+        let build = data["roles"].as_array_mut().unwrap().iter_mut().find(|role| role["name"] == "gg.addis.role.build").unwrap();
+        build["allows"][1]["scopes"] = scopes;
     }
 
     #[test]

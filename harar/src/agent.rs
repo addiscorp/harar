@@ -12,7 +12,8 @@
 //! - After `idle_lock` without use it forgets the key and every approval, and
 //!   on macOS it does the same within 15 seconds of the screen locking.
 
-use crate::{PeerCred, VaultResponse, load_keys, peer_credentials, read_request_bytes, write_encrypted_keys};
+use crate::common::{PeerCred, load_keys, peer_credentials, read_request_bytes, write_encrypted_keys};
+use harar_client::primary::PrimaryResponse as VaultResponse;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -204,7 +205,7 @@ impl Vault {
     /// Writes first, then swaps memory, so memory never holds what disk lacks.
     fn persist(&mut self, next: HashMap<String, String>) -> VaultResponse {
         let unlocked = self.unlocked.as_mut().expect("persist runs unlocked");
-        match write_encrypted_keys(&self.state_path, &unlocked.identity.to_public(), &next, None) {
+        match write_encrypted_keys(&self.state_path, &unlocked.identity.to_public(), &next) {
             Ok(()) => {
                 unlocked.keys = next;
                 VaultResponse::ok()
