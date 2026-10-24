@@ -550,9 +550,10 @@ pub fn rule_for<'a>(rules: &'a [ApprovalRule], class: &str) -> Result<&'a Approv
 /// What the caller owes:
 /// - verify each submission when it arrives (`verify_approval`) and keep at
 ///   most one per device and decision, so `approvals` never grows with junk;
-/// - pass `devices` as they were when the request was made, so a passkey
-///   counter checked here is the one from before this request (re-deciding
-///   with the same submissions gives the same answer);
+/// - pass `devices` as they are now, except each passkey's `sign_count`,
+///   which is the one from when the request was made: revocations take
+///   effect at once, and re-deciding with the same submissions gives the
+///   same answer;
 /// - store `sign_counts` afterwards, and latch Approved and Denied: once a
 ///   request is acted on, it is never acted on again.
 pub fn decide(
@@ -884,6 +885,9 @@ mod tests {
         assert_eq!(outcome(&launch, &[], &[]), Err(ApprovalError::BadRequest), "a launch must name a profile");
         launch.action = Action::Launch { profile: name("com.acme.profile.x") };
         assert_eq!(outcome(&launch, &[], &[]), Err(ApprovalError::BadRequest), "of this org");
+        let mut wordy = ask.clone();
+        wordy.action = Action::Token { audience: "https://api.simien.dev".into(), scopes: (0..5).map(|n| format!("s{n}{}", "x".repeat(240))).collect() };
+        assert_eq!(outcome(&wordy, &[], &[]), Err(ApprovalError::BadRequest), "more than a device should be asked to show");
         let mut long_chain = ask.clone();
         long_chain.chain = (0..9).map(|n| name(&format!("gg.addis.agent.a{n}"))).collect();
         assert_eq!(outcome(&long_chain, &[], &[]), Err(ApprovalError::BadRequest), "chain capped");
