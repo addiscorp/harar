@@ -14,6 +14,9 @@ one or the other; fix whichever is wrong in the same PR.
 | **broker** | The harar process on one machine. It proves the machine's identity to the primary, registers the zones it starts, tells the primary which zone is calling, and proxies outbound calls. | `gg.addis.broker.demon` |
 | **role** | A named set of permissions: verbs on resources. | `gg.addis.role.site-runtime` |
 | **profile** | What kind of zone a broker may start, and the label the primary matches bindings against. | `gg.addis.profile.build-vm` |
+| **app** | Something the org runs for people: its audiences (the URLs its tokens are for) and the services that run it (section 3b). | `gg.addis.app.simien` |
+| **channel** | A bucket of messages between actors, always hosted by one app. harar holds who is a member; the app holds the messages (section 3b). | `gg.addis.channel.ops`, `gg.addis.channel.ch-01jbx4k2` |
+| **template** | What kind of channel an app may open by itself, and who may be in one: as a profile is for zones. | `gg.addis.template.support-ticket` |
 | **trust** | A rule that accepts tokens from another issuer (GitHub Actions, another harar org) for specific claims. | GitHub's issuer, `repo = addiscorp/site` |
 
 The **primary** is `harar serve` for one org: policy, vault, issuer, audit. It
@@ -29,14 +32,15 @@ gg.addis.agent.ava
 ```
 
 - `org` is two or more labels, the org's domain reversed (`addis.gg` → `gg.addis`).
-- `kind` is one of `human`, `user`, `agent`, `service`, `broker`, `zone`, `role`, `profile`.
+- `kind` is one of `human`, `user`, `agent`, `service`, `broker`, `zone`, `role`, `profile`,
+  `app`, `channel`, `template`.
   `human` is a member of the org; `user` is someone using its apps.
   These words are reserved and are never an org label.
 - `local` is one label.
 - A label is `[a-z0-9-]`, 1–63 characters, not starting or ending with `-`.
   The whole name is at most 253 characters.
-- Short-lived zones get an id that is never reused: `vm-`, `ct-`, `sb-`, `run-`
-  followed by a ULID. A reused name would hand a new zone an old zone's history.
+- Short-lived zones and channels get an id that is never reused: `vm-`, `ct-`,
+  `sb-`, `run-`, `ch-` followed by a ULID. A reused name would hand a new zone an old zone's history.
 - **A name never grants anything by its shape.** Zone names are flat; a zone's
   parent is a field, not a prefix. Patterns in bindings (`gg.addis.agent.*`) match
   one kind in one org only.
@@ -62,8 +66,9 @@ binding: actor pattern × zone pattern → role
 role:    [ verb resource-pattern, … ]
 ```
 
-Verbs: `read` and `write` (secrets), `token` (identity tokens for an audience
-and scope), `launch` (start a zone of a profile), `approve` (an approval class).
+Verbs: `read` and `write` (secrets), `token` (identity tokens for an app and
+scope), `launch` (start a zone of a profile), `approve` (an approval class),
+`open` (open a channel from a template, section 3b).
 
 ```
 role gg.addis.role.site-runtime
@@ -80,14 +85,101 @@ One function, `model::decide`, implements this rule. Everything that decides
 ## 3a. App users
 
 - A user has no power by default: with no binding, they get nothing.
-- Whatever a binding says, a user only ever gets **tokens for the org's apps**.
-  `decide` refuses them `read`, `write`, `launch` and `approve`, so no policy
-  mistake can hand an app's customer the vault, a machine or an approval.
+- Whatever a binding says, a user only ever gets **tokens for the org's apps**,
+  and **membership of that app's channels** (section 3b). `decide` refuses them
+  `read`, `write`, `launch`, `approve` and `open`, so no policy mistake can hand
+  an app's customer the vault, a machine or an approval.
+- A user's tokens are for the apps that bind them, not every app the org runs:
+  a Simien customer gets no Zega token by accident.
 - Users are not rows in policy. The app's sign-in issues their tokens, and one
   binding (`com.acme.user.*`) gives every user the same role.
 - Power over the things the app offers them (their project, their documents)
   lives in the app: scopes in their token (`project:p-123:admin`) and row-level
   security in the app's Postgres (`owner = harar.actor()`, section 9).
+
+## 3b. Apps and channels
+
+harar maps out the system: which apps exist, which channels they host and who
+is a member of each. How an app uses its channels (support tickets, a team
+room, an orchestrator talking to its agents) is the app's own logic, built on
+these primitives and a TypeScript SDK.
+
+### Apps
+
+```
+app gg.addis.app.simien
+  audiences  https://simien.cloud, https://api.simien.cloud
+  services   gg.addis.service.simien-api
+```
+
+- A `token` permission names an app (`token app:gg.addis.app.simien deploy:*`)
+  or, as before, an audience. A token's `aud` is one of the app's audiences.
+- An app's services are the only actors that may open its channels and check
+  their membership.
+
+### Channels
+
+A channel is a bucket of messages between actors: humans, users, agents and
+services, of this org or of another (section 10). It belongs to the org of the
+app that hosts it.
+
+- **harar holds membership, because membership is authorization.** For each
+  channel: its app, its template, its members (each `listen` or `speak`), who
+  added each one and when, and whether the channel is open or closed.
+- **The app holds the messages**, in its own channels database. harar never
+  carries or stores a message. With pg_harar, row-level security on the app's
+  messages can check membership (`harar.member(channel)`, section 9).
+- **A channel needs no frontend.** Humans talking to humans, a human and the
+  orchestrator, the orchestrator and its agents: these are the same primitive
+  with different members. A channel with no web page can be hosted by the
+  mirab station it lives on and never leave that machine.
+- **Being a member grants nothing else.** A message is untrusted input, from
+  whoever wrote it. An agent's powers still come only from its other bindings,
+  so steering an agent in a channel can't make it do more than it already may.
+
+### Opening channels: templates
+
+A support ticket opens a channel. If each one needed a person to approve it,
+nobody could use them, so channels are opened the way brokers launch zones:
+from something approved once.
+
+```
+template gg.addis.template.support-ticket
+  app       gg.addis.app.simien
+  members   gg.addis.user.*            speak   (the customer who opened it)
+            gg.addis.human.*           speak   (bound to role support-rep)
+            gg.addis.agent.support     speak
+  life      at most 30 days; closes when the last member leaves
+  managed   by gg.addis.service.simien-api
+```
+
+- An app's service with `open` on a template opens a channel from it at run
+  time (`gg.addis.channel.ch-<ulid>`) and adds and removes members **within
+  the template**, with no approval. The ticket flow: the customer opens a
+  ticket, the app opens a channel with them in it, pairs a rep, the rep joins,
+  they talk, both leave, the channel closes. Its log stays in the app.
+- Anything outside the template (a member pattern it doesn't list, a longer
+  life) is a policy change, approved like any other (section 6). Making or
+  widening a template is one too.
+- Long-lived channels (`gg.addis.channel.ops`) are opened the same way, from a
+  template with no time limit.
+- Every membership change goes to the audit trail (section 8): who added whom,
+  to which channel, under which template. The messages don't.
+
+### Across orgs
+
+As in Slack's shared channels, **each org manages its own side.**
+
+- A template can admit another org's actors by pattern
+  (`com.acme.agent.*`, `com.acme.human.*`) when this org trusts that org's
+  issuer (section 10). It can also let one of that org's actors manage its
+  side: `com.acme.human.*` may add and remove `com.acme.*` members.
+- A member from another org proves who it is with a token from its own
+  primary, for the hosting app's audience. The app checks the token against
+  that org's keys and the membership against its own primary.
+- This is how an agent stationed on a customer's hardware helps inside an
+  Addis app: the customer's primary vouches for the agent, the app's org admits
+  it to one channel, and neither org gets authority over the other's people.
 
 ## 4. Zones and launch profiles (no inheritance)
 
@@ -331,3 +423,9 @@ PRs #31–#36 stay open as reference until their code is moved over.
    or either.
 3. Failover: the rollback anchor is per host, so a standby primary needs the
    anchor to travel with it.
+4. How an app checks membership on every message: asking its own primary
+   through its broker (with a short cache), or membership kept in the app's
+   Postgres by pg_harar for row-level security. Probably both, the second for
+   apps on Postgres.
+5. When a member is removed, how fast a host must stop delivering to them: at
+   once, which needs the host told, or within a token's life (5 minutes).
