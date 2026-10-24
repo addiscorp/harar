@@ -390,7 +390,9 @@ pub struct Role {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ZoneMatch {
-    /// Zones by name (exact, or a `*` prefix).
+    /// Zones registered in policy (machines, services) by name: exact, or a
+    /// `*` prefix. Never matches a zone a broker launched, so a broker can't
+    /// pick a child's name to collect a name binding's rights.
     Name(NamePattern),
     /// Zones started with this profile, wherever they run.
     Profile(Name),
@@ -399,7 +401,7 @@ pub enum ZoneMatch {
 impl ZoneMatch {
     fn matches(&self, zone: &Zone) -> bool {
         match self {
-            ZoneMatch::Name(pattern) => pattern.matches(&zone.name),
+            ZoneMatch::Name(pattern) => zone.profile.is_none() && pattern.matches(&zone.name),
             ZoneMatch::Profile(profile) => zone.profile.as_ref() == Some(profile),
         }
     }
@@ -413,18 +415,108 @@ pub struct Binding {
     pub role: Name,
 }
 
-/// One org's policy.
+/// One org's policy. Loading one checks that every name is of the right kind
+/// and in this org; zones are added only through the methods below.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "PolicyData", into = "PolicyData")]
 pub struct Policy {
     pub org: Org,
-    #[serde(default)]
     pub roles: Vec<Role>,
-    #[serde(default)]
     pub bindings: Vec<Binding>,
-    #[serde(default)]
     pub profiles: Vec<Profile>,
+    /// Zones are never removed: an expired or revoked zone stays, so its name
+    /// can't be registered again.
+    zones: HashMap<Name, Zone>,
+}
+
+/// How a policy is stored: zones as a list, so a key can never disagree with
+/// the zone it holds.
+#[derive(Serialize, Deserialize)]
+struct PolicyData {
+    org: Org,
     #[serde(default)]
-    pub zones: HashMap<Name, Zone>,
+    roles: Vec<Role>,
+    #[serde(default)]
+    bindings: Vec<Binding>,
+    #[serde(default)]
+    profiles: Vec<Profile>,
+    #[serde(default)]
+    zones: Vec<Zone>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PolicyError(String);
+
+impl fmt::Display for PolicyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PolicyError {}
+
+impl TryFrom<PolicyData> for Policy {
+    type Error = PolicyError;
+    fn try_from(data: PolicyData) -> Result<Policy, PolicyError> {
+        let org = data.org;
+        let check = |name: &Name, kind: Kind, what: &str| {
+            if name.kind() != kind || name.org() != &org {
+                return Err(PolicyError(format!("{what} {name} must be a {} of {org}", kind.as_str())));
+            }
+            Ok(())
+        };
+        let mut seen = std::collections::HashSet::new();
+        for role in &data.roles {
+            check(&role.name, Kind::Role, "role")?;
+            if !seen.insert(role.name.clone()) {
+                return Err(PolicyError(format!("role {} appears twice", role.name)));
+            }
+        }
+        for profile in &data.profiles {
+            check(&profile.name, Kind::Profile, "profile")?;
+            if !seen.insert(profile.name.clone()) {
+                return Err(PolicyError(format!("profile {} appears twice", profile.name)));
+            }
+        }
+        for binding in &data.bindings {
+            check(&binding.role, Kind::Role, "binding role")?;
+            if !binding.actor.kind().is_actor() {
+                return Err(PolicyError(format!("binding actor {} is not an actor", binding.actor)));
+            }
+            match &binding.zone {
+                ZoneMatch::Name(pattern) if pattern.kind() != Kind::Zone => {
+                    return Err(PolicyError(format!("binding zone {pattern} is not a zone")));
+                }
+                ZoneMatch::Profile(profile) => check(profile, Kind::Profile, "binding profile")?,
+                ZoneMatch::Name(_) => {}
+            }
+        }
+        let mut zones = HashMap::new();
+        for zone in data.zones {
+            check(&zone.name, Kind::Zone, "zone")?;
+            if let Some(parent) = &zone.parent {
+                check(parent, Kind::Zone, "zone parent")?;
+            }
+            if let Some(broker) = &zone.broker {
+                check(broker, Kind::Broker, "zone broker")?;
+            }
+            if let Some(profile) = &zone.profile {
+                check(profile, Kind::Profile, "zone profile")?;
+            }
+            if zones.insert(zone.name.clone(), zone).is_some() {
+                return Err(PolicyError("a zone appears twice".into()));
+            }
+        }
+        Ok(Policy { org, roles: data.roles, bindings: data.bindings, profiles: data.profiles, zones })
+    }
+}
+
+impl From<Policy> for PolicyData {
+    fn from(policy: Policy) -> PolicyData {
+        let mut zones: Vec<Zone> = policy.zones.into_values().collect();
+        zones.sort_by(|a, b| a.name.cmp(&b.name));
+        PolicyData { org: policy.org, roles: policy.roles, bindings: policy.bindings, profiles: policy.profiles, zones }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -435,6 +527,12 @@ pub enum Action {
     Token { audience: String, scopes: Vec<String> },
     Launch { profile: Name },
     Approve { class: String },
+}
+
+/// A secret path is `/`-separated segments, none empty, `.` or `..`, so a
+/// prefix like `prod/site/*` can't be escaped with `prod/site/../admin`.
+fn valid_secret_path(path: &str) -> bool {
+    path.split('/').all(|segment| !segment.is_empty() && segment != "." && segment != "..")
 }
 
 /// What a session lets the actor do: a subset of what its starter could.
@@ -448,6 +546,9 @@ pub struct Reach {
 pub struct Request<'a> {
     pub actor: &'a Name,
     pub zone: &'a Name,
+    /// The broker that vouched for the zone. A zone with a broker only counts
+    /// when that same broker vouches for it.
+    pub via: Option<&'a Name>,
     pub action: &'a Action,
     /// Set when the actor acts for someone inside a session.
     pub session: Option<&'a Reach>,
@@ -465,6 +566,8 @@ pub enum Denied {
     NotAnActor,
     UnknownZone,
     ZoneNotLive,
+    WrongBroker,
+    BadPath,
     NoBinding,
     OutsideSession,
     /// App users only get tokens, whatever a binding says.
@@ -478,6 +581,8 @@ impl Denied {
             Denied::NotAnActor => "not_an_actor",
             Denied::UnknownZone => "unknown_zone",
             Denied::ZoneNotLive => "zone_not_live",
+            Denied::WrongBroker => "wrong_broker",
+            Denied::BadPath => "bad_path",
             Denied::NoBinding => "no_binding",
             Denied::OutsideSession => "outside_session",
             Denied::UsersOnlyGetTokens => "users_only_get_tokens",
@@ -496,6 +601,43 @@ impl Policy {
 
     fn profile(&self, name: &Name) -> Option<&Profile> {
         self.profiles.iter().find(|profile| &profile.name == name)
+    }
+
+    pub fn zone(&self, name: &Name) -> Option<&Zone> {
+        self.zones.get(name)
+    }
+
+    /// Adds a zone a human approved through a policy change: a machine (with
+    /// the broker enrolled on it) or a service on a machine. Name bindings
+    /// match these zones; nothing a broker launches is added this way.
+    pub fn add_zone(&mut self, zone: Zone) -> Result<&Zone, RegisterError> {
+        if zone.name.kind() != Kind::Zone || zone.name.org() != &self.org || zone.profile.is_some() {
+            return Err(RegisterError::BadName);
+        }
+        if zone.broker.as_ref().is_some_and(|broker| broker.kind() != Kind::Broker || broker.org() != &self.org) {
+            return Err(RegisterError::NotABroker);
+        }
+        if self.zones.contains_key(&zone.name) {
+            return Err(RegisterError::NameTaken);
+        }
+        Ok(self.zones.entry(zone.name.clone()).or_insert(zone))
+    }
+
+    /// Revokes a zone, and with it every zone under it.
+    pub fn revoke_zone(&mut self, name: &Name) -> bool {
+        self.zones.get_mut(name).map(|zone| zone.revoked = true).is_some()
+    }
+
+    /// How many zones sit above `name`, if its chain is complete and short.
+    fn depth(&self, name: &Name) -> Option<usize> {
+        let mut current = self.zones.get(name)?;
+        for depth in 0..MAX_ZONE_DEPTH {
+            match &current.parent {
+                None => return Some(depth),
+                Some(parent) => current = self.zones.get(parent)?,
+            }
+        }
+        None
     }
 
     /// A zone is live when it, and every zone above it, is registered,
@@ -528,11 +670,19 @@ impl Policy {
         if request.actor.kind() == Kind::User && !matches!(request.action, Action::Token { .. }) {
             return Decision::Deny(Denied::UsersOnlyGetTokens);
         }
+        if let Action::Read { path } | Action::Write { path } = request.action {
+            if !valid_secret_path(path) {
+                return Decision::Deny(Denied::BadPath);
+            }
+        }
         let Some(zone) = self.zones.get(request.zone) else {
             return Decision::Deny(Denied::UnknownZone);
         };
         if !self.zone_is_live(request.zone, now) {
             return Decision::Deny(Denied::ZoneNotLive);
+        }
+        if zone.broker.is_some() && zone.broker.as_ref() != request.via {
+            return Decision::Deny(Denied::WrongBroker);
         }
         let by_role = self
             .bindings
@@ -551,20 +701,23 @@ impl Policy {
         Decision::Allow { by_role: role.name.clone() }
     }
 
-    /// Registers a zone a broker started. The broker must be allowed to launch
-    /// the profile from its own machine zone; the profile must admit the kind;
-    /// the zone may live no longer than the profile allows, nor outlive its
-    /// parent's own expiry. The new zone gets nothing from its parent: only
-    /// bindings that match its profile apply to it.
+    /// Registers a zone a broker started: a VM, container, sandbox or run,
+    /// never a machine or service. The broker must be the parent zone's own
+    /// broker and allowed to launch the profile there; the profile must admit
+    /// the kind; the zone lives no longer than the profile allows or than its
+    /// parent. The new zone gets nothing from its parent: only bindings that
+    /// match its profile apply to it.
     pub fn register_child(&mut self, ask: ChildZone, now: u64) -> Result<&Zone, RegisterError> {
         if ask.name.kind() != Kind::Zone || ask.name.org() != &self.org {
             return Err(RegisterError::BadName);
         }
-        if let Some(prefix) = ask.kind.fresh_id_prefix() {
-            let id = ask.name.local().strip_prefix(prefix).ok_or(RegisterError::NotFreshId)?;
-            if id.len() < 16 {
-                return Err(RegisterError::NotFreshId);
-            }
+        let prefix = ask.kind.fresh_id_prefix().ok_or(RegisterError::NotAChildKind)?;
+        let id = ask.name.local().strip_prefix(prefix).ok_or(RegisterError::NotFreshId)?;
+        if id.len() < 16 || !id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) {
+            return Err(RegisterError::NotFreshId);
+        }
+        if ask.broker.kind() != Kind::Broker {
+            return Err(RegisterError::NotABroker);
         }
         if self.zones.contains_key(&ask.name) {
             return Err(RegisterError::NameTaken);
@@ -573,8 +726,14 @@ impl Policy {
         if !self.zone_is_live(&ask.parent, now) {
             return Err(RegisterError::ParentNotLive);
         }
+        if parent.broker.as_ref() != Some(&ask.broker) {
+            return Err(RegisterError::NotParentsBroker);
+        }
+        if self.depth(&ask.parent).is_none_or(|depth| depth + 2 > MAX_ZONE_DEPTH) {
+            return Err(RegisterError::TooDeep);
+        }
         let launch = Action::Launch { profile: ask.profile.clone() };
-        let request = Request { actor: &ask.broker, zone: &ask.parent, action: &launch, session: None };
+        let request = Request { actor: &ask.broker, zone: &ask.parent, via: Some(&ask.broker), action: &launch, session: None };
         if !matches!(self.decide(&request, now), Decision::Allow { .. }) {
             return Err(RegisterError::MayNotLaunch);
         }
@@ -582,7 +741,7 @@ impl Policy {
         if !profile.kinds.contains(&ask.kind) {
             return Err(RegisterError::KindNotInProfile);
         }
-        let mut expires_at = now + ask.seconds.min(profile.max_seconds);
+        let mut expires_at = now.saturating_add(ask.seconds.min(profile.max_seconds));
         if let Some(parent_end) = parent.expires_at {
             expires_at = expires_at.min(parent_end);
         }
@@ -615,9 +774,13 @@ pub struct ChildZone {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegisterError {
     BadName,
+    NotAChildKind,
     NotFreshId,
+    NotABroker,
     NameTaken,
     ParentNotLive,
+    NotParentsBroker,
+    TooDeep,
     MayNotLaunch,
     UnknownProfile,
     KindNotInProfile,
@@ -627,9 +790,13 @@ impl RegisterError {
     pub fn as_str(self) -> &'static str {
         match self {
             RegisterError::BadName => "bad_name",
+            RegisterError::NotAChildKind => "not_a_child_kind",
             RegisterError::NotFreshId => "not_a_fresh_id",
+            RegisterError::NotABroker => "not_a_broker",
             RegisterError::NameTaken => "name_taken",
             RegisterError::ParentNotLive => "parent_not_live",
+            RegisterError::NotParentsBroker => "not_the_parents_broker",
+            RegisterError::TooDeep => "too_deep",
             RegisterError::MayNotLaunch => "may_not_launch",
             RegisterError::UnknownProfile => "unknown_profile",
             RegisterError::KindNotInProfile => "kind_not_in_profile",
@@ -661,7 +828,10 @@ mod tests {
     }
 
     fn decide(policy: &Policy, actor: &str, zone: &str, action: &Action) -> Decision {
-        policy.decide(&Request { actor: &name(actor), zone: &name(zone), action, session: None }, NOW)
+        let zone = name(zone);
+        // Vouched for by the zone's own broker, as a real request would be.
+        let via = policy.zone(&zone).and_then(|zone| zone.broker.clone());
+        policy.decide(&Request { actor: &name(actor), zone: &zone, via: via.as_ref(), action, session: None }, NOW)
     }
 
     fn denied(reason: Denied) -> Decision {
@@ -673,19 +843,18 @@ mod tests {
     /// build/* and nothing else.
     fn addis() -> Policy {
         let mut policy = Policy::new("gg.addis".parse().unwrap());
-        policy.zones.insert(
-            name("gg.addis.zone.demon"),
-            Zone {
+        policy
+            .add_zone(Zone {
                 name: name("gg.addis.zone.demon"),
                 kind: ZoneKind::Machine,
                 parent: None,
-                broker: None,
+                broker: Some(name("gg.addis.broker.demon")),
                 profile: None,
                 created_at: NOW - 100,
                 expires_at: None,
                 revoked: false,
-            },
-        );
+            })
+            .unwrap();
         policy.profiles.push(Profile {
             name: name("gg.addis.profile.build-vm"),
             kinds: vec![ZoneKind::Vm],
@@ -834,7 +1003,7 @@ mod tests {
         };
         let mut fresh = addis();
         let other_vm = "gg.addis.zone.vm-01jbx4k2m9q8r7zz";
-        assert_eq!(fresh.register_child(ask(other_vm, ZoneKind::Vm, "gg.addis.broker.bugsy", "gg.addis.profile.build-vm"), NOW).unwrap_err(), RegisterError::MayNotLaunch);
+        assert_eq!(fresh.register_child(ask(other_vm, ZoneKind::Vm, "gg.addis.broker.bugsy", "gg.addis.profile.build-vm"), NOW).unwrap_err(), RegisterError::NotParentsBroker);
         assert_eq!(fresh.register_child(ask(other_vm, ZoneKind::Vm, "gg.addis.broker.demon", "gg.addis.profile.prod-vm"), NOW).unwrap_err(), RegisterError::MayNotLaunch);
         assert_eq!(fresh.register_child(ask("gg.addis.zone.ct-01jbx4k2m9q8r7s6", ZoneKind::Container, "gg.addis.broker.demon", "gg.addis.profile.build-vm"), NOW).unwrap_err(), RegisterError::KindNotInProfile);
         assert_eq!(fresh.register_child(ask("gg.addis.zone.vm9863", ZoneKind::Vm, "gg.addis.broker.demon", "gg.addis.profile.build-vm"), NOW).unwrap_err(), RegisterError::NotFreshId);
@@ -843,17 +1012,156 @@ mod tests {
     }
 
     #[test]
+    fn a_broker_can_never_name_a_child_into_someone_elses_rights() {
+        let mut policy = addis();
+        // A careless binding by name that happens to match VM names.
+        policy.bindings.push(Binding {
+            actor: pattern("gg.addis.agent.*"),
+            zone: ZoneMatch::Name(pattern("gg.addis.zone.vm-*")),
+            role: name("gg.addis.role.site-runtime"),
+        });
+        launch_vm(&mut policy, 600).unwrap();
+        assert_eq!(decide(&policy, "gg.addis.agent.ava", VM, &read("prod/site/DATABASE_URL")), denied(Denied::NoBinding), "name bindings never match a launched zone");
+
+        // Brokers can only launch short-lived kinds, never a machine or service
+        // whose name a binding might already cover.
+        for kind in [ZoneKind::Machine, ZoneKind::Service] {
+            policy.profiles[0].kinds.push(kind);
+            let ask = ChildZone {
+                name: name("gg.addis.zone.site-prod"),
+                kind,
+                parent: name("gg.addis.zone.demon"),
+                broker: name("gg.addis.broker.demon"),
+                profile: name("gg.addis.profile.build-vm"),
+                seconds: 60,
+            };
+            assert_eq!(policy.register_child(ask, NOW).unwrap_err(), RegisterError::NotAChildKind);
+        }
+    }
+
+    #[test]
+    fn only_the_parents_own_broker_launches_and_vouches() {
+        let mut policy = addis();
+        let ask = |broker: &str| ChildZone {
+            name: name("gg.addis.zone.vm-01jbx4k2m9q8r7bb"),
+            kind: ZoneKind::Vm,
+            parent: name("gg.addis.zone.demon"),
+            broker: name(broker),
+            profile: name("gg.addis.profile.build-vm"),
+            seconds: 60,
+        };
+        // An agent bound to launch, posing as the broker.
+        policy.roles.push(Role { name: name("gg.addis.role.launcher"), allows: vec![permission(Verb::Launch, "gg.addis.profile.build-vm")] });
+        policy.bindings.push(Binding {
+            actor: pattern("gg.addis.agent.*"),
+            zone: ZoneMatch::Name(pattern("gg.addis.zone.demon")),
+            role: name("gg.addis.role.launcher"),
+        });
+        assert_eq!(policy.register_child(ask("gg.addis.agent.ava"), NOW).unwrap_err(), RegisterError::NotABroker);
+        assert_eq!(policy.register_child(ask("gg.addis.broker.bugsy"), NOW).unwrap_err(), RegisterError::NotParentsBroker);
+        policy.register_child(ask("gg.addis.broker.demon"), NOW).unwrap();
+
+        // A request from the VM counts only when demon's broker vouches for it.
+        let vm = name("gg.addis.zone.vm-01jbx4k2m9q8r7bb");
+        let build = read("build/cache-key");
+        let via = |broker: Option<&str>| {
+            let broker = broker.map(name);
+            policy.decide(&Request { actor: &name("gg.addis.agent.ava"), zone: &vm, via: broker.as_ref(), action: &build, session: None }, NOW)
+        };
+        assert!(matches!(via(Some("gg.addis.broker.demon")), Decision::Allow { .. }));
+        assert_eq!(via(Some("gg.addis.broker.bugsy")), denied(Denied::WrongBroker));
+        assert_eq!(via(None), denied(Denied::WrongBroker));
+    }
+
+    #[test]
+    fn secret_paths_cannot_climb_out_of_a_prefix() {
+        let policy = addis();
+        for path in ["prod/site/../admin/KEY", "prod/site/./KEY", "prod/site//KEY", "prod/site/", "", "/prod/site/KEY"] {
+            assert_eq!(decide(&policy, "gg.addis.service.site", "gg.addis.zone.demon", &read(path)), denied(Denied::BadPath), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn launch_lifetimes_never_overflow_and_nesting_is_bounded() {
+        let mut policy = addis();
+        policy.profiles[0].max_seconds = u64::MAX;
+        assert_eq!(launch_vm(&mut policy, u64::MAX).unwrap().expires_at, Some(u64::MAX));
+
+        // Each level launches the next until the depth limit.
+        let mut policy = addis();
+        policy.profiles[0].kinds.push(ZoneKind::Container);
+        policy.roles.push(Role { name: name("gg.addis.role.nest"), allows: vec![permission(Verb::Launch, "gg.addis.profile.build-vm")] });
+        policy.bindings.push(Binding {
+            actor: pattern("gg.addis.broker.demon"),
+            zone: ZoneMatch::Profile(name("gg.addis.profile.build-vm")),
+            role: name("gg.addis.role.nest"),
+        });
+        let mut parent = name("gg.addis.zone.demon");
+        let mut levels = 0;
+        loop {
+            let child = name(&format!("gg.addis.zone.ct-01jbx4k2m9q8r7{levels:02}"));
+            let ask = ChildZone {
+                name: child.clone(),
+                kind: ZoneKind::Container,
+                parent: parent.clone(),
+                broker: name("gg.addis.broker.demon"),
+                profile: name("gg.addis.profile.build-vm"),
+                seconds: 60,
+            };
+            match policy.register_child(ask, NOW) {
+                Ok(_) => {
+                    assert!(policy.zone_is_live(&child, NOW), "every zone it accepts is live");
+                    parent = child;
+                    levels += 1;
+                }
+                Err(err) => {
+                    assert_eq!(err, RegisterError::TooDeep);
+                    break;
+                }
+            }
+        }
+        assert_eq!(levels, MAX_ZONE_DEPTH - 1);
+    }
+
+    #[test]
+    fn a_policy_with_names_of_the_wrong_kind_or_org_does_not_load() {
+        let good = serde_json::to_value(addis()).unwrap();
+        assert!(serde_json::from_value::<Policy>(good.clone()).is_ok());
+        let broken = |path: &[&str], value: &str| {
+            let mut policy = good.clone();
+            let mut at = &mut policy;
+            for key in path {
+                at = match key.parse::<usize>() {
+                    Ok(index) => &mut at[index],
+                    Err(_) => &mut at[*key],
+                };
+            }
+            *at = serde_json::Value::String(value.into());
+            serde_json::from_value::<Policy>(policy).unwrap_err().to_string()
+        };
+        assert!(broken(&["roles", "0", "name"], "gg.addis.agent.x").contains("must be a role"));
+        assert!(broken(&["roles", "0", "name"], "com.acme.role.x").contains("must be a role of gg.addis"));
+        assert!(broken(&["bindings", "0", "role"], "gg.addis.profile.x").contains("must be a role"));
+        assert!(broken(&["bindings", "0", "zone", "name"], "gg.addis.agent.*").contains("is not a zone"));
+        assert!(broken(&["zones", "0", "broker"], "gg.addis.agent.demon").contains("must be a broker"));
+        let mut twice = good.clone();
+        let role = twice["roles"][0].clone();
+        twice["roles"].as_array_mut().unwrap().push(role);
+        assert!(serde_json::from_value::<Policy>(twice).unwrap_err().to_string().contains("appears twice"));
+    }
+
+    #[test]
     fn a_revoked_or_expired_parent_ends_every_zone_under_it() {
         let mut policy = addis();
         launch_vm(&mut policy, 600).unwrap();
         let build = read("build/cache-key");
         let at = |policy: &Policy, now: u64| {
-            policy.decide(&Request { actor: &name("gg.addis.agent.ava"), zone: &name(VM), action: &build, session: None }, now)
+            policy.decide(&Request { actor: &name("gg.addis.agent.ava"), zone: &name(VM), via: Some(&name("gg.addis.broker.demon")), action: &build, session: None }, now)
         };
         assert!(matches!(at(&policy, NOW + 1), Decision::Allow { .. }));
         assert_eq!(at(&policy, NOW + 600), denied(Denied::ZoneNotLive), "the VM's own expiry");
 
-        policy.zones.get_mut(&name("gg.addis.zone.demon")).unwrap().revoked = true;
+        assert!(policy.revoke_zone(&name("gg.addis.zone.demon")));
         assert_eq!(at(&policy, NOW + 1), denied(Denied::ZoneNotLive), "its machine was removed");
         let again = ChildZone {
             name: name("gg.addis.zone.vm-01jbx4k2m9q8r7aa"),
@@ -872,12 +1180,12 @@ mod tests {
         launch_vm(&mut policy, 600).unwrap();
         let reach = Reach { allows: vec![permission(Verb::Read, "build/cache-*")] };
         let with = |action: &Action| {
-            policy.decide(&Request { actor: &name("gg.addis.agent.ava"), zone: &name(VM), action, session: Some(&reach) }, NOW)
+            policy.decide(&Request { actor: &name("gg.addis.agent.ava"), zone: &name(VM), via: Some(&name("gg.addis.broker.demon")), action, session: Some(&reach) }, NOW)
         };
         assert!(matches!(with(&read("build/cache-key")), Decision::Allow { .. }));
         assert_eq!(with(&read("build/signing-key")), denied(Denied::OutsideSession), "the role allows it, the session doesn't");
         let wide = Reach { allows: vec![permission(Verb::Read, "*")] };
-        let wider = policy.decide(&Request { actor: &name("gg.addis.agent.ava"), zone: &name(VM), action: &read("prod/site/X"), session: Some(&wide) }, NOW);
+        let wider = policy.decide(&Request { actor: &name("gg.addis.agent.ava"), zone: &name(VM), via: Some(&name("gg.addis.broker.demon")), action: &read("prod/site/X"), session: Some(&wide) }, NOW);
         assert_eq!(wider, denied(Denied::NoBinding), "a wide session adds nothing the bindings don't give");
     }
 
@@ -894,19 +1202,18 @@ mod tests {
     #[test]
     fn app_users_get_app_tokens_and_nothing_else() {
         let mut policy = addis();
-        policy.zones.insert(
-            name("gg.addis.zone.web"),
-            Zone {
+        policy
+            .add_zone(Zone {
                 name: name("gg.addis.zone.web"),
                 kind: ZoneKind::Service,
-                parent: None,
-                broker: None,
+                parent: Some(name("gg.addis.zone.demon")),
+                broker: Some(name("gg.addis.broker.demon")),
                 profile: None,
                 created_at: NOW,
                 expires_at: None,
                 revoked: false,
-            },
-        );
+            })
+            .unwrap();
         // A careless role that would hand out everything.
         policy.roles.push(Role {
             name: name("gg.addis.role.app-user"),
