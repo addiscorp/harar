@@ -531,7 +531,7 @@ pub enum Action {
 
 /// A secret path is `/`-separated segments, none empty, `.` or `..`, so a
 /// prefix like `prod/site/*` can't be escaped with `prod/site/../admin`.
-fn valid_secret_path(path: &str) -> bool {
+pub fn valid_secret_path(path: &str) -> bool {
     path.split('/').all(|segment| !segment.is_empty() && segment != "." && segment != "..")
 }
 
