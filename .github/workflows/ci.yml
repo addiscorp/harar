@@ -36,13 +36,6 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-      # The real-topology tests run the daemon as a second uid inside an
-      # unprivileged user namespace, which Ubuntu's AppArmor blocks by default.
-      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-      # The custody test maps its uid onto the git-server user, uid 994.
-      - run: |
-          getent passwd 994 || sudo useradd --system --uid 994 --no-create-home git-server
-          test "$(getent passwd 994 | cut -d: -f1)" = git-server
       - run: cargo check --locked --workspace --all-targets
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --locked --workspace
