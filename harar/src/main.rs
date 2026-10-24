@@ -75,6 +75,8 @@ struct Config {
     org: Option<String>,
     /// Move an existing state file into Postgres on this start.
     import_state: bool,
+    /// Start although Postgres has seen writes and this host has no anchor.
+    accept_unanchored: bool,
     heartbeat_interval: Duration,
     sync_interval: Duration,
     promote_after_failures: u32,
@@ -99,6 +101,7 @@ impl Config {
             postgres: std::env::var("HARAR_POSTGRES").ok(),
             org: std::env::var("HARAR_ORG").ok(),
             import_state: false,
+            accept_unanchored: false,
             heartbeat_interval: Duration::from_secs(env_u64(
                 "GILD_VAULT_HEARTBEAT_SECONDS",
                 DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
@@ -177,6 +180,7 @@ impl Config {
                     }
                 }
                 "--import-state" => config.import_state = true,
+                "--accept-unanchored" => config.accept_unanchored = true,
                 "--heartbeat-seconds" => {
                     if let Some(value) = args.next().and_then(|value| value.parse().ok()) {
                         config.heartbeat_interval = Duration::from_secs(value);
@@ -318,7 +322,14 @@ async fn open_primary_store(
     if !state_path.exists() {
         return Ok((store, saved));
     }
+    let imported = state_path.with_extension("age.imported");
     if !saved.is_empty() {
+        // An import that committed, then stopped before the rename: finish it.
+        if load_keys(state_path, identity)? == saved && !imported.exists() {
+            fs::rename(state_path, &imported).with_context(|| format!("rename {} to {}", state_path.display(), imported.display()))?;
+            eprintln!("harar: finished an earlier import; renamed the file to {}", imported.display());
+            return Ok((store, saved));
+        }
         return Err(anyhow!(
             "both {} and Postgres hold secrets for {org}; harar won't guess which is right. Move the file aside once you've checked.",
             state_path.display()
@@ -330,12 +341,17 @@ async fn open_primary_store(
             state_path.display()
         ));
     }
+    if imported.exists() {
+        return Err(anyhow!("{} already exists; move it aside before importing again", imported.display()));
+    }
     let file_keys = load_keys(state_path, identity)?;
+    if let Some(bad) = file_keys.keys().find(|key| !harar_client::model::valid_secret_path(key)) {
+        return Err(anyhow!("{bad:?} isn't a secret path (/-separated, no empty, . or .. segments); rename it in the file vault first. Nothing was imported."));
+    }
     let changes: Vec<store::postgres::Change<'_>> =
         file_keys.iter().map(|(key, value)| store::postgres::Change { path: key, value: Some(value.as_bytes()) }).collect();
     store.pg.write(org, &changes, &format!("{org}.service.harar"), None).await.map_err(|err| anyhow!("import: {err}; nothing was imported"))?;
     drop(changes);
-    let imported = state_path.with_extension("age.imported");
     fs::rename(state_path, &imported).with_context(|| format!("rename {} to {}", state_path.display(), imported.display()))?;
     *store.saved.lock().await = file_keys.clone();
     eprintln!(
@@ -605,7 +621,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
             let org = config.org.as_deref().ok_or_else(|| anyhow!("--postgres needs --org (e.g. gg.addis)"))?;
             org.parse::<harar_client::model::Org>().map_err(|err| anyhow!("--org {org}: {err}"))?;
             let anchor = config.state_path.with_file_name("store.anchor");
-            let pg = store::postgres::PgStore::connect(url, "harar_primary", store_master_key(&master_key), Some(anchor))
+            let options = store::postgres::Options { anchor: Some(anchor), accept_unanchored: config.accept_unanchored, exit_when_lost: true };
+            let pg = store::postgres::PgStore::connect(url, "harar_primary", store_master_key(&master_key), options)
                 .await
                 .map_err(|err| anyhow!("open the secret store: {err}"))?;
             pg.hold_as_primary().await.map_err(|err| anyhow!("open the secret store: {err}"))?;
@@ -2935,6 +2952,7 @@ mod tests {
             postgres: None,
             org: None,
             import_state: false,
+            accept_unanchored: false,
             heartbeat_interval: Duration::from_millis(10),
             sync_interval: Duration::from_millis(10),
             promote_after_failures: 2,
@@ -4811,7 +4829,7 @@ mod tests {
     }
 
     async fn test_pg(url: &str, identity: &age::x25519::Identity, schema: &str) -> store::postgres::PgStore {
-        store::postgres::PgStore::connect(url, schema, store_master_key(identity), None).await.unwrap()
+        store::postgres::PgStore::connect(url, schema, store_master_key(identity), store::postgres::Options::default()).await.unwrap()
     }
 
     fn test_schema(name: &str) -> String {

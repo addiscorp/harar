@@ -10,7 +10,7 @@
 use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::fmt;
 use zeroize::Zeroizing;
 
@@ -206,15 +206,26 @@ pub fn rewrap(old: &MasterKey, new: &MasterKey, row: &Row<'_>, sealed: &Sealed) 
     })
 }
 
-/// The stored tag on a path's head: (org, path, latest version).
-pub fn head_tag(master: &MasterKey, org: &str, path: &str, version: u64) -> [u8; 32] {
-    master.tag(&[&path_and_version(HEAD_CONTEXT, org, path, version)])
+/// What a version's row holds, hashed: its ciphertexts and master key id.
+/// Heads are bound to it, so a version deleted and written again is a
+/// different head even with the same number.
+pub fn content_hash(sealed: &Sealed) -> [u8; 32] {
+    let mut out = Vec::with_capacity(sealed.ciphertext.len() + sealed.wrapped_key.len() + 64);
+    field(&mut out, &sealed.ciphertext);
+    field(&mut out, &sealed.wrapped_key);
+    field(&mut out, sealed.master_key_id.as_bytes());
+    Sha256::digest(&out).into()
+}
+
+/// The stored tag on a path's head: (org, path, latest version, its content).
+pub fn head_tag(master: &MasterKey, org: &str, path: &str, version: u64, content: &[u8; 32]) -> [u8; 32] {
+    master.tag(&[&path_and_version(HEAD_CONTEXT, org, path, version), content])
 }
 
 /// A head's share of the store digest. Never stored, so nobody without the
 /// key can pick heads whose shares cancel out.
-pub fn head_leaf(master: &MasterKey, org: &str, path: &str, version: u64) -> [u8; 32] {
-    master.tag(&[&path_and_version(LEAF_CONTEXT, org, path, version)])
+pub fn head_leaf(master: &MasterKey, org: &str, path: &str, version: u64, content: &[u8; 32]) -> [u8; 32] {
+    master.tag(&[&path_and_version(LEAF_CONTEXT, org, path, version), content])
 }
 
 /// XOR of every head's leaf: changing, adding or removing any head changes it.
@@ -302,19 +313,27 @@ mod tests {
     fn tags_depend_on_the_key_and_everything_they_cover() {
         let master = MasterKey::from_bytes("mk-1", [1; 32]);
         let other = MasterKey::from_bytes("mk-1", [2; 32]);
-        let tag = head_tag(&master, "gg.addis", "prod/a", 3);
-        assert_eq!(tag, head_tag(&master, "gg.addis", "prod/a", 3));
+        let content = [9; 32];
+        let tag = head_tag(&master, "gg.addis", "prod/a", 3, &content);
+        assert_eq!(tag, head_tag(&master, "gg.addis", "prod/a", 3, &content));
         for different in [
-            head_tag(&master, "gg.addis", "prod/a", 2),
-            head_tag(&master, "gg.addis", "prod/b", 3),
-            head_tag(&other, "gg.addis", "prod/a", 3),
-            head_leaf(&master, "gg.addis", "prod/a", 3),
+            head_tag(&master, "gg.addis", "prod/a", 2, &content),
+            head_tag(&master, "gg.addis", "prod/b", 3, &content),
+            head_tag(&master, "gg.addis", "prod/a", 3, &[8; 32]),
+            head_tag(&other, "gg.addis", "prod/a", 3, &content),
+            head_leaf(&master, "gg.addis", "prod/a", 3, &content),
         ] {
             assert_ne!(tag, different);
         }
         assert_ne!(state_tag(&master, 1, &[0; 32]), state_tag(&master, 2, &[0; 32]));
         assert_ne!(anchor_tag(&master, 1), state_tag(&master, 1, &[0; 32]));
-        assert!(tags_match(&tag, &tag) && !tags_match(&tag, &head_tag(&master, "gg.addis", "prod/a", 2)) && !tags_match(&tag, &tag[..31]));
+        assert!(tags_match(&tag, &tag) && !tags_match(&tag, &head_tag(&master, "gg.addis", "prod/a", 2, &content)) && !tags_match(&tag, &tag[..31]));
+        // A head's digest share covers its content too, so a version deleted
+        // and written again never cancels out of the digest.
+        assert_ne!(head_leaf(&master, "gg.addis", "prod/a", 3, &content), head_leaf(&master, "gg.addis", "prod/a", 3, &[8; 32]));
+        // Two seals of the same value are different content.
+        let row = row("gg.addis", "prod/a", 1);
+        assert_ne!(content_hash(&seal(&master, &row, b"v")), content_hash(&seal(&master, &row, b"v")));
         // The wrap key and tag key are not the master secret or each other.
         assert_ne!(*master.wrap, [1; 32]);
         assert_ne!(*master.wrap, *master.tag);

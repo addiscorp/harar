@@ -78,13 +78,25 @@ pub struct Change<'a> {
     pub value: Option<&'a [u8]>,
 }
 
+/// How a store connects and what it guards beyond Postgres.
+#[derive(Clone, Debug, Default)]
+pub struct Options {
+    /// Where the number of writes this primary has made is kept, outside
+    /// Postgres. None only in tests that don't exercise it.
+    pub anchor: Option<PathBuf>,
+    /// Start even though Postgres has seen writes and there is no anchor
+    /// (a new or rebuilt primary host). Off, a missing anchor is refused.
+    pub accept_unanchored: bool,
+    /// End the process when the connection to Postgres ends, so a primary
+    /// that lost its lock never keeps serving from memory.
+    pub exit_when_lost: bool,
+}
+
 pub struct PgStore {
     client: Mutex<Client>,
     master: MasterKey,
     schema: String,
-    /// Where the number of writes this primary has made is kept, outside
-    /// Postgres. None in tests that don't exercise it.
-    anchor: Option<PathBuf>,
+    options: Options,
 }
 
 fn check(org: &str, path: &str) -> Result<(), StoreError> {
@@ -104,11 +116,27 @@ struct State {
     digest: [u8; 32],
 }
 
+/// A path's head, checked: its version and what that version's row holds.
+struct Head {
+    version: u64,
+    content: [u8; 32],
+}
+
+const ROW_COLUMNS: &str = "s.ciphertext, s.wrapped_key, s.master_key_id, s.deleted, s.written_by, s.txn";
+
+fn sealed_of(row: &tokio_postgres::Row) -> Sealed {
+    Sealed { ciphertext: row.get("ciphertext"), wrapped_key: row.get("wrapped_key"), master_key_id: row.get("master_key_id") }
+}
+
+fn is_loopback(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
 impl PgStore {
     /// Connects over a local socket or loopback, and creates the tables if
     /// they're missing. `schema` is normally `harar_primary`; tests give each
     /// run its own.
-    pub async fn connect(url: &str, schema: &str, master: MasterKey, anchor: Option<PathBuf>) -> Result<PgStore, StoreError> {
+    pub async fn connect(url: &str, schema: &str, master: MasterKey, options: Options) -> Result<PgStore, StoreError> {
         assert!(
             !schema.is_empty() && schema.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
             "schema names are fixed by harar, never taken from input"
@@ -117,21 +145,27 @@ impl PgStore {
         let local = !config.get_hosts().is_empty()
             && config.get_hosts().iter().all(|host| match host {
                 Host::Unix(_) => true,
-                Host::Tcp(name) => matches!(name.as_str(), "localhost" | "127.0.0.1" | "::1"),
-            });
+                Host::Tcp(name) => is_loopback(name),
+            })
+            && config.get_hostaddrs().iter().all(|addr| addr.is_loopback());
         if !local {
             return Err(StoreError::NotLocal);
         }
         config.connect_timeout(Duration::from_secs(10));
         config.keepalives(true);
+        config.keepalives_idle(Duration::from_secs(30));
         let (client, connection) = config.connect(NoTls).await?;
+        let exit_when_lost = options.exit_when_lost;
         tokio::spawn(async move {
-            if let Err(err) = connection.await {
-                eprintln!("harar: postgres connection ended: {err}");
+            let result = connection.await;
+            eprintln!("harar: the connection to Postgres ended: {result:?}");
+            if exit_when_lost {
+                eprintln!("harar: this primary no longer holds the store; exiting");
+                std::process::exit(75);
             }
         });
-        client.batch_execute("SET statement_timeout = '10s'; SET lock_timeout = '10s'").await?;
-        let store = PgStore { client: Mutex::new(client), master, schema: schema.to_string(), anchor };
+        client.batch_execute("SET statement_timeout = '30s'; SET lock_timeout = '10s'").await?;
+        let store = PgStore { client: Mutex::new(client), master, schema: schema.to_string(), options };
         store.migrate().await?;
         Ok(store)
     }
@@ -211,12 +245,21 @@ impl PgStore {
 
     /// The anchor holds the number of writes this primary has made. Postgres
     /// may be ahead of it (a write committed, then a crash before the anchor
-    /// moved), never behind.
+    /// moved), never behind. A missing anchor is refused once Postgres has
+    /// seen writes, unless this start was told to accept it.
     fn check_anchor(&self, seq: u64) -> Result<(), StoreError> {
-        let Some(path) = &self.anchor else { return Ok(()) };
+        let Some(path) = &self.options.anchor else { return Ok(()) };
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if seq == 0 || self.options.accept_unanchored {
+                    return Ok(());
+                }
+                return Err(tampered(format!(
+                    "Postgres has seen {seq} writes but this primary has no anchor at {}; if this host is new, start once with --accept-unanchored",
+                    path.display()
+                )));
+            }
             Err(err) => return Err(StoreError::Anchor(err)),
         };
         let (seen, tag) = text.trim().split_once(' ').ok_or_else(|| tampered("the anchor file is malformed"))?;
@@ -235,12 +278,78 @@ impl PgStore {
         Ok(())
     }
 
-    fn move_anchor(&self, seq: u64) -> Result<(), StoreError> {
-        let Some(path) = &self.anchor else { return Ok(()) };
-        let tag: String = envelope::anchor_tag(&self.master, seq).iter().map(|b| format!("{b:02x}")).collect();
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, format!("{seq} {tag}\n")).map_err(StoreError::Anchor)?;
-        std::fs::rename(&tmp, path).map_err(StoreError::Anchor)
+    /// Moves the anchor, durably. Called after a commit, so a failure here is
+    /// logged, not returned: the write happened, and an anchor behind
+    /// Postgres is allowed.
+    fn move_anchor(&self, seq: u64) {
+        let Some(path) = &self.options.anchor else { return };
+        let write = || -> std::io::Result<()> {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let tag: String = envelope::anchor_tag(&self.master, seq).iter().map(|b| format!("{b:02x}")).collect();
+            let tmp = path.with_extension("tmp");
+            let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+            file.write_all(format!("{seq} {tag}\n").as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, path)?;
+            if let Some(parent) = path.parent() {
+                std::fs::File::open(parent)?.sync_all()?;
+            }
+            Ok(())
+        };
+        if let Err(err) = write() {
+            eprintln!("harar: could not move the store's anchor at {} to {seq}: {err}", path.display());
+        }
+    }
+
+    /// Checks every head against the rows it points at and the state's
+    /// digest, and that no secret exists without a head or past it. Returns
+    /// the heads. Runs in every write and every load, so tampering is caught
+    /// at the next of either.
+    async fn verify_heads(&self, tx: &Transaction<'_>, state: &State) -> Result<BTreeMap<(String, String), (Head, Option<tokio_postgres::Row>)>, StoreError> {
+        let s = &self.schema;
+        let rows = tx
+            .query(
+                &format!(
+                    "SELECT h.org, h.path, h.version, h.tag, {ROW_COLUMNS}
+                     FROM {s}.secret_heads h
+                     LEFT JOIN {s}.secrets s ON s.org = h.org AND s.path = h.path AND s.version = h.version"
+                ),
+                &[],
+            )
+            .await?;
+        let mut digest = [0_u8; 32];
+        let mut heads = BTreeMap::new();
+        for row in rows {
+            let (org, path, version): (String, String, i64) = (row.get(0), row.get(1), row.get(2));
+            let version = version as u64;
+            if !valid_secret_path(&path) {
+                return Err(tampered(format!("a head names {path:?}, which harar never writes")));
+            }
+            let ciphertext: Option<Vec<u8>> = row.get("ciphertext");
+            if ciphertext.is_none() {
+                return Err(tampered(format!("{org}/{path} version {version} is missing")));
+            }
+            let content = envelope::content_hash(&sealed_of(&row));
+            if !envelope::tags_match(row.get(3), &envelope::head_tag(&self.master, &org, &path, version, &content)) {
+                return Err(tampered(format!("the head of {org}/{path} was not written by harar")));
+            }
+            envelope::xor_into(&mut digest, &envelope::head_leaf(&self.master, &org, &path, version, &content));
+            if heads.insert((org.clone(), path.clone()), (Head { version, content }, Some(row))).is_some() {
+                return Err(tampered(format!("{org}/{path} has two heads")));
+            }
+        }
+        if digest != state.digest {
+            return Err(tampered("a head was added, removed or rewound"));
+        }
+        for row in tx.query(&format!("SELECT org, path, max(version) FROM {s}.secrets GROUP BY org, path"), &[]).await? {
+            let key: (String, String) = (row.get(0), row.get(1));
+            let newest = row.get::<_, i64>(2) as u64;
+            if heads.get(&key).map(|(head, _)| head.version) != Some(newest) {
+                return Err(tampered(format!("{}/{} has version {newest} but no head that matches it", key.0, key.1)));
+            }
+        }
+        Ok(heads)
     }
 
     /// Writes `changes` to one org, all or nothing, as new versions.
@@ -251,21 +360,22 @@ impl PgStore {
         let s = &self.schema;
         let mut client = self.client.lock().await;
         let tx = client.transaction().await?;
+        // The state row's lock makes every writer take turns.
         let mut state = self.read_state(&tx, true).await?;
+        let mut heads: BTreeMap<String, Head> = self
+            .verify_heads(&tx, &state)
+            .await?
+            .into_iter()
+            .filter(|((head_org, _), _)| head_org == org)
+            .map(|((_, path), (head, _))| (path, head))
+            .collect();
         let mut versions = Vec::with_capacity(changes.len());
         for change in changes {
-            let head = tx
-                .query_opt(&format!("SELECT version, tag FROM {s}.secret_heads WHERE org = $1 AND path = $2 FOR UPDATE"), &[&org, &change.path])
-                .await?;
-            let current = match &head {
+            let current = match heads.get(change.path) {
                 None => 0,
                 Some(head) => {
-                    let version = head.get::<_, i64>(0) as u64;
-                    if !envelope::tags_match(head.get(1), &envelope::head_tag(&self.master, org, change.path, version)) {
-                        return Err(tampered(format!("the head of {org}/{} was not written by harar", change.path)));
-                    }
-                    envelope::xor_into(&mut state.digest, &envelope::head_leaf(&self.master, org, change.path, version));
-                    version
+                    envelope::xor_into(&mut state.digest, &envelope::head_leaf(&self.master, org, change.path, head.version, &head.content));
+                    head.version
                 }
             };
             let version = current + 1;
@@ -279,7 +389,8 @@ impl PgStore {
                 &[&org, &change.path, &(version as i64), &sealed.ciphertext, &sealed.wrapped_key, &sealed.master_key_id, &row.deleted, &written_by, &txn],
             )
             .await?;
-            let tag = envelope::head_tag(&self.master, org, change.path, version).to_vec();
+            let content = envelope::content_hash(&sealed);
+            let tag = envelope::head_tag(&self.master, org, change.path, version, &content).to_vec();
             tx.execute(
                 &format!(
                     "INSERT INTO {s}.secret_heads (org, path, version, tag) VALUES ($1, $2, $3, $4)
@@ -288,7 +399,8 @@ impl PgStore {
                 &[&org, &change.path, &(version as i64), &tag],
             )
             .await?;
-            envelope::xor_into(&mut state.digest, &envelope::head_leaf(&self.master, org, change.path, version));
+            envelope::xor_into(&mut state.digest, &envelope::head_leaf(&self.master, org, change.path, version, &content));
+            heads.insert(change.path.to_string(), Head { version, content });
             versions.push(version);
         }
         state.seq += 1;
@@ -296,7 +408,7 @@ impl PgStore {
         tx.execute(&format!("UPDATE {s}.store_state SET seq = $1, digest = $2, tag = $3 WHERE one"), &[&(state.seq as i64), &state.digest.to_vec(), &tag])
             .await?;
         tx.commit().await?;
-        self.move_anchor(state.seq)?;
+        self.move_anchor(state.seq);
         Ok(versions)
     }
 
@@ -313,55 +425,28 @@ impl PgStore {
         let deleted: bool = row.get("deleted");
         let written_by: &str = row.get("written_by");
         let txn: Option<&str> = row.get("txn");
-        let sealed = Sealed { ciphertext: row.get("ciphertext"), wrapped_key: row.get("wrapped_key"), master_key_id: row.get("master_key_id") };
-        let value = envelope::open(&self.master, &Row { org, path, version, deleted, written_by, txn }, &sealed)
+        let value = envelope::open(&self.master, &Row { org, path, version, deleted, written_by, txn }, &sealed_of(row))
             .map_err(|err| tampered(format!("{org}/{path} version {version} {err}")))?;
         Ok((deleted, value))
     }
 
     /// Every live secret of `org`, newest versions, after checking the whole
-    /// store: the state row's tag, the anchor, every head's tag, the digest
-    /// over all heads, and that no secret exists without a head or past it.
+    /// store: the state row's tag, the anchor, every head against its row,
+    /// the digest over all heads, and that no secret exists without a head or
+    /// past it. This is how the primary loads, and the only safe way to serve.
     pub async fn load_all(&self, org: &str) -> Result<BTreeMap<String, Zeroizing<Vec<u8>>>, StoreError> {
         org.parse::<Org>().map_err(|_| StoreError::BadOrg)?;
-        let s = &self.schema;
         let mut client = self.client.lock().await;
         let tx = client.build_transaction().isolation_level(tokio_postgres::IsolationLevel::RepeatableRead).read_only(true).start().await?;
         let state = self.read_state(&tx, false).await?;
-        let mut digest = [0_u8; 32];
-        let mut heads = BTreeMap::new();
-        for head in tx.query(&format!("SELECT org, path, version, tag FROM {s}.secret_heads"), &[]).await? {
-            let (head_org, path, version): (String, String, i64) = (head.get(0), head.get(1), head.get(2));
-            let version = version as u64;
-            if !valid_secret_path(&path) || !envelope::tags_match(head.get(3), &envelope::head_tag(&self.master, &head_org, &path, version)) {
-                return Err(tampered(format!("the head of {head_org}/{path} was not written by harar")));
-            }
-            envelope::xor_into(&mut digest, &envelope::head_leaf(&self.master, &head_org, &path, version));
-            heads.insert((head_org, path), version);
-        }
-        if digest != state.digest {
-            return Err(tampered("a head was added, removed or rewound"));
-        }
-        for row in tx.query(&format!("SELECT org, path, max(version) FROM {s}.secrets GROUP BY org, path"), &[]).await? {
-            let key: (String, String) = (row.get(0), row.get(1));
-            let newest = row.get::<_, i64>(2) as u64;
-            if heads.get(&key) != Some(&newest) {
-                return Err(tampered(format!("{}/{} has version {newest} but harar last wrote {:?}", key.0, key.1, heads.get(&key))));
-            }
-        }
+        let heads = self.verify_heads(&tx, &state).await?;
         let mut out = BTreeMap::new();
-        for ((head_org, path), version) in &heads {
+        for ((head_org, path), (head, row)) in &heads {
             if head_org != org {
                 continue;
             }
-            let row = tx
-                .query_opt(
-                    &format!("SELECT ciphertext, wrapped_key, master_key_id, deleted, written_by, txn FROM {s}.secrets WHERE org = $1 AND path = $2 AND version = $3"),
-                    &[&org, path, &(*version as i64)],
-                )
-                .await?
-                .ok_or_else(|| tampered(format!("{org}/{path} version {version} is missing")))?;
-            let (deleted, value) = self.open_row(org, path, *version, &row)?;
+            let row = row.as_ref().expect("verify_heads keeps each head's row");
+            let (deleted, value) = self.open_row(org, path, head.version, row)?;
             if !deleted {
                 out.insert(path.clone(), value);
             }
@@ -376,16 +461,26 @@ impl PgStore {
         Ok(self.load_all(org).await?.into_keys().filter(|path| path.starts_with(prefix)).collect())
     }
 
-    /// One path's newest value, checking that path's head and rows and the
-    /// store's state row. A rewind to the path's own older head is caught by
-    /// `load_all`, which the primary runs at every start.
+    /// One path's newest value, checking that path's head against its row,
+    /// and the store's state row, but not the digest over every head: a path
+    /// rewound with its newer rows deleted is caught by `load_all` and by the
+    /// next write, not here. For history and tools, not for serving.
     pub async fn get(&self, org: &str, path: &str) -> Result<(u64, Zeroizing<Vec<u8>>), StoreError> {
         check(org, path)?;
         let s = &self.schema;
         let mut client = self.client.lock().await;
         let tx = client.build_transaction().isolation_level(tokio_postgres::IsolationLevel::RepeatableRead).read_only(true).start().await?;
         self.read_state(&tx, false).await?;
-        let head = tx.query_opt(&format!("SELECT version, tag FROM {s}.secret_heads WHERE org = $1 AND path = $2"), &[&org, &path]).await?;
+        let head = tx
+            .query_opt(
+                &format!(
+                    "SELECT h.version, h.tag, {ROW_COLUMNS} FROM {s}.secret_heads h
+                     LEFT JOIN {s}.secrets s ON s.org = h.org AND s.path = h.path AND s.version = h.version
+                     WHERE h.org = $1 AND h.path = $2"
+                ),
+                &[&org, &path],
+            )
+            .await?;
         let newest: i64 = tx
             .query_one(&format!("SELECT coalesce(max(version), 0) FROM {s}.secrets WHERE org = $1 AND path = $2"), &[&org, &path])
             .await?
@@ -394,20 +489,17 @@ impl PgStore {
             return Err(if newest == 0 { StoreError::NotFound } else { tampered(format!("{org}/{path} has versions but no head")) });
         };
         let version = head.get::<_, i64>(0) as u64;
-        if !envelope::tags_match(head.get(1), &envelope::head_tag(&self.master, org, path, version)) {
+        if head.get::<_, Option<Vec<u8>>>("ciphertext").is_none() {
+            return Err(tampered(format!("{org}/{path} version {version} is missing")));
+        }
+        let content = envelope::content_hash(&sealed_of(&head));
+        if !envelope::tags_match(head.get(1), &envelope::head_tag(&self.master, org, path, version, &content)) {
             return Err(tampered(format!("the head of {org}/{path} was not written by harar")));
         }
         if newest as u64 != version {
             return Err(tampered(format!("{org}/{path} has version {newest} but harar last wrote {version}")));
         }
-        let row = tx
-            .query_opt(
-                &format!("SELECT ciphertext, wrapped_key, master_key_id, deleted, written_by, txn FROM {s}.secrets WHERE org = $1 AND path = $2 AND version = $3"),
-                &[&org, &path, &(version as i64)],
-            )
-            .await?
-            .ok_or_else(|| tampered(format!("{org}/{path} version {version} is missing")))?;
-        let (deleted, value) = self.open_row(org, path, version, &row)?;
+        let (deleted, value) = self.open_row(org, path, version, &head)?;
         tx.commit().await?;
         if deleted {
             return Err(StoreError::NotFound);
@@ -423,10 +515,7 @@ impl PgStore {
             .client
             .lock()
             .await
-            .query_opt(
-                &format!("SELECT ciphertext, wrapped_key, master_key_id, deleted, written_by, txn FROM {s}.secrets WHERE org = $1 AND path = $2 AND version = $3"),
-                &[&org, &path, &(version as i64)],
-            )
+            .query_opt(&format!("SELECT {ROW_COLUMNS} FROM {s}.secrets s WHERE org = $1 AND path = $2 AND version = $3"), &[&org, &path, &(version as i64)])
             .await?
             .ok_or(StoreError::NotFound)?;
         let (deleted, value) = self.open_row(org, path, version, &row)?;
@@ -444,10 +533,7 @@ impl PgStore {
             .client
             .lock()
             .await
-            .query(
-                &format!("SELECT version, ciphertext, wrapped_key, master_key_id, deleted, written_by, txn FROM {s}.secrets WHERE org = $1 AND path = $2 ORDER BY version"),
-                &[&org, &path],
-            )
+            .query(&format!("SELECT s.version, {ROW_COLUMNS} FROM {s}.secrets s WHERE org = $1 AND path = $2 ORDER BY version"), &[&org, &path])
             .await?;
         rows.iter()
             .map(|row| {
@@ -489,7 +575,7 @@ mod tests {
     }
 
     async fn store(url: &str, schema: &str) -> PgStore {
-        PgStore::connect(url, schema, master(), None).await.unwrap()
+        PgStore::connect(url, schema, master(), Options::default()).await.unwrap()
     }
 
     async fn raw(url: &str) -> Client {
@@ -608,8 +694,8 @@ mod tests {
         client.execute(&format!("DELETE FROM {s}.secrets WHERE path = $1 AND version = 2"), &[&PATH]).await.unwrap();
         client.execute(&format!("UPDATE {s}.secret_heads SET version = 1, tag = $2 WHERE path = $1"), &[&PATH, &old_head]).await.unwrap();
         assert!(is_tampered(store.load_all(ORG).await), "a path rewound to its own older head");
-        store.put(ORG, "prod/new/KEY", b"x", SAMI, None).await.unwrap();
-        assert!(is_tampered(store.load_all(ORG).await), "later writes don't paper over it");
+        assert!(is_tampered(store.put(ORG, "prod/new/KEY", b"x", SAMI, None).await), "the next write refuses it too");
+        assert!(is_tampered(store.put(ORG, PATH, b"v3", SAMI, None).await), "even a write to the rewound path");
 
         // A fresh store: removing a head makes its secret vanish, unless caught.
         let schema = format!("{s}_b");
@@ -623,12 +709,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_rewind_wrapped_around_a_real_write_is_still_caught() {
+        // Rewind a path, let harar write that path, then rewind again: the
+        // digest must not come back into line.
+        let Some(url) = database_url() else { return };
+        let schema = schema();
+        let store = store(&url, &schema).await;
+        let client = raw(&url).await;
+        let s = &schema;
+        store.put(ORG, PATH, b"v1", SAMI, None).await.unwrap();
+        let v1_head: Vec<u8> = client.query_one(&format!("SELECT tag FROM {s}.secret_heads WHERE path = $1"), &[&PATH]).await.unwrap().get(0);
+        store.put(ORG, PATH, VALUE, SAMI, None).await.unwrap();
+        let rewind = || async {
+            client.execute(&format!("DELETE FROM {s}.secrets WHERE path = $1 AND version = 2"), &[&PATH]).await.unwrap();
+            client.execute(&format!("UPDATE {s}.secret_heads SET version = 1, tag = $2 WHERE path = $1"), &[&PATH, &v1_head]).await.unwrap();
+        };
+        rewind().await;
+        assert!(is_tampered(store.put(ORG, PATH, b"new", SAMI, None).await), "the real write is refused, not laundered");
+        rewind().await;
+        assert!(is_tampered(store.load_all(ORG).await));
+    }
+
+    #[tokio::test]
+    async fn two_heads_for_one_path_are_caught() {
+        let Some(url) = database_url() else { return };
+        let schema = schema();
+        let store = store(&url, &schema).await;
+        let client = raw(&url).await;
+        let s = &schema;
+        store.put(ORG, PATH, b"v1", SAMI, None).await.unwrap();
+        client
+            .batch_execute(&format!(
+                "ALTER TABLE {s}.secret_heads DROP CONSTRAINT secret_heads_pkey;
+                 INSERT INTO {s}.secret_heads SELECT * FROM {s}.secret_heads LIMIT 1;
+                 INSERT INTO {s}.secret_heads SELECT * FROM {s}.secret_heads LIMIT 1;"
+            ))
+            .await
+            .unwrap();
+        // Three copies: two cancel in the digest, so it alone would pass.
+        assert!(is_tampered(store.load_all(ORG).await), "duplicate heads");
+    }
+
+    #[tokio::test]
+    async fn a_missing_anchor_is_refused_once_the_store_has_writes() {
+        let Some(url) = database_url() else { return };
+        let schema = schema();
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("store.anchor");
+        let with = |accept_unanchored: bool| Options { anchor: Some(anchor.clone()), accept_unanchored, ..Options::default() };
+        let store = PgStore::connect(&url, &schema, master(), with(false)).await.unwrap();
+        store.put(ORG, PATH, b"v1", SAMI, None).await.unwrap();
+        assert!(anchor.exists());
+        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&anchor).unwrap().permissions()) & 0o777, 0o600);
+        std::fs::remove_file(&anchor).unwrap();
+        let err = store.load_all(ORG).await.unwrap_err().to_string();
+        assert!(err.contains("--accept-unanchored"), "{err}");
+        let accepted = PgStore::connect(&url, &schema, master(), with(true)).await.unwrap();
+        assert_eq!(accepted.load_all(ORG).await.unwrap().len(), 1);
+        accepted.put(ORG, PATH, b"v2", SAMI, None).await.unwrap();
+        assert!(anchor.exists(), "the next write anchors it again");
+    }
+
+    #[tokio::test]
+    async fn a_committed_write_succeeds_even_if_its_anchor_cannot_move() {
+        let Some(url) = database_url() else { return };
+        let options = Options { anchor: Some(PathBuf::from("/nonexistent/harar/store.anchor")), accept_unanchored: true, ..Options::default() };
+        let store = PgStore::connect(&url, &schema(), master(), options).await.unwrap();
+        assert_eq!(store.put(ORG, PATH, b"v1", SAMI, None).await.unwrap(), 1, "the write happened; the caller must hear so");
+        assert_eq!(store.load_all(ORG).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn the_whole_store_rolled_back_is_caught_by_the_anchor() {
         let Some(url) = database_url() else { return };
         let schema = schema();
         let dir = tempfile::tempdir().unwrap();
         let anchor = dir.path().join("store.anchor");
-        let store = PgStore::connect(&url, &schema, master(), Some(anchor.clone())).await.unwrap();
+        let options = Options { anchor: Some(anchor.clone()), ..Options::default() };
+        let store = PgStore::connect(&url, &schema, master(), options).await.unwrap();
         let client = raw(&url).await;
         let s = &schema;
         store.put(ORG, PATH, b"v1", SAMI, None).await.unwrap();
@@ -708,8 +866,8 @@ mod tests {
 
     #[tokio::test]
     async fn postgres_is_reached_only_locally() {
-        for url in ["host=db.example.com user=harar", "postgres://harar@10.0.0.5/harar", "user=harar"] {
-            let result = PgStore::connect(url, "harar_primary", master(), None).await;
+        for url in ["host=db.example.com user=harar", "postgres://harar@10.0.0.5/harar", "user=harar", "host=localhost hostaddr=10.0.0.5 user=harar"] {
+            let result = PgStore::connect(url, "harar_primary", master(), Options::default()).await;
             assert!(matches!(result, Err(StoreError::NotLocal)), "{url}");
         }
     }
