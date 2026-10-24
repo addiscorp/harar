@@ -14,6 +14,7 @@ use tokio::sync::Mutex;
 pub mod approvals;
 pub mod model;
 pub mod oidc;
+pub mod recovery;
 
 const DEFAULT_SOCKET_PATH: &str = "/run/tana-vault.sock";
 pub const DEFAULT_GILD_VAULT_SOCKET_PATH: &str = "/run/harar.sock";

@@ -127,32 +127,82 @@ the keys at `<issuer>/.well-known/openid-configuration` → `jwks_uri`.
 
 - Policy changes are **propose → approve → apply**. Each applied change is a new
   `policy_version`, signed by its approver and chained to the previous version.
-- Approvals belong to **classes** defined in policy (`policy.widen`,
-  `policy.narrow`, `deploy.production`, `broker.request`, …).
-- A human approves with one of their **approver devices**: a key that lives in
-  hardware they carry and only signs after Face ID, Touch ID or a PIN. Being
+- Approvals belong to **classes** (`policy.widen`, `deploy.production`,
+  `broker.request`, …). Narrowing (removing access, revoking a machine) never
+  waits: it applies at once, so access can always be cut off.
+- A person approves with one of their **approver devices**: a key that lives in
+  hardware they carry and signs only after Face ID, Touch ID or a PIN. Being
   logged in as an OS user is never an approval.
-- An approval is a signature over the exact request (its id, actor, zone,
-  action, resource and expiry), so it can't be replayed onto anything else.
-  The primary verifies it against the human's enrolled device keys.
+- An approval is a signature over the exact request and the device's own id
+  (`approvals::ApprovalRequest::challenge`, a fixed binary encoding pinned by
+  known answers), so it can't be replayed onto anything else. The device shows
+  text computed from those same fields.
 - Device kinds, all the same to the primary:
-  - **phone app** (iOS Secure Enclave, Android StrongBox): a push notification
-    shows who is asking, from where, for what; Face ID signs.
-  - **passkey** (WebAuthn): an approval page served by the primary; any phone or
-    laptop with a passkey signs. No app to install.
-  - **Mac**: the Secure Enclave key `harar agent` already uses.
-- A human enrolls several devices, so losing one never locks the org out. An
-  offline recovery key enrolls replacements. The highest classes can require
-  two devices (`policy.widen`, enrolling a new approver device).
-- **Delegated approval.** A machine or agent may hold an approval class only
-  through its role, with limits: which classes, how many per hour, until when.
-  It can never approve `policy.widen`, a new approver device, or anything it is
-  in the actor chain of. The human can revoke the delegation from any device.
+  - **phone**: the Vault in the Simien app (iOS Secure Enclave, Android
+    StrongBox), with push notifications;
+  - **passkey** (WebAuthn): the primary's approval page, one credential per
+    ceremony, with the full WebAuthn checks;
+  - **Mac**: a Secure Enclave key made for approving, separate from the
+    agent's own key.
+
+### Reserved classes: only a person
+Only a person, on their own device, approves what could take over or blind the
+whole system (`approvals::RESERVED_CLASSES`, matched on whole segments):
+1. `device.*`: adding or removing approver devices;
+2. `approvals.*`: changing who may approve what, including a coordinator's
+   powers and which classes it may approve;
+3. `audit.*`: turning off or removing the audit trail;
+4. `trust.*`: trusting another org or issuer;
+5. `keys.*`: rotating the master key or the signing keys;
+6. `recovery.*`, `setup.*`, `hosts.*`, `issuer.*`, `store.*`,
+   `policy.rollback`: things that stand in for a device, join the trust root,
+   or could undo every narrowing at once.
+
+Also reserved, whatever the class says: **any change that gives anyone approver
+rights** (`grants_approval`, or `Action::Approve`), and any malformed class. A
+reserved class needs the primary's `reserved_devices` count of distinct keys
+(1 to start; 2 once every approver has two devices), and never a synced passkey.
+
+### A coordinator
+A coordinator agent (a "CTO") may approve the classes a person switched on for
+it (say `deploy.*`, `policy.widen`), including widening other agents' reach, so
+orchestration isn't held up. The safety is in the blast radius and the record:
+- **It can never make another approver, nor widen one**: granting approver
+  rights is reserved, and a coordinator refuses anything that widens any name
+  holding `approve`. So coordinators can't promote each other, and only a
+  person widens what any approver holds.
+- **Every request says whose reach it widens** (`Reach`: nobody, these
+  actors, anything these patterns match, or unknown). It's signed and shown.
+  A coordinator never approves an unknown reach, or one that touches itself or
+  anything that started it, by name or by a pattern that matches it.
+- Nothing it acts through: it never widens, or approves a request from, what
+  started it, whom it acts for, or anything it started, nor a sibling under
+  the same agent.
+- A device enrolled with a recovery code waits a day before it may approve
+  reserved classes (it can deny at once), so a stolen code isn't instant full
+  control.
+- A name that holds no `approve` today can be widened by a coordinator; if a
+  person later makes it an approver, it keeps that reach.
+- Classes it wasn't given, misspelled ones included, fail closed.
+- The primary adds: every coordinator approval audited with its lineage, a
+  daily digest to the person, optional rate limits per class, and revoking its
+  delegation from any device taking effect at once.
+
+A fresh primary starts with no coordinator; enabling one is an `approvals.*`
+change, a person's alone. `policy.widen` by a person needs one device and may
+use a synced passkey: the person's choice for now.
+
+### Getting in without a device
+- **A new primary prints a one-time setup link** to the terminal, never to a
+  log, for the person who will own it. Opening it enrolls their first device.
+  It works once, for 24 hours, and is gone as soon as any device exists.
+- **Recovery codes.** Enrolling a first device shows ten one-time codes, to
+  keep in a password manager or print. Each works once, only for its owner;
+  using one enrolls a new device, and every other device is told. A new set
+  replaces the old one, and making one is a reserved `recovery.*` change.
+- **In an org, an admin can recover a member**, as in any workspace.
 - A phone approves; it never holds the vault's master key. Servers unlock
   without anyone present, so the vault's keys stay on the primary.
-- An orchestrator agent may approve only the classes its role names, never a
-  request where it or anything it started is in the actor chain, and never
-  `policy.widen`.
 
 ## 7. Storage
 
@@ -263,20 +313,16 @@ PRs #31–#36 stay open as reference until their code is moved over.
   - Its key ladder starts at bugsy's Secure Enclave, with a key that doesn't
     require presence, so the primary restarts with nobody there. The chip
     still keeps the key from being copied.
-  - bugsy is also Addis's staff server and builds private repos with GitHub
-    Actions. The Actions runner must not share the primary's trust:
-    - run it in a VM, or at least as its own macOS user, with no access to
-      harar's folder, socket or Postgres, and discard the VM after each job
-      where possible;
-    - private repos only, never pull requests from forks;
-    - it gets secrets like any CI run: a run identity and short tokens.
+  - bugsy is the command centre for Addis and Simien. It is factory-reset
+    before setup, and no CI runner is installed on it: private-repo builds run
+    elsewhere.
 - **The issuer for `gg.addis` is `https://account.addis.gg`**, Addis's account
   service (not built yet). Until it is, the issuer URL is configured per
   primary. Names avoid "id" for the account system.
 
 ## 13. Open questions
 
-1. Which approval classes an orchestrator agent may hold.
+1. Rate limits and the daily digest's shape for a coordinator.
 2. Whether customer orgs run their own primary, use one hosted in Simien Cloud,
    or either.
 3. Failover: the rollback anchor is per host, so a standby primary needs the
