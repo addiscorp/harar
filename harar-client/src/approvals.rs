@@ -769,14 +769,13 @@ mod tests {
         let approval = signed(&phone, &ask, Decision::Approve);
         type Change = Box<dyn Fn(&mut ApprovalRequest)>;
         let changes: Vec<(&str, Change)> = vec![
-            ("primary", Box::new(|r| r.primary = "https://staging.addis.gg".into())),
             ("class", Box::new(|r| r.class = "deploy.staging".into())),
             ("actor", Box::new(|r| r.actor = name("gg.addis.agent.eve"))),
             ("act_for", Box::new(|r| r.act_for = None)),
             ("chain", Box::new(|r| r.chain.clear())),
             ("zone", Box::new(|r| r.zone = None)),
             ("action", Box::new(|r| r.action = Action::Token { audience: "https://api.simien.dev".into(), scopes: vec!["deploy:*".into()] })),
-            ("action kind", Box::new(|r| r.action = Action::Read { path: "https://api.simien.dev".into() })),
+            ("action kind", Box::new(|r| r.action = Action::Read { path: "prod/site/DATABASE_URL".into() })),
             ("created_at", Box::new(|r| r.created_at -= 1)),
             ("expires_at", Box::new(|r| r.expires_at += 1)),
         ];
@@ -785,6 +784,12 @@ mod tests {
             change(&mut other);
             assert_eq!(rejected(&other, std::slice::from_ref(&approval), &devices), [ApprovalError::BadProof], "{what}");
         }
+        // A copy for another primary, decided by that primary: still not this signature.
+        let mut staging = ask.clone();
+        staging.primary = "https://staging.addis.gg".into();
+        let at_staging = Primary { issuer: staging.primary.clone(), ..rp() };
+        let decided = decide(&staging, std::slice::from_ref(&approval), &devices, &rules(), &at_staging, NOW).unwrap();
+        assert_eq!(decided.rejected, [(0, ApprovalError::BadProof)], "primary");
         // The same request under another id: its challenge differs too.
         let mut renamed = ask.clone();
         renamed.id = "ap_01jbx7q4m2k9z8w3v5t6h8n3".into();
@@ -1012,7 +1017,8 @@ mod tests {
         let mut backwards = request("deploy.production");
         backwards.expires_at = backwards.created_at;
         assert_eq!(outcome(&backwards, &[], &[]), Err(ApprovalError::BadRequest), "expires before it was made");
-        let foreign: [Box<dyn Fn(&mut ApprovalRequest)>; 3] = [
+        type Change = Box<dyn Fn(&mut ApprovalRequest)>;
+        let foreign: [Change; 3] = [
             Box::new(|r| r.zone = Some(name("com.acme.zone.x"))),
             Box::new(|r| r.act_for = Some(name("com.acme.human.x"))),
             Box::new(|r| r.chain = vec![name("com.acme.agent.x")]),
