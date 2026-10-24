@@ -257,12 +257,27 @@ primary is its own root; Addis services accept its tokens only through trust row
 
 PRs #31–#36 stay open as reference until their code is moved over.
 
-## 12. Open questions
+## 12. Decided
 
-1. Which machine is the Addis primary: demon (TPM, #34) or the iMac (Secure
-   Enclave without presence)?
-2. The issuer URL for `gg.addis`: `https://id.simien.dev`, `https://id.addis.gg`,
-   or both during a move?
-3. Which approval classes an orchestrator agent may hold.
-4. Whether customer orgs run their own primary, use one hosted in Simien Cloud,
+- **The Addis primary is bugsy** (a Mac): `harar serve --postgres … --org gg.addis`.
+  - Its key ladder starts at bugsy's Secure Enclave, with a key that doesn't
+    require presence, so the primary restarts with nobody there. The chip
+    still keeps the key from being copied.
+  - bugsy is also Addis's staff server and builds private repos with GitHub
+    Actions. The Actions runner must not share the primary's trust:
+    - run it in a VM, or at least as its own macOS user, with no access to
+      harar's folder, socket or Postgres, and discard the VM after each job
+      where possible;
+    - private repos only, never pull requests from forks;
+    - it gets secrets like any CI run: a run identity and short tokens.
+- **The issuer for `gg.addis` is `https://account.addis.gg`**, Addis's account
+  service (not built yet). Until it is, the issuer URL is configured per
+  primary. Names avoid "id" for the account system.
+
+## 13. Open questions
+
+1. Which approval classes an orchestrator agent may hold.
+2. Whether customer orgs run their own primary, use one hosted in Simien Cloud,
    or either.
+3. Failover: the rollback anchor is per host, so a standby primary needs the
+   anchor to travel with it.

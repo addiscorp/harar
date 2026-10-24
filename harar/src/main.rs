@@ -41,9 +41,10 @@ const DEFAULT_REPLICATION_TOKEN_PATH: &str = "/etc/gild/vault-replication-token"
 const DEFAULT_SIGNING_KEY_PATH: &str = "/var/lib/harar/harar-signing.key";
 /// The ES256 key lives next to the Ed25519 signing key unless told otherwise.
 const ES256_KEY_FILE_NAME: &str = "harar-es256.key";
-/// Where harar says its tokens come from. id.simien.dev is planned; until it
-/// exists, set HARAR_ISSUER to wherever the discovery document is served.
-const DEFAULT_ISSUER: &str = "https://id.simien.dev";
+/// Where harar says its tokens come from: Addis's account service. It isn't
+/// live yet; until it is, set HARAR_ISSUER to wherever the discovery document
+/// is served.
+const DEFAULT_ISSUER: &str = "https://account.addis.gg";
 const DEFAULT_HEARTBEAT_INTERVAL_SECONDS: u64 = 5;
 const DEFAULT_SYNC_INTERVAL_SECONDS: u64 = 30;
 const DEFAULT_PROMOTE_AFTER_FAILURES: u32 = 5;
