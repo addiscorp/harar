@@ -43,13 +43,13 @@ pub fn is_highest(class: &str) -> bool {
 /// spaces, so it can't be padded off screen, imitate the words around it, or
 /// hide control and direction-changing characters.
 fn plain(text: &str) -> bool {
-    !text.is_empty() && text.len() <= 256 && text.bytes().all(|b| b.is_ascii_graphic())
+    !text.is_empty() && text.len() <= 256 && text.bytes().all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\')
 }
 
 const MAX_SCOPES: usize = 16;
 const MAX_CHAIN: usize = 8;
-/// More submissions than this for one request are not even looked at.
-pub const MAX_APPROVALS: usize = 64;
+/// The longest description a device is asked to show.
+const MAX_DESCRIPTION: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -71,6 +71,11 @@ pub struct ApproverDevice {
     pub kind: DeviceKind,
     /// P-256.
     pub public_key: Jwk,
+    /// For passkeys, the WebAuthn credential id, so the approval page asks
+    /// for exactly this credential (`allowCredentials`, one per ceremony):
+    /// the device id is in what's signed, so the page must know it first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
     pub enrolled_at: u64,
     /// Enrollment proved (by platform attestation, or the passkey's UV flag)
     /// that this key signs only after biometrics or a PIN. Devices without
@@ -229,14 +234,13 @@ impl ApprovalRequest {
             Action::Launch { profile } => format!("start a {profile} zone"),
             Action::Approve { class } => format!("approve \"{class}\" requests"),
         };
-        let mut text = format!("[{} {}] {} wants to {what}", self.class, self.org, self.actor);
+        let mut text = format!("[{} {} on {}] {} wants to {what}", self.class, self.org, self.primary, self.actor);
         if let Some(act_for) = &self.act_for {
             text.push_str(&format!("; for {act_for}"));
         }
         if let Some(zone) = &self.zone {
             text.push_str(&format!("; from {zone}"));
         }
-        text.push_str(&format!("; on {}", self.primary));
         text
     }
 
@@ -267,8 +271,18 @@ impl ApprovalRequest {
                 return Err(ApprovalError::BadRequest);
             }
         }
-        if self.chain.len() > MAX_CHAIN || !self.actor.kind().is_actor() || self.zone.as_ref().is_some_and(|zone| zone.kind() != Kind::Zone) {
+        if self.chain.len() > MAX_CHAIN
+            || !self.actor.kind().is_actor()
+            || self.zone.as_ref().is_some_and(|zone| zone.kind() != Kind::Zone)
+            || self.act_for.as_ref().is_some_and(|who| !matches!(who.kind(), Kind::Human | Kind::User))
+            || !self.chain.iter().all(|name| name.kind().is_actor())
+        {
             return Err(ApprovalError::BadRequest);
+        }
+        if let Action::Launch { profile } = &self.action {
+            if profile.kind() != Kind::Profile || profile.org() != &self.org {
+                return Err(ApprovalError::BadRequest);
+            }
         }
         let texts: Vec<&str> = match &self.action {
             Action::Read { path } | Action::Write { path } => vec![path],
@@ -286,10 +300,24 @@ impl ApprovalRequest {
         if self.created_at > now + CLOCK_SKEW_SECONDS || self.expires_at <= self.created_at || self.expires_at - self.created_at > MAX_REQUEST_SECONDS {
             return Err(ApprovalError::BadRequest);
         }
+        if self.describe().len() > MAX_DESCRIPTION {
+            return Err(ApprovalError::BadRequest);
+        }
         if now >= self.expires_at {
             return Err(ApprovalError::Expired);
         }
         Ok(())
+    }
+
+    /// The classes whose rules this request must satisfy: its own, and for a
+    /// grant of approver rights, the granted class too, so a grant is never
+    /// judged by a looser rule than the rights it gives.
+    fn governing_classes(&self) -> Vec<&str> {
+        let mut classes = vec![self.class.as_str()];
+        if let Action::Approve { class } = &self.action {
+            classes.push(class);
+        }
+        classes
     }
 }
 
@@ -519,8 +547,14 @@ pub fn rule_for<'a>(rules: &'a [ApprovalRule], class: &str) -> Result<&'a Approv
 /// is approved once one approver's distinct device keys reach the rule's
 /// count (two for the highest classes). Nobody approves a request they made.
 ///
-/// The caller stores `sign_counts`, and latches Approved and Denied: once a
-/// request is acted on, it is never acted on again.
+/// What the caller owes:
+/// - verify each submission when it arrives (`verify_approval`) and keep at
+///   most one per device and decision, so `approvals` never grows with junk;
+/// - pass `devices` as they were when the request was made, so a passkey
+///   counter checked here is the one from before this request (re-deciding
+///   with the same submissions gives the same answer);
+/// - store `sign_counts` afterwards, and latch Approved and Denied: once a
+///   request is acted on, it is never acted on again.
 pub fn decide(
     request: &ApprovalRequest,
     approvals: &[Approval],
@@ -530,15 +564,15 @@ pub fn decide(
     now: u64,
 ) -> Result<Decided, ApprovalError> {
     request.check(rp, now)?;
-    let rule = rule_for(rules, &request.class)?;
-    let need = usize::from(rule.devices.max(1)).max(if request.is_highest() { 2 } else { 1 });
+    let governing: Vec<&ApprovalRule> = request.governing_classes().into_iter().map(|class| rule_for(rules, class)).collect::<Result<_, _>>()?;
+    let need = governing.iter().map(|rule| usize::from(rule.devices.max(1))).max().unwrap_or(1).max(if request.is_highest() { 2 } else { 1 });
     // Which human each key has counted for: one key never counts for two.
     let mut key_owner: BTreeMap<String, &Name> = BTreeMap::new();
     let mut rejected = Vec::new();
     let mut sign_counts = BTreeMap::new();
     let mut denied = false;
     let mut keys: BTreeMap<&Name, BTreeSet<String>> = BTreeMap::new();
-    for (index, approval) in approvals.iter().enumerate().take(MAX_APPROVALS) {
+    for (index, approval) in approvals.iter().enumerate() {
         let (device, count) = match verify_approval(request, approval, devices, rp) {
             Ok(verified) => verified,
             Err(err) => {
@@ -546,7 +580,7 @@ pub fn decide(
                 continue;
             }
         };
-        if !rule.approvers.matches(&device.human) {
+        if !governing.iter().all(|rule| rule.approvers.matches(&device.human)) {
             rejected.push((index, ApprovalError::NotAnApprover));
             continue;
         }
@@ -585,11 +619,17 @@ pub fn decide(
 /// Whether a machine or agent, approving through its role rather than a
 /// device, may approve this request: never the highest classes; only an agent
 /// or service of the same org (humans approve with a device; app users never);
-/// never the asker, whom it acts for, anything that started it, or anything
-/// the asker started (`approver_chain` is what started the approver, nearest
-/// first). Whether its role allows `approve <class>` is `Policy::decide`'s call.
+/// never the asker, whom it acts for, anything that started it, anything the
+/// asker started, or a sibling under the same agent (`approver_chain` is what
+/// started the approver, nearest first). Acting for the same human is
+/// allowed: that's an orchestrator approving low-risk work for its person.
+/// Whether its role allows `approve <class>` is `Policy::decide`'s call.
 pub fn delegation_allowed(request: &ApprovalRequest, approver: &Name, approver_chain: &[Name]) -> bool {
+    // Agents sharing an ancestor agent are one line: siblings never approve
+    // each other. Services and brokers that start everything don't count.
+    let shared_agent = approver_chain.iter().any(|name| name.kind() == Kind::Agent && request.chain.contains(name));
     !request.is_highest()
+        && !shared_agent
         && matches!(approver.kind(), Kind::Agent | Kind::Service)
         && approver.org() == &request.org
         && approver != &request.actor
@@ -645,6 +685,7 @@ mod tests {
             human: name(human),
             kind,
             public_key: crate::oidc::es256_jwk(key.verifying_key()),
+            credential_id: (kind == DeviceKind::Passkey).then(|| format!("cred-{id}")),
             enrolled_at: NOW - 100,
             user_verification: true,
             backup_eligible: false,
@@ -749,11 +790,23 @@ mod tests {
         bare.zone = None;
         bare.action = Action::Read { path: "prod/site/DATABASE_URL".into() };
         assert_eq!(hex(bare.challenge(Decision::Deny, "pk-1")), KNOWN_ANSWER_BARE);
+        let mut grant = request("deploy.production");
+        grant.action = Action::Approve { class: "policy.narrow".into() };
+        assert_eq!(hex(grant.challenge(Decision::Approve, "mac-1")), KNOWN_ANSWER_GRANT);
+        let mut write = bare.clone();
+        write.action = Action::Write { path: "prod/a".into() };
+        assert_eq!(hex(write.challenge(Decision::Approve, "pk-1")), KNOWN_ANSWER_WRITE);
+        let mut launch = bare;
+        launch.action = Action::Launch { profile: name("gg.addis.profile.build-vm") };
+        assert_eq!(hex(launch.challenge(Decision::Approve, "pk-1")), KNOWN_ANSWER_LAUNCH);
     }
 
     /// Computed by a separate Python script from the encoding written in
     /// `challenge`'s doc, not by this code, so the two had to agree.
     const KNOWN_ANSWER: &str = "530729abd0482f9adfb5934c84c36a86247ae15b63b2db23ec8201bb173aadba";
+    const KNOWN_ANSWER_GRANT: &str = "3f46f9a72da1670caf0a02f4cf5f0d2f4a53f0cf8ade2c036569e040362efbf0";
+    const KNOWN_ANSWER_WRITE: &str = "ba040088009ea0d4793cd93ca3db4daad545ed787c000fa79a39669f89302699";
+    const KNOWN_ANSWER_LAUNCH: &str = "217ccfbf899091d893735350e27b5c0c0f5691b63ac0f294e147a3109807e77b";
     const KNOWN_ANSWER_BARE: &str = "d6b8ffb5d1341e72e6bdb3b2f8cfce5e85ce3c0adc99ae553e86c32a3ad5fd8e";
 
     #[test]
@@ -807,10 +860,10 @@ mod tests {
         let ask = request("deploy.production");
         assert_eq!(
             ask.describe(),
-            "[deploy.production gg.addis] gg.addis.agent.ava wants to get a token for \"https://api.simien.dev\" with scopes [\"deploy:site\"]; for gg.addis.human.sami; from gg.addis.zone.vm-01jbx4k2m9q8r7s6; on https://account.addis.gg"
+            "[deploy.production gg.addis on https://account.addis.gg] gg.addis.agent.ava wants to get a token for \"https://api.simien.dev\" with scopes [\"deploy:site\"]; for gg.addis.human.sami; from gg.addis.zone.vm-01jbx4k2m9q8r7s6"
         );
         // Text that could read differently from what it is never gets that far.
-        for path in ["prod/site/\u{202e}YEK", "prod/site/\nKEY", "", "prod/site/KEY, for gg.addis.human.sami", "prod/../x"] {
+        for path in ["prod/site/\u{202e}YEK", "prod/site/\nKEY", "", "prod/site/KEY, for gg.addis.human.sami", "prod/../x", "prod/site/KEY\"", "prod/site\\KEY"] {
             let mut sneaky = ask.clone();
             sneaky.action = Action::Read { path: path.into() };
             assert_eq!(outcome(&sneaky, &[], &[]), Err(ApprovalError::BadRequest), "{path:?}");
@@ -826,6 +879,11 @@ mod tests {
             sneaky.action = action.clone();
             assert_eq!(outcome(&sneaky, &[], &[]), Err(ApprovalError::BadRequest), "{action:?}");
         }
+        let mut launch = ask.clone();
+        launch.action = Action::Launch { profile: name("gg.addis.agent.x") };
+        assert_eq!(outcome(&launch, &[], &[]), Err(ApprovalError::BadRequest), "a launch must name a profile");
+        launch.action = Action::Launch { profile: name("com.acme.profile.x") };
+        assert_eq!(outcome(&launch, &[], &[]), Err(ApprovalError::BadRequest), "of this org");
         let mut long_chain = ask.clone();
         long_chain.chain = (0..9).map(|n| name(&format!("gg.addis.agent.a{n}"))).collect();
         assert_eq!(outcome(&long_chain, &[], &[]), Err(ApprovalError::BadRequest), "chain capped");
@@ -936,6 +994,17 @@ mod tests {
         assert!(grant.is_highest());
         assert_eq!(outcome(&grant, &[signed(&phone, &grant, Decision::Approve)], &devices), Ok(Outcome::Pending { have: 1, need: 2 }));
         assert!(!delegation_allowed(&grant, &name("gg.addis.agent.helper"), &[]));
+        let mut synced_grant = device("pk-9", "gg.addis.human.sami", DeviceKind::Passkey);
+        synced_grant.device.backup_eligible = true;
+        assert_eq!(rejected(&grant, &[passkey(&synced_grant, &grant, Decision::Approve, Assertion::default())], std::slice::from_ref(&synced_grant.device)), [ApprovalError::SyncedPasskey], "nor by a synced passkey");
+
+        // A grant is also judged by the rule for what it grants: eve may approve
+        // deploys, but only sami may approve anything that hands out policy rights.
+        let eve_a = device("eve-1", "gg.addis.human.eve", DeviceKind::Phone);
+        let eve_b = device("eve-2", "gg.addis.human.eve", DeviceKind::Mac);
+        let eves = [eve_a.device.clone(), eve_b.device.clone()];
+        let by_eve = [signed(&eve_a, &grant, Decision::Approve), signed(&eve_b, &grant, Decision::Approve)];
+        assert_eq!(rejected(&grant, &by_eve, &eves), [ApprovalError::NotAnApprover, ApprovalError::NotAnApprover]);
     }
 
     #[test]
@@ -1028,6 +1097,15 @@ mod tests {
             change(&mut other);
             assert_eq!(outcome(&other, &[], &[]), Err(ApprovalError::BadRequest), "every name in the request is the org's");
         }
+        let mut zone_as_actor = request("deploy.production");
+        zone_as_actor.actor = name("gg.addis.zone.demon");
+        assert_eq!(outcome(&zone_as_actor, &[], &[]), Err(ApprovalError::BadRequest), "the actor must be an actor");
+        let mut role_for = request("deploy.production");
+        role_for.act_for = Some(name("gg.addis.role.admin"));
+        assert_eq!(outcome(&role_for, &[], &[]), Err(ApprovalError::BadRequest), "acting for a person, never a role");
+        let mut zone_in_chain = request("deploy.production");
+        zone_in_chain.chain = vec![name("gg.addis.zone.demon")];
+        assert_eq!(outcome(&zone_in_chain, &[], &[]), Err(ApprovalError::BadRequest));
         let mut not_a_zone = request("deploy.production");
         not_a_zone.zone = Some(name("gg.addis.agent.x"));
         assert_eq!(outcome(&not_a_zone, &[], &[]), Err(ApprovalError::BadRequest));
@@ -1065,6 +1143,23 @@ mod tests {
         for_agent.act_for = Some(helper.clone());
         assert!(!allowed(&for_agent, &helper), "whom the asker acts for");
         assert!(!delegation_allowed(&request("deploy.staging"), &helper, &[name("gg.addis.agent.ava")]), "something the asker started");
+        assert!(!delegation_allowed(&request("deploy.staging"), &helper, &[name("gg.addis.agent.orchestrator")]), "a sibling under the same agent");
+        assert!(delegation_allowed(&request("deploy.staging"), &helper, &[name("gg.addis.service.gild")]), "a service that starts everything isn't a shared line");
+    }
+
+    #[test]
+    fn deciding_again_with_the_same_submissions_gives_the_same_answer() {
+        let mut pk = device("pk-1", "gg.addis.human.sami", DeviceKind::Passkey);
+        pk.device.sign_count = 3;
+        let mac = device("mac-1", "gg.addis.human.sami", DeviceKind::Mac);
+        let devices = [pk.device.clone(), mac.device.clone()];
+        let ask = request("policy.widen");
+        let first = passkey(&pk, &ask, Decision::Approve, Assertion { count: 4, ..Assertion::default() });
+        assert_eq!(outcome(&ask, std::slice::from_ref(&first), &devices), Ok(Outcome::Pending { have: 1, need: 2 }));
+        // The second device arrives later; the devices passed are still the
+        // snapshot from when the request was made, so the passkey still counts.
+        let both = [first, signed(&mac, &ask, Decision::Approve)];
+        assert_eq!(outcome(&ask, &both, &devices), Ok(Outcome::Approved));
     }
 
     #[test]
