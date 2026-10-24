@@ -20,6 +20,19 @@ env:
 jobs:
   linux:
     runs-on: ubuntu-24.04
+    # A throwaway Postgres for the secret store's tests. The password only
+    # guards this job's own container.
+    services:
+      postgres:
+        image: postgres:17-bookworm
+        env:
+          POSTGRES_PASSWORD: harar-test-only
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      HARAR_TEST_DATABASE_URL: host=127.0.0.1 port=5432 user=postgres password=harar-test-only dbname=postgres
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
@@ -38,6 +51,9 @@ jobs:
     # GitHub's macOS runners have a working Secure Enclave, so the enclave
     # tests run here for real.
     runs-on: macos-15
+    # GitHub's Macs can't run containers; the Linux job covers the store.
+    env:
+      HARAR_TEST_NO_POSTGRES: "1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
