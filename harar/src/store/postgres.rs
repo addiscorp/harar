@@ -97,7 +97,16 @@ pub struct PgStore {
     master: MasterKey,
     schema: String,
     options: Options,
+    /// Set once this process holds the store; only then does losing the
+    /// connection end the process (so a failed start reports its own error).
+    holding: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Anchor moves that failed in a row. Past a few, writes stop: rollback
+    /// protection is going stale and someone must look.
+    anchor_failures: std::sync::atomic::AtomicU32,
 }
+
+/// How many anchor moves may fail in a row before writes are refused.
+const MAX_ANCHOR_FAILURES: u32 = 3;
 
 fn check(org: &str, path: &str) -> Result<(), StoreError> {
     org.parse::<Org>().map_err(|_| StoreError::BadOrg)?;
@@ -124,8 +133,14 @@ struct Head {
 
 const ROW_COLUMNS: &str = "s.ciphertext, s.wrapped_key, s.master_key_id, s.deleted, s.written_by, s.txn";
 
-fn sealed_of(row: &tokio_postgres::Row) -> Sealed {
-    Sealed { ciphertext: row.get("ciphertext"), wrapped_key: row.get("wrapped_key"), master_key_id: row.get("master_key_id") }
+/// Reads a column, treating a NULL or a changed type as tampering rather
+/// than panicking: only someone who changed the schema can cause either.
+fn col<'a, T: tokio_postgres::types::FromSql<'a>>(row: &'a tokio_postgres::Row, index: impl tokio_postgres::row::RowIndex + fmt::Display) -> Result<T, StoreError> {
+    row.try_get(index).map_err(|err| tampered(format!("a column doesn't read as harar wrote it: {err}")))
+}
+
+fn sealed_of(row: &tokio_postgres::Row) -> Result<Sealed, StoreError> {
+    Ok(Sealed { ciphertext: col(row, "ciphertext")?, wrapped_key: col(row, "wrapped_key")?, master_key_id: col(row, "master_key_id")? })
 }
 
 fn is_loopback(host: &str) -> bool {
@@ -156,16 +171,25 @@ impl PgStore {
         config.keepalives_idle(Duration::from_secs(30));
         let (client, connection) = config.connect(NoTls).await?;
         let exit_when_lost = options.exit_when_lost;
+        let holding = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let held = std::sync::Arc::clone(&holding);
         tokio::spawn(async move {
             let result = connection.await;
             eprintln!("harar: the connection to Postgres ended: {result:?}");
-            if exit_when_lost {
+            if exit_when_lost && held.load(std::sync::atomic::Ordering::SeqCst) {
                 eprintln!("harar: this primary no longer holds the store; exiting");
                 std::process::exit(75);
             }
         });
         client.batch_execute("SET statement_timeout = '30s'; SET lock_timeout = '10s'").await?;
-        let store = PgStore { client: Mutex::new(client), master, schema: schema.to_string(), options };
+        let store = PgStore {
+            client: Mutex::new(client),
+            master,
+            schema: schema.to_string(),
+            options,
+            holding,
+            anchor_failures: std::sync::atomic::AtomicU32::new(0),
+        };
         store.migrate().await?;
         Ok(store)
     }
@@ -224,7 +248,11 @@ impl PgStore {
             .query_one("SELECT pg_try_advisory_lock(hashtextextended($1, 0))", &[&format!("harar:{}", self.schema)])
             .await?
             .get(0);
-        if held { Ok(()) } else { Err(StoreError::InUse) }
+        if !held {
+            return Err(StoreError::InUse);
+        }
+        self.holding.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 
     async fn read_state(&self, tx: &Transaction<'_>, lock: bool) -> Result<State, StoreError> {
@@ -233,9 +261,9 @@ impl PgStore {
             .query_opt(&format!("SELECT seq, digest, tag FROM {s}.store_state WHERE one{}", if lock { " FOR UPDATE" } else { "" }), &[])
             .await?
             .ok_or_else(|| tampered("the store's state row is missing"))?;
-        let seq: i64 = row.get(0);
-        let digest = bytes32(row.get(1), "the store digest")?;
-        let tag: &[u8] = row.get(2);
+        let seq: i64 = col(&row, 0)?;
+        let digest = bytes32(col(&row, 1)?, "the store digest")?;
+        let tag: &[u8] = col(&row, 2)?;
         if seq < 0 || !envelope::tags_match(tag, &envelope::state_tag(&self.master, seq as u64, &digest)) {
             return Err(tampered("the store's state row was not written by harar"));
         }
@@ -297,8 +325,12 @@ impl PgStore {
             }
             Ok(())
         };
-        if let Err(err) = write() {
-            eprintln!("harar: could not move the store's anchor at {} to {seq}: {err}", path.display());
+        match write() {
+            Ok(()) => self.anchor_failures.store(0, std::sync::atomic::Ordering::SeqCst),
+            Err(err) => {
+                let failures = self.anchor_failures.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                eprintln!("harar: could not move the store's anchor at {} to {seq} ({failures} in a row): {err}", path.display());
+            }
         }
     }
 
@@ -321,17 +353,17 @@ impl PgStore {
         let mut digest = [0_u8; 32];
         let mut heads = BTreeMap::new();
         for row in rows {
-            let (org, path, version): (String, String, i64) = (row.get(0), row.get(1), row.get(2));
+            let (org, path, version): (String, String, i64) = (col(&row, 0)?, col(&row, 1)?, col(&row, 2)?);
             let version = version as u64;
             if !valid_secret_path(&path) {
                 return Err(tampered(format!("a head names {path:?}, which harar never writes")));
             }
-            let ciphertext: Option<Vec<u8>> = row.get("ciphertext");
+            let ciphertext: Option<Vec<u8>> = col(&row, "ciphertext")?;
             if ciphertext.is_none() {
                 return Err(tampered(format!("{org}/{path} version {version} is missing")));
             }
-            let content = envelope::content_hash(&sealed_of(&row));
-            if !envelope::tags_match(row.get(3), &envelope::head_tag(&self.master, &org, &path, version, &content)) {
+            let content = envelope::content_hash(&sealed_of(&row)?);
+            if !envelope::tags_match(col(&row, 3)?, &envelope::head_tag(&self.master, &org, &path, version, &content)) {
                 return Err(tampered(format!("the head of {org}/{path} was not written by harar")));
             }
             envelope::xor_into(&mut digest, &envelope::head_leaf(&self.master, &org, &path, version, &content));
@@ -343,8 +375,8 @@ impl PgStore {
             return Err(tampered("a head was added, removed or rewound"));
         }
         for row in tx.query(&format!("SELECT org, path, max(version) FROM {s}.secrets GROUP BY org, path"), &[]).await? {
-            let key: (String, String) = (row.get(0), row.get(1));
-            let newest = row.get::<_, i64>(2) as u64;
+            let key: (String, String) = (col(&row, 0)?, col(&row, 1)?);
+            let newest = col::<i64>(&row, 2)? as u64;
             if heads.get(&key).map(|(head, _)| head.version) != Some(newest) {
                 return Err(tampered(format!("{}/{} has version {newest} but no head that matches it", key.0, key.1)));
             }
@@ -356,6 +388,11 @@ impl PgStore {
     pub async fn write(&self, org: &str, changes: &[Change<'_>], written_by: &str, txn: Option<&str>) -> Result<Vec<u64>, StoreError> {
         for change in changes {
             check(org, change.path)?;
+        }
+        if self.anchor_failures.load(std::sync::atomic::Ordering::SeqCst) >= MAX_ANCHOR_FAILURES {
+            return Err(StoreError::Anchor(std::io::Error::other(format!(
+                "the anchor couldn't be written {MAX_ANCHOR_FAILURES} times in a row; writes are stopped until it can"
+            ))));
         }
         let s = &self.schema;
         let mut client = self.client.lock().await;
@@ -422,10 +459,10 @@ impl PgStore {
     }
 
     fn open_row(&self, org: &str, path: &str, version: u64, row: &tokio_postgres::Row) -> Result<(bool, Zeroizing<Vec<u8>>), StoreError> {
-        let deleted: bool = row.get("deleted");
-        let written_by: &str = row.get("written_by");
-        let txn: Option<&str> = row.get("txn");
-        let value = envelope::open(&self.master, &Row { org, path, version, deleted, written_by, txn }, &sealed_of(row))
+        let deleted: bool = col(row, "deleted")?;
+        let written_by: &str = col(row, "written_by")?;
+        let txn: Option<&str> = col(row, "txn")?;
+        let value = envelope::open(&self.master, &Row { org, path, version, deleted, written_by, txn }, &sealed_of(row)?)
             .map_err(|err| tampered(format!("{org}/{path} version {version} {err}")))?;
         Ok((deleted, value))
     }
@@ -492,7 +529,7 @@ impl PgStore {
         if head.get::<_, Option<Vec<u8>>>("ciphertext").is_none() {
             return Err(tampered(format!("{org}/{path} version {version} is missing")));
         }
-        let content = envelope::content_hash(&sealed_of(&head));
+        let content = envelope::content_hash(&sealed_of(&head)?);
         if !envelope::tags_match(head.get(1), &envelope::head_tag(&self.master, org, path, version, &content)) {
             return Err(tampered(format!("the head of {org}/{path} was not written by harar")));
         }
@@ -539,7 +576,7 @@ impl PgStore {
             .map(|row| {
                 let version = row.get::<_, i64>("version") as u64;
                 let (deleted, _) = self.open_row(org, path, version, row)?;
-                Ok(VersionInfo { version, deleted, written_by: row.get("written_by") })
+                Ok(VersionInfo { version, deleted, written_by: col(row, "written_by")? })
             })
             .collect()
     }
@@ -777,6 +814,25 @@ mod tests {
         let store = PgStore::connect(&url, &schema(), master(), options).await.unwrap();
         assert_eq!(store.put(ORG, PATH, b"v1", SAMI, None).await.unwrap(), 1, "the write happened; the caller must hear so");
         assert_eq!(store.load_all(ORG).await.unwrap().len(), 1);
+        store.put(ORG, PATH, b"v2", SAMI, None).await.unwrap();
+        store.put(ORG, PATH, b"v3", SAMI, None).await.unwrap();
+        let stopped = store.put(ORG, PATH, b"v4", SAMI, None).await;
+        assert!(matches!(stopped, Err(StoreError::Anchor(_))), "after 3 anchor failures in a row, writes stop");
+        assert_eq!(store.load_all(ORG).await.unwrap()[PATH].as_slice(), b"v3", "reads still work");
+    }
+
+    #[tokio::test]
+    async fn a_column_changed_by_someone_who_owns_the_schema_is_tampering_not_a_crash() {
+        let Some(url) = database_url() else { return };
+        let schema = schema();
+        let store = store(&url, &schema).await;
+        store.put(ORG, PATH, VALUE, SAMI, None).await.unwrap();
+        raw(&url)
+            .await
+            .batch_execute(&format!("ALTER TABLE {schema}.secrets ALTER COLUMN written_by DROP NOT NULL; UPDATE {schema}.secrets SET written_by = NULL;"))
+            .await
+            .unwrap();
+        assert!(is_tampered(store.load_all(ORG).await));
     }
 
     #[tokio::test]
