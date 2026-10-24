@@ -16,6 +16,9 @@ const MAX_ZONE_DEPTH: usize = 8;
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     Human,
+    /// An app's end user: a consumer of what the org runs, never an authority
+    /// in it. Users only ever get tokens for the org's own apps.
+    User,
     Agent,
     Service,
     Broker,
@@ -25,11 +28,12 @@ pub enum Kind {
 }
 
 impl Kind {
-    const ALL: [Kind; 7] = [Kind::Human, Kind::Agent, Kind::Service, Kind::Broker, Kind::Zone, Kind::Role, Kind::Profile];
+    const ALL: [Kind; 8] = [Kind::Human, Kind::User, Kind::Agent, Kind::Service, Kind::Broker, Kind::Zone, Kind::Role, Kind::Profile];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Kind::Human => "human",
+            Kind::User => "user",
             Kind::Agent => "agent",
             Kind::Service => "service",
             Kind::Broker => "broker",
@@ -45,7 +49,7 @@ impl Kind {
 
     /// Kinds that can be responsible for a request.
     pub fn is_actor(self) -> bool {
-        matches!(self, Kind::Human | Kind::Agent | Kind::Service | Kind::Broker)
+        matches!(self, Kind::Human | Kind::User | Kind::Agent | Kind::Service | Kind::Broker)
     }
 }
 
@@ -66,7 +70,7 @@ impl fmt::Display for NameError {
         match self {
             NameError::TooLong => write!(f, "a name is at most {MAX_NAME_LEN} characters"),
             NameError::BadLabel(label) => write!(f, "{label:?} is not a label: use a-z, 0-9 and -, 1-63 characters, no - at either end"),
-            NameError::NoKind => write!(f, "a name needs a kind: human, agent, service, broker, zone, role or profile"),
+            NameError::NoKind => write!(f, "a name needs a kind: human, user, agent, service, broker, zone, role or profile"),
             NameError::OrgTooShort => write!(f, "an org is at least two labels, its domain reversed (gg.addis)"),
             NameError::KindInOrg(label) => write!(f, "{label:?} is a kind and can't be part of an org"),
             NameError::LocalMissing => write!(f, "a name ends with exactly one label after its kind"),
@@ -463,6 +467,8 @@ pub enum Denied {
     ZoneNotLive,
     NoBinding,
     OutsideSession,
+    /// App users only get tokens, whatever a binding says.
+    UsersOnlyGetTokens,
 }
 
 impl Denied {
@@ -474,6 +480,7 @@ impl Denied {
             Denied::ZoneNotLive => "zone_not_live",
             Denied::NoBinding => "no_binding",
             Denied::OutsideSession => "outside_session",
+            Denied::UsersOnlyGetTokens => "users_only_get_tokens",
         }
     }
 }
@@ -517,6 +524,9 @@ impl Policy {
         }
         if !request.actor.kind().is_actor() {
             return Decision::Deny(Denied::NotAnActor);
+        }
+        if request.actor.kind() == Kind::User && !matches!(request.action, Action::Token { .. }) {
+            return Decision::Deny(Denied::UsersOnlyGetTokens);
         }
         let Some(zone) = self.zones.get(request.zone) else {
             return Decision::Deny(Denied::UnknownZone);
@@ -879,6 +889,52 @@ mod tests {
         assert!(matches!(decide(&policy, "gg.addis.agent.ava", VM, &token("https://api.simien.dev", &["deploy:site"])), Decision::Allow { .. }));
         assert_eq!(decide(&policy, "gg.addis.agent.ava", VM, &token("https://api.simien.dev", &["deploy:site", "admin"])), denied(Denied::NoBinding));
         assert_eq!(decide(&policy, "gg.addis.agent.ava", VM, &token("https://gild.gg", &["deploy:site"])), denied(Denied::NoBinding));
+    }
+
+    #[test]
+    fn app_users_get_app_tokens_and_nothing_else() {
+        let mut policy = addis();
+        policy.zones.insert(
+            name("gg.addis.zone.web"),
+            Zone {
+                name: name("gg.addis.zone.web"),
+                kind: ZoneKind::Service,
+                parent: None,
+                broker: None,
+                profile: None,
+                created_at: NOW,
+                expires_at: None,
+                revoked: false,
+            },
+        );
+        // A careless role that would hand out everything.
+        policy.roles.push(Role {
+            name: name("gg.addis.role.app-user"),
+            allows: vec![
+                Permission { verb: Verb::Token, resource: "https://app.simien.dev".into(), scopes: vec!["read:own".into()] },
+                permission(Verb::Read, "*"),
+                permission(Verb::Write, "*"),
+                permission(Verb::Launch, "gg.addis.profile.build-vm"),
+                permission(Verb::Approve, "*"),
+            ],
+        });
+        policy.bindings.push(Binding {
+            actor: pattern("gg.addis.user.*"),
+            zone: ZoneMatch::Name(pattern("gg.addis.zone.web")),
+            role: name("gg.addis.role.app-user"),
+        });
+        let user = "gg.addis.user.u-8f3a9c2e";
+        let token = Action::Token { audience: "https://app.simien.dev".into(), scopes: vec!["read:own".into()] };
+        assert!(matches!(decide(&policy, user, "gg.addis.zone.web", &token), Decision::Allow { .. }));
+        for action in [
+            read("prod/site/DATABASE_URL"),
+            Action::Write { path: "prod/site/DATABASE_URL".into() },
+            Action::Launch { profile: name("gg.addis.profile.build-vm") },
+            Action::Approve { class: "deploy.production".into() },
+        ] {
+            assert_eq!(decide(&policy, user, "gg.addis.zone.web", &action), denied(Denied::UsersOnlyGetTokens), "{action:?}");
+        }
+        assert_eq!(name(user).kind(), Kind::User);
     }
 
     #[test]
