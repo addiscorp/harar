@@ -14,12 +14,13 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTC_WRAPPER: sccache
-  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   linux:
     runs-on: ubuntu-24.04
+    # Compilation is cached in R2. public-ci holds only the key for this
+    # repo's sccache buckets (the dsc model); publishing keys are in release.
+    environment: public-ci
     # A throwaway Postgres for the secret store's tests. The password only
     # guards this job's own container.
     services:
@@ -32,24 +33,69 @@ jobs:
           --health-cmd "pg_isready -U postgres"
           --health-interval 2s --health-timeout 5s --health-retries 30
     env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_BUCKET: harar-sccache-linux-x64
+      SCCACHE_REGION: auto
+      SCCACHE_S3_USE_SSL: "true"
+      SCCACHE_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_SCCACHE_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SCCACHE_SECRET_ACCESS_KEY }}
       HARAR_TEST_DATABASE_URL: host=127.0.0.1 port=5432 user=postgres password=harar-test-only dbname=postgres
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: sccache is required, on R2
+        run: |
+          if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ] || [ -z "$SCCACHE_ENDPOINT" ]; then
+            echo "::error::The R2 sccache keys are missing (public-ci environment). SCCACHE IS REQUIRED FOR ALL RUST COMPILATION."
+            exit 1
+          fi
+          # R2_ENDPOINT keeps its https:// for the AWS CLI; sccache wants the
+          # bare host and adds the scheme itself (SCCACHE_S3_USE_SSL).
+          export SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT#https://}"
+          echo "SCCACHE_ENDPOINT=$SCCACHE_ENDPOINT" >> "$GITHUB_ENV"
+          sccache --start-server
+          sccache --show-stats | tee sccache-stats.txt
+          grep -q "$SCCACHE_BUCKET" sccache-stats.txt || { echo "::error::sccache is not using the R2 bucket $SCCACHE_BUCKET"; exit 1; }
       - run: cargo check --locked --workspace --all-targets
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --locked --workspace
+      - run: sccache --show-stats
 
   macos:
     # GitHub's macOS runners have a working Secure Enclave, so the enclave
     # tests run here for real.
     runs-on: macos-15
+    # Compilation is cached in R2. public-ci holds only the key for this
+    # repo's sccache buckets (the dsc model); publishing keys are in release.
+    environment: public-ci
     # GitHub's Macs can't run containers; the Linux job covers the store.
     env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_BUCKET: harar-sccache-darwin-arm64
+      SCCACHE_REGION: auto
+      SCCACHE_S3_USE_SSL: "true"
+      SCCACHE_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_SCCACHE_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SCCACHE_SECRET_ACCESS_KEY }}
       HARAR_TEST_NO_POSTGRES: "1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: sccache is required, on R2
+        run: |
+          if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ] || [ -z "$SCCACHE_ENDPOINT" ]; then
+            echo "::error::The R2 sccache keys are missing (public-ci environment). SCCACHE IS REQUIRED FOR ALL RUST COMPILATION."
+            exit 1
+          fi
+          # R2_ENDPOINT keeps its https:// for the AWS CLI; sccache wants the
+          # bare host and adds the scheme itself (SCCACHE_S3_USE_SSL).
+          export SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT#https://}"
+          echo "SCCACHE_ENDPOINT=$SCCACHE_ENDPOINT" >> "$GITHUB_ENV"
+          sccache --start-server
+          sccache --show-stats | tee sccache-stats.txt
+          grep -q "$SCCACHE_BUCKET" sccache-stats.txt || { echo "::error::sccache is not using the R2 bucket $SCCACHE_BUCKET"; exit 1; }
       - run: cargo check --locked --workspace --all-targets
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --locked --workspace
+      - run: sccache --show-stats
