@@ -9,6 +9,7 @@ one or the other; fix whichever is wrong in the same PR.
 |---|---|---|
 | **org** | The top boundary. Each org has its own **primary**: its own policy, vault, issuer and keys. | `gg.addis`, `com.acme` |
 | **actor** | Who is responsible for a request. An agent always acts for someone; it is never its own root. | `gg.addis.human.sami`, `gg.addis.agent.ava`, `gg.addis.service.gild` |
+| **user** | An app's end user: a consumer of what the org runs, never an authority in it (section 3a). | `com.acme.user.u-8f3a9c2e` |
 | **zone** | Where code runs. Zones nest (machine → VM → container → process), and each has its own identity. | `gg.addis.zone.demon`, `gg.addis.zone.vm-01jbx4k2` |
 | **broker** | The harar process on one machine. It proves the machine's identity to the primary, registers the zones it starts, tells the primary which zone is calling, and proxies outbound calls. | `gg.addis.broker.demon` |
 | **role** | A named set of permissions: verbs on resources. | `gg.addis.role.site-runtime` |
@@ -28,7 +29,8 @@ gg.addis.agent.ava
 ```
 
 - `org` is two or more labels, the org's domain reversed (`addis.gg` → `gg.addis`).
-- `kind` is one of `human`, `agent`, `service`, `broker`, `zone`, `role`, `profile`.
+- `kind` is one of `human`, `user`, `agent`, `service`, `broker`, `zone`, `role`, `profile`.
+  `human` is a member of the org; `user` is someone using its apps.
   These words are reserved and are never an org label.
 - `local` is one label.
 - A label is `[a-z0-9-]`, 1–63 characters, not starting or ending with `-`.
@@ -74,6 +76,18 @@ binding  actor gg.addis.agent.*       zone profile:gg.addis.profile.build-vm →
 
 One function, `model::decide`, implements this rule. Everything that decides
 (the primary, brokers) calls it; nothing reimplements it.
+
+## 3a. App users
+
+- A user has no power by default: with no binding, they get nothing.
+- Whatever a binding says, a user only ever gets **tokens for the org's apps**.
+  `decide` refuses them `read`, `write`, `launch` and `approve`, so no policy
+  mistake can hand an app's customer the vault, a machine or an approval.
+- Users are not rows in policy. The app's sign-in issues their tokens, and one
+  binding (`com.acme.user.*`) gives every user the same role.
+- Power over the things the app offers them (their project, their documents)
+  lives in the app: scopes in their token (`project:p-123:admin`) and row-level
+  security in the app's Postgres (`owner = harar.actor()`, section 9).
 
 ## 4. Zones and launch profiles (no inheritance)
 
