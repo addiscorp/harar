@@ -1,8 +1,9 @@
 //! Approvals (architecture, section 6): a human approves from a device that
 //! signs only after Face ID, Touch ID or a PIN, over the exact request, so a
-//! signature can't be replayed onto anything else. Machines and agents may
-//! approve only classes their role names, never the highest ones, and never
-//! anything they asked for or started.
+//! signature can't be replayed onto anything else. A coordinator agent may
+//! approve anything its role names, except the reserved classes, which only a
+//! person can approve, and never anything that raises its own reach or its
+//! lineage's.
 //!
 //! What a device shows is `ApprovalRequest::describe`, computed from the same
 //! fields the signature covers; nothing the requester writes freely is shown.
@@ -18,16 +19,25 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-const CHALLENGE_CONTEXT: &[u8] = b"harar.approval.v2";
+const CHALLENGE_CONTEXT: &[u8] = b"harar.approval.v3";
 
 /// The longest a request may wait for approval.
 pub const MAX_REQUEST_SECONDS: u64 = 24 * 3600;
 const CLOCK_SKEW_SECONDS: u64 = 60;
 
-/// Classes that always need two of the approver's distinct device keys, that
-/// no synced passkey may approve, and that no machine or agent may ever
-/// approve. Anything under them (`policy.widen.x`) counts as them.
-pub const HIGHEST_CLASSES: [&str; 2] = ["policy.widen", "device.enroll"];
+/// What only a person may approve, on their own device: the actions that
+/// could take over or blind the whole system. Anything under them
+/// (`device.enroll`, `keys.rotate`) counts as them.
+/// - `device`: adding or removing approver devices;
+/// - `approvals`: changing who may approve what, the coordinator's powers too;
+/// - `audit`: turning off or removing the audit trail;
+/// - `trust`: trusting another org or issuer;
+/// - `keys`: rotating the master key or the signing keys.
+///
+/// Granting approver rights (`Action::Approve`) is reserved whatever its
+/// class says, and so is raising a coordinator's own reach (see
+/// `delegation_allowed`). No synced passkey approves a reserved class.
+pub const RESERVED_CLASSES: [&str; 5] = ["device", "approvals", "audit", "trust", "keys"];
 
 /// `segment(.segment)*`, each segment `[a-z0-9-]`, at most 128 characters.
 pub fn valid_class(class: &str) -> bool {
@@ -35,8 +45,8 @@ pub fn valid_class(class: &str) -> bool {
         && class.split('.').all(|segment| !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'))
 }
 
-pub fn is_highest(class: &str) -> bool {
-    HIGHEST_CLASSES.iter().any(|highest| class == *highest || class.strip_prefix(highest).is_some_and(|rest| rest.starts_with('.')))
+pub fn is_reserved(class: &str) -> bool {
+    RESERVED_CLASSES.iter().any(|root| class == *root || class.strip_prefix(root).is_some_and(|rest| rest.starts_with('.')))
 }
 
 /// Text a device shows must be one plain token: printable ASCII with no
@@ -101,13 +111,16 @@ impl ApproverDevice {
     }
 }
 
-/// The primary deciding: its issuer URL, which every request must name, and
-/// the site its passkeys belong to. Both from its own config, never from a
-/// request or a device record.
+/// The primary deciding: its issuer URL, which every request must name, the
+/// site its passkeys belong to, and how many of a person's devices a reserved
+/// class needs. All from its own config, never from a request or a device.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Primary {
     pub issuer: String,
     pub rp_id: String,
+    /// Devices a reserved class needs: 1 to start; 2 once every approver has
+    /// two devices enrolled.
+    pub reserved_devices: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +152,11 @@ pub struct ApprovalRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zone: Option<Name>,
     pub action: Action,
+    /// Whose reach this changes, if it changes anyone's: the actors a grant
+    /// or binding would give more to. A coordinator never approves a request
+    /// that affects itself or anything in its lineage.
+    #[serde(default)]
+    pub affects: Vec<Name>,
     pub created_at: u64,
     pub expires_at: u64,
 }
@@ -198,7 +216,7 @@ impl ApprovalRequest {
     /// SHA-256 over a fixed encoding of every field and the decision.
     ///
     /// `context || device_id || id || primary || org || class || actor || act_for? ||
-    /// chain[] || zone? || action || created_at || expires_at || decision`,
+    /// chain[] || zone? || action || affects[] || created_at || expires_at || decision`,
     /// strings as u64 big-endian length then bytes, optionals as 0 or 1 then
     /// the string, lists as a u64 count then each string, the action as one
     /// tag byte (1 read, 2 write, 3 token, 4 launch, 5 approve) then its
@@ -213,6 +231,7 @@ impl ApprovalRequest {
         list(&mut out, &self.chain.iter().map(Name::to_string).collect::<Vec<_>>());
         optional(&mut out, &self.zone);
         encode_action(&mut out, &self.action);
+        list(&mut out, &self.affects.iter().map(Name::to_string).collect::<Vec<_>>());
         out.extend_from_slice(&self.created_at.to_be_bytes());
         out.extend_from_slice(&self.expires_at.to_be_bytes());
         out.push(match decision {
@@ -241,13 +260,17 @@ impl ApprovalRequest {
         if let Some(zone) = &self.zone {
             text.push_str(&format!("; from {zone}"));
         }
+        if !self.affects.is_empty() {
+            let names: Vec<String> = self.affects.iter().map(Name::to_string).collect();
+            text.push_str(&format!("; gives more to {}", names.join(" ")));
+        }
         text
     }
 
-    /// Whether the highest-class rules apply: the class says so, or the
-    /// action grants approver rights, which is always among the highest.
-    pub fn is_highest(&self) -> bool {
-        is_highest(&self.class) || matches!(self.action, Action::Approve { .. })
+    /// Whether only a person may approve this: a reserved class, or a grant
+    /// of approver rights, whatever its class says.
+    pub fn is_reserved(&self) -> bool {
+        is_reserved(&self.class) || matches!(self.action, Action::Approve { .. })
     }
 
     /// The request itself is well formed, for this primary, and still open.
@@ -272,6 +295,8 @@ impl ApprovalRequest {
             }
         }
         if self.chain.len() > MAX_CHAIN
+            || self.affects.len() > MAX_CHAIN
+            || !self.affects.iter().all(|name| name.kind().is_actor())
             || !self.actor.kind().is_actor()
             || self.zone.as_ref().is_some_and(|zone| zone.kind() != Kind::Zone)
             || self.act_for.as_ref().is_some_and(|who| !matches!(who.kind(), Kind::Human | Kind::User))
@@ -293,7 +318,7 @@ impl ApprovalRequest {
         if !texts.iter().all(|text| plain(text)) {
             return Err(ApprovalError::BadRequest);
         }
-        let mut names = std::iter::once(&self.actor).chain(&self.act_for).chain(&self.chain).chain(&self.zone);
+        let mut names = std::iter::once(&self.actor).chain(&self.act_for).chain(&self.chain).chain(&self.zone).chain(&self.affects);
         if names.any(|name| name.org() != &self.org) {
             return Err(ApprovalError::BadRequest);
         }
@@ -522,7 +547,7 @@ pub fn verify_approval<'a>(
         }
         (Proof::WebAuthn { authenticator_data, client_data_json, signature }, DeviceKind::Passkey) => {
             let parts = (decode(authenticator_data)?, decode(client_data_json)?, decode(signature)?);
-            Some(verify_webauthn(&key, device, rp, &challenge, request.is_highest(), (&parts.0, &parts.1, &parts.2))?)
+            Some(verify_webauthn(&key, device, rp, &challenge, request.is_reserved(), (&parts.0, &parts.1, &parts.2))?)
         }
         _ => return Err(ApprovalError::BadProof),
     };
@@ -566,7 +591,8 @@ pub fn decide(
 ) -> Result<Decided, ApprovalError> {
     request.check(rp, now)?;
     let governing: Vec<&ApprovalRule> = request.governing_classes().into_iter().map(|class| rule_for(rules, class)).collect::<Result<_, _>>()?;
-    let need = governing.iter().map(|rule| usize::from(rule.devices.max(1))).max().unwrap_or(1).max(if request.is_highest() { 2 } else { 1 });
+    let floor = if request.is_reserved() { usize::from(rp.reserved_devices.max(1)) } else { 1 };
+    let need = governing.iter().map(|rule| usize::from(rule.devices.max(1))).max().unwrap_or(1).max(floor);
     // Which human each key has counted for: one key never counts for two.
     let mut key_owner: BTreeMap<String, &Name> = BTreeMap::new();
     let mut rejected = Vec::new();
@@ -617,20 +643,26 @@ pub fn decide(
     Ok(Decided { outcome, rejected, sign_counts })
 }
 
-/// Whether a machine or agent, approving through its role rather than a
-/// device, may approve this request: never the highest classes; only an agent
-/// or service of the same org (humans approve with a device; app users never);
-/// never the asker, whom it acts for, anything that started it, anything the
-/// asker started, or a sibling under the same agent (`approver_chain` is what
-/// started the approver, nearest first). Acting for the same human is
-/// allowed: that's an orchestrator approving low-risk work for its person.
-/// Whether its role allows `approve <class>` is `Policy::decide`'s call.
+/// Whether a coordinator (an agent or service approving through its role
+/// rather than a device) may approve this request. It may approve anything
+/// except:
+/// - a reserved class, or a grant of approver rights;
+/// - a request that gives more to itself or to anything that started it (no
+///   self-promotion; only a person widens what a coordinator holds);
+/// - its own request, a request from whoever it acts for, from anything that
+///   started it or that it started, or from a sibling under the same agent.
+///
+/// Humans approve with a device and app users never approve. Whether its
+/// role allows `approve <class>`, and its rate limits, are the primary's call.
 pub fn delegation_allowed(request: &ApprovalRequest, approver: &Name, approver_chain: &[Name]) -> bool {
-    // Agents sharing an ancestor agent are one line: siblings never approve
-    // each other. Services and brokers that start everything don't count.
+    let lineage = || std::iter::once(approver).chain(approver_chain);
+    // Agents sharing an ancestor agent are one line. Services and brokers
+    // that start everything don't count.
     let shared_agent = approver_chain.iter().any(|name| name.kind() == Kind::Agent && request.chain.contains(name));
-    !request.is_highest()
+    let self_promotion = lineage().any(|name| request.affects.contains(name));
+    !request.is_reserved()
         && !shared_agent
+        && !self_promotion
         && matches!(approver.kind(), Kind::Agent | Kind::Service)
         && approver.org() == &request.org
         && approver != &request.actor
@@ -652,7 +684,7 @@ mod tests {
     }
 
     fn rp() -> Primary {
-        Primary { issuer: "https://account.addis.gg".into(), rp_id: "account.addis.gg".into() }
+        Primary { issuer: "https://account.addis.gg".into(), rp_id: "account.addis.gg".into(), reserved_devices: 1 }
     }
 
     fn request(class: &str) -> ApprovalRequest {
@@ -666,6 +698,7 @@ mod tests {
             chain: vec![name("gg.addis.agent.orchestrator")],
             zone: Some(name("gg.addis.zone.vm-01jbx4k2m9q8r7s6")),
             action: Action::Token { audience: "https://api.simien.dev".into(), scopes: vec!["deploy:site".into()] },
+            affects: vec![],
             created_at: NOW - 10,
             expires_at: NOW + 600,
         }
@@ -757,6 +790,10 @@ mod tests {
             ApprovalRule { class: "deploy.*".into(), approvers: "gg.addis.human.*".parse().unwrap(), devices: 1 },
             ApprovalRule { class: "policy.*".into(), approvers: "gg.addis.human.sami".parse().unwrap(), devices: 1 },
             ApprovalRule { class: "device.*".into(), approvers: "gg.addis.human.sami".parse().unwrap(), devices: 1 },
+            ApprovalRule { class: "approvals.*".into(), approvers: "gg.addis.human.sami".parse().unwrap(), devices: 1 },
+            ApprovalRule { class: "audit.*".into(), approvers: "gg.addis.human.sami".parse().unwrap(), devices: 1 },
+            ApprovalRule { class: "trust.*".into(), approvers: "gg.addis.human.sami".parse().unwrap(), devices: 1 },
+            ApprovalRule { class: "keys.*".into(), approvers: "gg.addis.human.sami".parse().unwrap(), devices: 1 },
         ]
     }
 
@@ -783,6 +820,9 @@ mod tests {
         // If this changes, every phone and passkey page must change with it:
         // bump the context string instead of editing the encoding in place.
         let hex = |digest: [u8; 32]| digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let mut affecting = request("policy.widen");
+        affecting.affects = vec![name("gg.addis.agent.worker")];
+        assert_eq!(hex(affecting.challenge(Decision::Approve, "mac-1")), KNOWN_ANSWER_AFFECTS);
         assert_eq!(hex(request("deploy.production").challenge(Decision::Approve, "phone-1")), KNOWN_ANSWER);
         // Every optional absent, an empty chain, another kind of action, a deny.
         let mut bare = request("deploy.production");
@@ -804,11 +844,12 @@ mod tests {
 
     /// Computed by a separate Python script from the encoding written in
     /// `challenge`'s doc, not by this code, so the two had to agree.
-    const KNOWN_ANSWER: &str = "530729abd0482f9adfb5934c84c36a86247ae15b63b2db23ec8201bb173aadba";
-    const KNOWN_ANSWER_GRANT: &str = "3f46f9a72da1670caf0a02f4cf5f0d2f4a53f0cf8ade2c036569e040362efbf0";
-    const KNOWN_ANSWER_WRITE: &str = "ba040088009ea0d4793cd93ca3db4daad545ed787c000fa79a39669f89302699";
-    const KNOWN_ANSWER_LAUNCH: &str = "217ccfbf899091d893735350e27b5c0c0f5691b63ac0f294e147a3109807e77b";
-    const KNOWN_ANSWER_BARE: &str = "d6b8ffb5d1341e72e6bdb3b2f8cfce5e85ce3c0adc99ae553e86c32a3ad5fd8e";
+    const KNOWN_ANSWER: &str = "3a652c74a3080077c0eca6c8eb1bb16f47c7b5e003223780e7cc2f216368a580";
+    const KNOWN_ANSWER_AFFECTS: &str = "e45d5c48f4545524f3459925165c9d81214b3ec393b96ad8c8114eab3e3a0c3f";
+    const KNOWN_ANSWER_GRANT: &str = "a28a7df5b25a56216e205674b5f1dd0523e560b044ab39ea8d8110c112862e1c";
+    const KNOWN_ANSWER_WRITE: &str = "934b4c5e15b68af43fd20cb03662aa488a3afa845dc34bbaa7f57135c641687b";
+    const KNOWN_ANSWER_LAUNCH: &str = "5a85f55b0acdf97b827317c2c867aff6841d20b9406b3faf82d4a1bd71db15e0";
+    const KNOWN_ANSWER_BARE: &str = "18b44c5ac42239c85a0799cdd5b27d76ee8a17f4bcc4c171a873846e85b1a100";
 
     #[test]
     fn a_signature_fits_only_its_own_request_and_decision() {
@@ -830,6 +871,7 @@ mod tests {
             ("zone", Box::new(|r| r.zone = None)),
             ("action", Box::new(|r| r.action = Action::Token { audience: "https://api.simien.dev".into(), scopes: vec!["deploy:*".into()] })),
             ("action kind", Box::new(|r| r.action = Action::Read { path: "prod/site/DATABASE_URL".into() })),
+            ("affects", Box::new(|r| r.affects = vec![name("gg.addis.agent.worker")])),
             ("created_at", Box::new(|r| r.created_at -= 1)),
             ("expires_at", Box::new(|r| r.expires_at += 1)),
         ];
@@ -961,42 +1003,47 @@ mod tests {
     }
 
     #[test]
-    fn the_highest_classes_need_two_distinct_keys_never_synced() {
+    fn reserved_classes_need_the_configured_devices_and_never_a_synced_passkey() {
         let phone = device("phone-1", "gg.addis.human.sami", DeviceKind::Phone);
         let mac = device("mac-1", "gg.addis.human.sami", DeviceKind::Mac);
         let devices = [phone.device.clone(), mac.device.clone()];
-        for class in ["policy.widen", "policy.widen.network", "device.enroll"] {
+        let two = Primary { reserved_devices: 2, ..rp() };
+        for class in ["device.enroll", "approvals.rules", "audit.change", "trust.change", "keys.rotate"] {
             let ask = request(class);
+            assert!(ask.is_reserved(), "{class}");
             let once = signed(&phone, &ask, Decision::Approve);
-            assert_eq!(outcome(&ask, std::slice::from_ref(&once), &devices), Ok(Outcome::Pending { have: 1, need: 2 }), "{class}: the rule says 1; the floor is 2");
-            assert_eq!(outcome(&ask, &[once.clone(), once.clone()], &devices), Ok(Outcome::Pending { have: 1, need: 2 }), "{class}: one device twice");
-            assert_eq!(outcome(&ask, &[once, signed(&mac, &ask, Decision::Approve)], &devices), Ok(Outcome::Approved), "{class}");
+            assert_eq!(outcome(&ask, std::slice::from_ref(&once), &devices), Ok(Outcome::Approved), "{class}: one device, the default");
+            let with_two = |approvals: &[Approval]| decide(&ask, approvals, &devices, &rules(), &two, NOW).map(|d| d.outcome);
+            assert_eq!(with_two(std::slice::from_ref(&once)), Ok(Outcome::Pending { have: 1, need: 2 }), "{class}: set to two");
+            assert_eq!(with_two(&[once.clone(), once.clone()]), Ok(Outcome::Pending { have: 1, need: 2 }), "{class}: one device twice");
+            assert_eq!(with_two(&[once, signed(&mac, &ask, Decision::Approve)]), Ok(Outcome::Approved), "{class}");
         }
+        assert!(!request("policy.widen").is_reserved(), "widening policy is a coordinator's to approve");
 
         // One key enrolled under two ids is still one key.
         let twin = with_key("mac-2", "gg.addis.human.sami", DeviceKind::Mac, phone.key.clone());
-        let ask = request("policy.widen");
+        let ask = request("keys.rotate");
         let both = [phone.device.clone(), twin.device.clone()];
-        assert_eq!(outcome(&ask, &[signed(&phone, &ask, Decision::Approve), signed(&twin, &ask, Decision::Approve)], &both), Ok(Outcome::Pending { have: 1, need: 2 }));
+        let decided = decide(&ask, &[signed(&phone, &ask, Decision::Approve), signed(&twin, &ask, Decision::Approve)], &both, &rules(), &two, NOW).unwrap();
+        assert_eq!(decided.outcome, Outcome::Pending { have: 1, need: 2 });
 
-        // A synced passkey can approve a deploy, never the highest classes.
+        // A synced passkey can approve a deploy, never a reserved class.
         let mut synced = device("pk-1", "gg.addis.human.sami", DeviceKind::Passkey);
         synced.device.backup_eligible = true;
         let deploy = request("deploy.production");
         assert_eq!(outcome(&deploy, &[passkey(&synced, &deploy, Decision::Approve, Assertion::default())], std::slice::from_ref(&synced.device)), Ok(Outcome::Approved));
-        let widen = request("policy.widen");
-        assert_eq!(rejected(&widen, &[passkey(&synced, &widen, Decision::Approve, Assertion::default())], std::slice::from_ref(&synced.device)), [ApprovalError::SyncedPasskey]);
+        let enroll = request("device.enroll");
+        assert_eq!(rejected(&enroll, &[passkey(&synced, &enroll, Decision::Approve, Assertion::default())], std::slice::from_ref(&synced.device)), [ApprovalError::SyncedPasskey]);
         let flagged = device("pk-2", "gg.addis.human.sami", DeviceKind::Passkey);
-        let says_synced = passkey(&flagged, &widen, Decision::Approve, Assertion { flags: 0x0d, ..Assertion::default() });
-        assert_eq!(rejected(&widen, &[says_synced], std::slice::from_ref(&flagged.device)), [ApprovalError::SyncedPasskey], "the BE flag on the assertion counts too");
-        let backed_up = passkey(&flagged, &widen, Decision::Approve, Assertion { flags: 0x15, ..Assertion::default() });
-        assert_eq!(rejected(&widen, &[backed_up], std::slice::from_ref(&flagged.device)), [ApprovalError::SyncedPasskey], "and so does BS");
+        let says_synced = passkey(&flagged, &enroll, Decision::Approve, Assertion { flags: 0x0d, ..Assertion::default() });
+        assert_eq!(rejected(&enroll, &[says_synced], std::slice::from_ref(&flagged.device)), [ApprovalError::SyncedPasskey], "the BE flag on the assertion counts too");
+        let backed_up = passkey(&flagged, &enroll, Decision::Approve, Assertion { flags: 0x15, ..Assertion::default() });
+        assert_eq!(rejected(&enroll, &[backed_up], std::slice::from_ref(&flagged.device)), [ApprovalError::SyncedPasskey], "and so does BS");
 
-        // Granting approver rights is always a highest-class request, whatever its class says.
+        // Granting approver rights is reserved, whatever its class says.
         let mut grant = request("deploy.staging");
         grant.action = Action::Approve { class: "policy.widen".into() };
-        assert!(grant.is_highest());
-        assert_eq!(outcome(&grant, &[signed(&phone, &grant, Decision::Approve)], &devices), Ok(Outcome::Pending { have: 1, need: 2 }));
+        assert!(grant.is_reserved());
         assert!(!delegation_allowed(&grant, &name("gg.addis.agent.helper"), &[]));
         let mut synced_grant = device("pk-9", "gg.addis.human.sami", DeviceKind::Passkey);
         synced_grant.device.backup_eligible = true;
@@ -1004,11 +1051,8 @@ mod tests {
 
         // A grant is also judged by the rule for what it grants: eve may approve
         // deploys, but only sami may approve anything that hands out policy rights.
-        let eve_a = device("eve-1", "gg.addis.human.eve", DeviceKind::Phone);
-        let eve_b = device("eve-2", "gg.addis.human.eve", DeviceKind::Mac);
-        let eves = [eve_a.device.clone(), eve_b.device.clone()];
-        let by_eve = [signed(&eve_a, &grant, Decision::Approve), signed(&eve_b, &grant, Decision::Approve)];
-        assert_eq!(rejected(&grant, &by_eve, &eves), [ApprovalError::NotAnApprover, ApprovalError::NotAnApprover]);
+        let eve = device("eve-1", "gg.addis.human.eve", DeviceKind::Phone);
+        assert_eq!(rejected(&grant, &[signed(&eve, &grant, Decision::Approve)], std::slice::from_ref(&eve.device)), [ApprovalError::NotAnApprover]);
     }
 
     #[test]
@@ -1131,13 +1175,25 @@ mod tests {
     }
 
     #[test]
-    fn delegated_approval_never_reaches_the_highest_classes_or_the_askers_line() {
+    fn a_coordinator_approves_real_work_but_never_reserved_classes_or_its_own_line() {
         let helper = name("gg.addis.agent.helper");
         let allowed = |request: &ApprovalRequest, approver: &Name| delegation_allowed(request, approver, &[]);
         assert!(allowed(&request("deploy.staging"), &helper));
-        assert!(!allowed(&request("policy.widen"), &helper));
-        assert!(!allowed(&request("policy.widen.network"), &helper));
-        assert!(!allowed(&request("device.enroll"), &helper));
+        assert!(allowed(&request("deploy.production"), &helper), "a coordinator can do real work");
+        assert!(allowed(&request("policy.widen"), &helper), "including widening other agents' reach");
+        for reserved in ["device.enroll", "approvals.rules", "audit.change", "trust.change", "keys.rotate"] {
+            assert!(!allowed(&request(reserved), &helper), "{reserved} is a person's alone");
+        }
+        // No self-promotion: never a request that gives more to itself or its lineage.
+        let mut widen_self = request("policy.widen");
+        widen_self.affects = vec![helper.clone()];
+        assert!(!allowed(&widen_self, &helper), "itself");
+        let mut widen_parent = request("policy.widen");
+        widen_parent.affects = vec![name("gg.addis.agent.boss")];
+        assert!(!delegation_allowed(&widen_parent, &helper, &[name("gg.addis.agent.boss")]), "what started it");
+        let mut widen_other = request("policy.widen");
+        widen_other.affects = vec![name("gg.addis.agent.worker")];
+        assert!(allowed(&widen_other, &helper), "another agent's reach is fine");
         assert!(!allowed(&request("deploy.staging"), &name("gg.addis.agent.ava")), "the asker");
         assert!(!allowed(&request("deploy.staging"), &name("gg.addis.agent.orchestrator")), "what started the asker");
         assert!(!allowed(&request("deploy.staging"), &name("gg.addis.human.sami")), "humans approve with a device");
@@ -1157,7 +1213,9 @@ mod tests {
         pk.device.sign_count = 3;
         let mac = device("mac-1", "gg.addis.human.sami", DeviceKind::Mac);
         let devices = [pk.device.clone(), mac.device.clone()];
-        let ask = request("policy.widen");
+        let ask = request("keys.rotate");
+        let two = Primary { reserved_devices: 2, ..rp() };
+        let outcome = |ask: &ApprovalRequest, approvals: &[Approval], devices: &[ApproverDevice]| decide(ask, approvals, devices, &rules(), &two, NOW).map(|d| d.outcome);
         let first = passkey(&pk, &ask, Decision::Approve, Assertion { count: 4, ..Assertion::default() });
         assert_eq!(outcome(&ask, std::slice::from_ref(&first), &devices), Ok(Outcome::Pending { have: 1, need: 2 }));
         // The second device arrives later; the devices passed are still the
