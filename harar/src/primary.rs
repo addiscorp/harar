@@ -69,6 +69,9 @@ pub struct Serve {
     accept_unanchored: bool,
     #[arg(long, default_value = "/var/log/harar.log")]
     audit_log: PathBuf,
+    /// The master key every stored secret is encrypted to (0400, yours).
+    #[arg(long, default_value = crate::master_key::DEFAULT_MASTER_KEY_PATH)]
+    master_key_file: PathBuf,
     #[arg(long, default_value = "/var/lib/harar/harar-signing.key")]
     signing_key_file: PathBuf,
     /// Default: next to the signing key.
@@ -99,7 +102,14 @@ pub(crate) struct Primary {
     /// Whether an OS user exists on this machine. Only users that do may be
     /// mapped, so the lockout guard never counts a typo as an owner.
     user_exists: fn(&str) -> bool,
+    /// Audit lines for unknown callers, per uid and minute, so one local user
+    /// can't fill the audit log.
+    unknown_lines: std::sync::Mutex<HashMap<u32, (u64, u32)>>,
 }
+
+/// Audit lines kept per unknown uid per minute; past this, one line says the
+/// rest were left out.
+const UNKNOWN_LINES_PER_MINUTE: u32 = 5;
 
 /// What answering a request comes to: a reply, or a new key map to save.
 enum Outcome {
@@ -251,6 +261,7 @@ impl Primary {
             .create(true)
             .append(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&self.audit_log)
             .and_then(|mut file| writeln!(file, "{line}"))
             .with_context(|| format!("audit {}", self.audit_log.display()))
@@ -262,13 +273,16 @@ impl Primary {
         let (policy, users, actor) = match self.caller(&keys, peer) {
             Ok(caller) => caller,
             Err(reason) => {
-                if let Err(err) = self.audit(peer, None, op, None, reason) {
+                if let Some(result) = self.unknown_line(peer.uid, reason)
+                    && let Err(err) = self.audit(peer, None, op, None, result)
+                {
                     eprintln!("harar: {err:#}");
                 }
                 return PrimaryResponse::error(reason);
             }
         };
         let (subject, outcome) = self.answer(&keys, policy, users, &actor, request);
+        let committed = matches!(outcome, Outcome::Commit(_));
         let response = match outcome {
             Outcome::Reply(response) => *response,
             // A change is written to the audit log before it is made, and
@@ -284,8 +298,28 @@ impl Primary {
         let result = if response.ok { "ok" } else { response.error.as_deref().unwrap_or("error") };
         if let Err(err) = self.audit(peer, Some(&actor), op, subject.as_deref(), result) {
             eprintln!("harar: {err:#}");
+            // A change is already made (and logged as pending); nothing else
+            // is handed out unrecorded: no secret, no token, no policy.
+            if response.ok && !committed {
+                return PrimaryResponse::error("audit_failed");
+            }
         }
         response
+    }
+
+    /// What to write for an unknown caller: the reason for the first few per
+    /// uid each minute, one note that the rest are left out, then nothing.
+    fn unknown_line(&self, uid: u32, reason: &'static str) -> Option<&'static str> {
+        let minute = now_epoch_seconds() / 60;
+        let mut lines = self.unknown_lines.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        lines.retain(|_, (at, _)| *at == minute);
+        let (_, count) = lines.entry(uid).or_insert((minute, 0));
+        *count += 1;
+        match *count {
+            n if n <= UNKNOWN_LINES_PER_MINUTE => Some(reason),
+            n if n == UNKNOWN_LINES_PER_MINUTE + 1 => Some("more_unknown_calls_this_minute_not_logged"),
+            _ => None,
+        }
     }
 
     fn answer(&self, keys: &HashMap<String, String>, policy: Policy, mut users: BTreeMap<String, Name>, actor: &Name, request: PrimaryRequest) -> (Option<String>, Outcome) {
@@ -481,7 +515,7 @@ impl Primary {
     /// leave nobody able to change it again.
     fn someone_can_change_policy(&self, policy: &Policy, users: &BTreeMap<String, Name>) -> bool {
         let widen = Action::Approve { class: "policy.widen".into() };
-        users.values().any(|actor| self.check(policy, actor, &widen).is_ok())
+        users.iter().any(|(user, actor)| (self.user_exists)(user) && self.check(policy, actor, &widen).is_ok())
     }
 
     async fn commit(&self, keys: &mut HashMap<String, String>, next: HashMap<String, String>) -> PrimaryResponse {
@@ -567,7 +601,7 @@ async fn open(config: &Serve) -> Result<Primary> {
     let broker = Name::new(&org, Kind::Broker, &config.machine)?;
     let state_dir = config.state_path.parent().ok_or_else(|| anyhow!("the state path has no parent folder"))?;
     ensure_private_dir(state_dir, "state")?;
-    let identity = crate::master_key::load_master_key()?;
+    let identity = crate::master_key::load_master_key(&config.master_key_file)?;
     let (storage, mut keys) = match &config.postgres_file {
         None => {
             let keys = load_keys(&config.state_path, &identity)?;
@@ -606,6 +640,7 @@ async fn open(config: &Serve) -> Result<Primary> {
         issuer: oidc::Issuer::new(config.issuer.clone(), es256, signing),
         audit_log: config.audit_log.clone(),
         user_exists: crate::common::user_exists,
+        unknown_lines: Default::default(),
     };
     match keys.get(POLICY_KEY) {
         Some(_) => {
@@ -658,18 +693,22 @@ fn ensure_private_dir(path: &Path, kind: &str) -> Result<()> {
 }
 
 /// A file only this user can read: their own, with no group or other bits.
+/// The checks are made on the file that was opened, never on a symlink.
 fn read_private_file(path: &Path, kind: &str) -> Result<String> {
-    let metadata = fs::symlink_metadata(path).with_context(|| format!("read the {kind} {}", path.display()))?;
+    let mut file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path).with_context(|| format!("open the {kind} {}", path.display()))?;
+    let metadata = file.metadata()?;
     // SAFETY: geteuid has no preconditions.
     if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } || metadata.permissions().mode() & 0o077 != 0 {
         return Err(anyhow!("refusing a {kind} others can read, or this user doesn't own: {}", path.display()));
     }
-    fs::read_to_string(path).with_context(|| format!("read the {kind} {}", path.display()))
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut file, &mut text).with_context(|| format!("read the {kind} {}", path.display()))?;
+    Ok(text)
 }
 
 /// The audit log is this user's and private, or the primary doesn't start.
 fn check_audit_log(path: &Path) -> Result<()> {
-    let file = OpenOptions::new().create(true).append(true).mode(0o600).open(path).with_context(|| format!("open the audit log {}", path.display()))?;
+    let file = OpenOptions::new().create(true).append(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(path).with_context(|| format!("open the audit log {}", path.display()))?;
     let metadata = file.metadata()?;
     // SAFETY: geteuid has no preconditions.
     if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } || metadata.permissions().mode() & 0o077 != 0 {
@@ -717,12 +756,15 @@ fn bind_socket(path: &Path) -> Result<UnixListener> {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => {
-            if std::os::unix::net::UnixStream::connect(path).is_ok() {
-                return Err(anyhow!("another harar is serving on {}", path.display()));
+        // Only a socket nothing answers on is stale; one that is busy or
+        // unreadable may still be a live primary's.
+        Ok(metadata) if metadata.file_type().is_socket() => match std::os::unix::net::UnixStream::connect(path) {
+            Ok(_) => return Err(anyhow!("another harar is serving on {}", path.display())),
+            Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
+                fs::remove_file(path).with_context(|| format!("remove the stale {}", path.display()))?
             }
-            fs::remove_file(path).with_context(|| format!("remove the stale {}", path.display()))?
-        }
+            Err(err) => return Err(anyhow!("can't tell whether {} is in use ({err}); remove it if no harar is running", path.display())),
+        },
         Ok(_) => return Err(anyhow!("{} exists and is not a socket", path.display())),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err).with_context(|| format!("stat {}", path.display())),
@@ -749,6 +791,7 @@ pub async fn run(config: Serve) -> Result<()> {
         tokio::spawn(serve_public(public, Arc::clone(&primary), PUBLIC_LIMITS));
     }
     let slots = Arc::new(tokio::sync::Semaphore::new(LOCAL_LIMITS.connections));
+    let per_uid = Arc::new(PerUid::default());
     loop {
         let slot = Arc::clone(&slots).acquire_owned().await.expect("the semaphore is never closed");
         let (stream, _) = match listener.accept().await {
@@ -760,9 +803,10 @@ pub async fn run(config: Serve) -> Result<()> {
             }
         };
         let primary = Arc::clone(&primary);
+        let per_uid = Arc::clone(&per_uid);
         tokio::spawn(async move {
             let _slot = slot;
-            if let Err(err) = connection(stream, &primary, LOCAL_LIMITS.exchange).await {
+            if let Err(err) = connection(stream, &primary, &per_uid, LOCAL_LIMITS.exchange).await {
                 eprintln!("harar connection error: {err:#}");
             }
         });
@@ -770,12 +814,53 @@ pub async fn run(config: Serve) -> Result<()> {
 }
 
 /// Limits for the local socket, which any OS user on this machine can open.
-const LOCAL_LIMITS: Limits = Limits { connections: 64, exchange: Duration::from_secs(5) };
+/// A request arrives at once, so a second is plenty to send it.
+const LOCAL_LIMITS: Limits = Limits { connections: 64, exchange: Duration::from_secs(1) };
+/// Connections one OS user may hold open at once, so no one user can take
+/// every slot.
+const CONNECTIONS_PER_UID: usize = 8;
+
+/// Open connections per OS user.
+#[derive(Default)]
+struct PerUid(std::sync::Mutex<HashMap<u32, usize>>);
+
+/// One of a user's connection slots, given back when dropped.
+struct UidSlot<'a> {
+    per_uid: &'a PerUid,
+    uid: u32,
+}
+
+impl PerUid {
+    fn take(&self, uid: u32) -> Option<UidSlot<'_>> {
+        let mut open = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = open.entry(uid).or_insert(0);
+        if *count >= CONNECTIONS_PER_UID {
+            return None;
+        }
+        *count += 1;
+        Some(UidSlot { per_uid: self, uid })
+    }
+}
+
+impl Drop for UidSlot<'_> {
+    fn drop(&mut self) {
+        let mut open = self.per_uid.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = open.get_mut(&self.uid) {
+            *count -= 1;
+            if *count == 0 {
+                open.remove(&self.uid);
+            }
+        }
+    }
+}
 
 /// Reading the request and writing the reply each get `limit`; deciding and
 /// saving in between are never cut off halfway.
-async fn connection(mut stream: UnixStream, primary: &Primary, limit: Duration) -> Result<()> {
+async fn connection(mut stream: UnixStream, primary: &Primary, per_uid: &PerUid, limit: Duration) -> Result<()> {
     let peer = peer_credentials(&stream).context("read the caller's credentials")?;
+    let Some(_uid_slot) = per_uid.take(peer.uid) else {
+        return Err(anyhow!("uid {} already has {CONNECTIONS_PER_UID} connections open", peer.uid));
+    };
     let bytes = tokio::time::timeout(limit, read_request_bytes(&mut stream)).await.map_err(|_| anyhow!("the caller sent nothing in time"))??;
     let response = match serde_json::from_slice::<PrimaryRequest>(&bytes) {
         Ok(request) => primary.handle(&peer, request).await,

@@ -158,3 +158,28 @@ pub(crate) fn write_encrypted_keys(path: &Path, recipient: &age::x25519::Recipie
 pub(crate) fn now_epoch_seconds() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("the clock is after 1970").as_secs()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_user_running_the_tests_exists_and_a_made_up_one_doesnt() {
+        // SAFETY: geteuid has no preconditions.
+        let me = username_for_uid(unsafe { libc::geteuid() }).unwrap();
+        assert!(user_exists(&me));
+        assert!(!user_exists("harar-no-such-user-7f3a"));
+        assert!(!user_exists("bad\0name"));
+    }
+
+    #[test]
+    fn a_lock_is_held_until_its_file_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("primary.lock");
+        let held = lock_exclusive(&path).unwrap();
+        assert!(lock_exclusive(&path).is_err());
+        drop(held);
+        assert!(lock_exclusive(&path).is_ok());
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+}

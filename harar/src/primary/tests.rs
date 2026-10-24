@@ -39,6 +39,7 @@ async fn with_identity(dir: &Path, identity: &age::x25519::Identity) -> Primary 
         audit_log: dir.join("audit.log"),
         // Every user exists here except the ghosts.
         user_exists: |user| !user.starts_with("ghost"),
+        unknown_lines: Default::default(),
     }
 }
 
@@ -196,6 +197,11 @@ async fn giving_approver_rights_needs_its_own_approval() {
     let reader = Role { name: name("gg.addis.role.reader"), allows: vec![Permission { verb: Verb::Read, resource: "docs/*".into(), scopes: vec![] }] };
     assert!(ask(&primary, "ava", change(PolicyChange::SetRole { role: reader })).await.ok);
     assert!(ask(&primary, "ava", change(PolicyChange::MapUser { user: "site2".into(), actor: name("gg.addis.service.site") })).await.ok);
+    // The owner, who may approve approvals.grant, can make the same grants.
+    let approver = Role { name: name("gg.addis.role.site"), allows: vec![Permission { verb: Verb::Approve, resource: "*".into(), scopes: vec![] }] };
+    assert!(ask(&primary, "sami", change(PolicyChange::SetRole { role: approver })).await.ok, "a positive control: the guard isn't refusing everything");
+    // Once site approves, mapping another OS user to it is a grant too.
+    assert_eq!(refused(&ask(&primary, "ava", change(PolicyChange::MapUser { user: "site3".into(), actor: name("gg.addis.service.site") })).await), "no_binding");
 }
 
 #[tokio::test]
@@ -313,7 +319,78 @@ async fn a_caller_who_sends_nothing_is_dropped() {
     let (primary, _) = primary(dir.path()).await;
     let (_caller, ours) = UnixStream::pair().unwrap();
     let started = std::time::Instant::now();
-    let result = tokio::time::timeout(Duration::from_secs(5), connection(ours, &primary, Duration::from_millis(100))).await;
+    let result = tokio::time::timeout(Duration::from_secs(5), connection(ours, &primary, &PerUid::default(), Duration::from_millis(100))).await;
     assert!(result.expect("the connection gave up by itself").is_err());
     assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn nothing_is_handed_out_unrecorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut primary, _) = primary(dir.path()).await;
+    assert!(ask(&primary, "sami", PrimaryRequest::Put { key: "prod/a".into(), value: "v".into() }).await.ok);
+    primary.audit_log = dir.path().join("missing").join("audit.log");
+    let token = PrimaryRequest::Token(TokenAsk { audience: "https://api.simien.dev".into(), scopes: vec![], ttl_seconds: None, act: None, alg: None });
+    for request in [PrimaryRequest::Get { key: "prod/a".into() }, token, PrimaryRequest::List, PrimaryRequest::PolicyShow] {
+        let response = ask(&primary, "sami", request).await;
+        assert_eq!(refused(&response), "audit_failed");
+        assert!(response.value.is_none() && response.token.is_none() && response.keys.is_none() && response.policy.is_none());
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_caller_cant_fill_the_audit_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let (primary, _) = primary(dir.path()).await;
+    for _ in 0..50 {
+        assert_eq!(refused(&ask(&primary, "mallory", PrimaryRequest::List).await), "unknown_caller");
+    }
+    let log = fs::read_to_string(dir.path().join("audit.log")).unwrap();
+    let results: Vec<String> = log.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["result"].as_str().unwrap().to_string()).collect();
+    assert_eq!(results.len(), UNKNOWN_LINES_PER_MINUTE as usize + 1, "{results:?}");
+    assert_eq!(results.last().unwrap(), "more_unknown_calls_this_minute_not_logged");
+    // Every caller is still refused, logged or not, and a known one is logged as usual.
+    assert!(ask(&primary, "sami", PrimaryRequest::List).await.ok);
+    assert_eq!(fs::read_to_string(dir.path().join("audit.log")).unwrap().lines().count(), results.len() + 1);
+}
+
+#[test]
+fn one_user_cant_hold_every_connection() {
+    let per_uid = PerUid::default();
+    let held: Vec<_> = (0..CONNECTIONS_PER_UID).map(|_| per_uid.take(501).expect("a slot")).collect();
+    assert!(per_uid.take(501).is_none(), "uid 501 is at its limit");
+    assert!(per_uid.take(502).is_some(), "another user isn't");
+    drop(held);
+    assert!(per_uid.take(501).is_some(), "slots come back when connections close");
+}
+
+#[tokio::test]
+async fn a_user_who_is_gone_no_longer_counts_as_an_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut primary, _) = primary(dir.path()).await;
+    assert!(ask(&primary, "sami", change(PolicyChange::MapUser { user: "sami2".into(), actor: name("gg.addis.human.sami") })).await.ok);
+    // sami2's account is deleted later.
+    primary.user_exists = |user| user != "sami2";
+    assert_eq!(refused(&ask(&primary, "sami", change(PolicyChange::UnmapUser { user: "sami".into() })).await), "would_lock_out");
+}
+
+#[test]
+fn private_files_must_be_private() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("postgres");
+    fs::write(&file, "host=/run/postgresql").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(read_private_file(&file, "connection file").is_err(), "others can read it");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(read_private_file(&file, "connection file").unwrap(), "host=/run/postgresql");
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&file, &link).unwrap();
+    assert!(read_private_file(&link, "connection file").is_err(), "a symlink isn't the file");
+
+    let audit = dir.path().join("audit.log");
+    fs::write(&audit, "").unwrap();
+    fs::set_permissions(&audit, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(check_audit_log(&audit).is_err());
+    fs::set_permissions(&audit, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(check_audit_log(&audit).is_ok());
 }

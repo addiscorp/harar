@@ -74,7 +74,7 @@ impl Primary {
             .args(["--signing-key-file", &path(state.join("signing.key"))])
             .args(["--issuer", &url, "--public-listen", &address])
             .args(&extra)
-            .env("GILD_VAULT_MASTER_KEY_PATH", dir.path().join("master.key"))
+            .args(["--master-key-file", &path(dir.path().join("master.key"))])
             .stdout(Stdio::null())
             .stderr(fs::File::create(dir.path().join("serve.log")).unwrap())
             .spawn()
@@ -294,7 +294,7 @@ fn a_second_primary_on_the_same_state_refuses_to_start() {
             .args(["--state-path", state.join("keys.age").to_str().unwrap()])
             .args(["--audit-log", dir.join(audit).to_str().unwrap()])
             .args(["--signing-key-file", state.join("signing.key").to_str().unwrap()])
-            .env("GILD_VAULT_MASTER_KEY_PATH", dir.join("master.key"));
+            .args(["--master-key-file", dir.join("master.key").to_str().unwrap()]);
         command
     };
     let said = refused_to_start(&mut serve(&dir.join("other.sock"), &state, "audit.log"));

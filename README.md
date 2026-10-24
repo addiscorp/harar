@@ -33,7 +33,8 @@ read (0600), so a password never shows in `ps`.
 ```sh
 sudo harar serve --org gg.addis --machine bugsy \
   --owner gg.addis.human.sami --owner-user sami \
-  --postgres-file /var/lib/harar/postgres
+  --postgres-file /var/lib/harar/postgres \
+  --master-key-file /etc/harar/master.key
 
 harar policy show
 harar policy role set gg.addis.role.site --read 'prod/site/*' \
