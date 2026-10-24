@@ -247,6 +247,10 @@ impl NamePattern {
     pub fn kind(&self) -> Kind {
         self.kind
     }
+
+    pub fn org(&self) -> &Org {
+        &self.org
+    }
 }
 
 impl FromStr for NamePattern {

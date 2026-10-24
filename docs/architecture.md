@@ -147,40 +147,52 @@ the keys at `<issuer>/.well-known/openid-configuration` → `jwks_uri`.
 
 ### Reserved classes: only a person
 Only a person, on their own device, approves what could take over or blind the
-whole system:
+whole system (`approvals::RESERVED_CLASSES`, matched on whole segments):
 1. `device.*`: adding or removing approver devices;
 2. `approvals.*`: changing who may approve what, including a coordinator's
-   powers, and any grant of approver rights;
-3. raising a coordinator's own reach, or its lineage's (no self-promotion);
-4. `audit.*`: turning off or removing the audit trail;
-5. `trust.*`: trusting another org or issuer;
-6. `keys.*`: rotating the master key or the signing keys.
+   powers and which classes it may approve;
+3. `audit.*`: turning off or removing the audit trail;
+4. `trust.*`: trusting another org or issuer;
+5. `keys.*`: rotating the master key or the signing keys;
+6. `recovery.*`, `setup.*`, `hosts.*`, `issuer.*`, `store.*`,
+   `policy.rollback`: things that stand in for a device, join the trust root,
+   or could undo every narrowing at once.
 
-A reserved class needs the primary's `reserved_devices` count of distinct keys
+Also reserved, whatever the class says: **any change that gives anyone approver
+rights** (`grants_approval`, or `Action::Approve`), and any malformed class. A
+reserved class needs the primary's `reserved_devices` count of distinct keys
 (1 to start; 2 once every approver has two devices), and never a synced passkey.
 
 ### A coordinator
-A coordinator agent (a "CTO") may approve everything else its role names,
-including deploys and widening other agents' reach, so orchestration isn't
-held up. The safety is in the blast radius and the record, not in refusing
-work:
-- it can't grant more than it holds, and only a person widens what it holds;
-- it never approves its own request, one from whoever it acts for, from its
-  lineage, or from a sibling under the same agent;
-- every approval it makes is audited with its full lineage, and the person
-  gets a daily digest;
-- optional rate limits per class;
-- revoking its delegation from any device takes effect at once.
+A coordinator agent (a "CTO") may approve the classes a person switched on for
+it (say `deploy.*`, `policy.widen`), including widening other agents' reach, so
+orchestration isn't held up. The safety is in the blast radius and the record:
+- **It can never make another approver**: granting approver rights is
+  reserved. So two coordinators can never promote each other, and only a
+  person widens what any coordinator holds.
+- **Every request says whose reach it widens** (`Reach`: nobody, these
+  actors, anything these patterns match, or unknown). It's signed and shown.
+  A coordinator never approves an unknown reach, or one that touches itself or
+  anything that started it, by name or by a pattern that matches it.
+- It never approves its own request, one from whoever it acts for, from its
+  lineage, or from a sibling under the same agent.
+- Classes it wasn't given, misspelled ones included, fail closed.
+- The primary adds: every coordinator approval audited with its lineage, a
+  daily digest to the person, optional rate limits per class, and revoking its
+  delegation from any device taking effect at once.
 
-A fresh primary starts with no coordinator; enabling one is a reserved
-`approvals.*` change.
+A fresh primary starts with no coordinator; enabling one is an `approvals.*`
+change, a person's alone. `policy.widen` by a person needs one device and may
+use a synced passkey: the person's choice for now.
 
 ### Getting in without a device
-- **A new primary prints a one-time setup link.** Whoever opens it enrolls the
-  first device. It works once, only while no device exists, for 24 hours.
-- **Recovery codes.** Enrolling the first device shows ten one-time codes, to
-  keep in a password manager or print. Each works once; using one enrolls a new
-  device, and every other device is told.
+- **A new primary prints a one-time setup link** to the terminal, never to a
+  log, for the person who will own it. Opening it enrolls their first device.
+  It works once, for 24 hours, and is gone as soon as any device exists.
+- **Recovery codes.** Enrolling a first device shows ten one-time codes, to
+  keep in a password manager or print. Each works once, only for its owner;
+  using one enrolls a new device, and every other device is told. A new set
+  replaces the old one, and making one is a reserved `recovery.*` change.
 - **In an org, an admin can recover a member**, as in any workspace.
 - A phone approves; it never holds the vault's master key. Servers unlock
   without anyone present, so the vault's keys stay on the primary.

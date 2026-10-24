@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-const CHALLENGE_CONTEXT: &[u8] = b"harar.approval.v3";
+const CHALLENGE_CONTEXT: &[u8] = b"harar.approval.v4";
 
 /// The longest a request may wait for approval.
 pub const MAX_REQUEST_SECONDS: u64 = 24 * 3600;
@@ -34,10 +34,16 @@ const CLOCK_SKEW_SECONDS: u64 = 60;
 /// - `trust`: trusting another org or issuer;
 /// - `keys`: rotating the master key or the signing keys.
 ///
-/// Granting approver rights (`Action::Approve`) is reserved whatever its
-/// class says, and so is raising a coordinator's own reach (see
-/// `delegation_allowed`). No synced passkey approves a reserved class.
-pub const RESERVED_CLASSES: [&str; 5] = ["device", "approvals", "audit", "trust", "keys"];
+/// - `recovery`, `setup`: recovery codes and setup links, which stand in for a device;
+/// - `hosts`: enrolling a machine, which joins the trust root;
+/// - `issuer`, `store`: the primary's own identity and storage;
+/// - `policy.rollback`: restoring an earlier policy, which can widen anything.
+///
+/// Also reserved, whatever its class says: granting approver rights
+/// (`Action::Approve`, or any change with `grants_approval`), and any class
+/// that isn't well formed. No synced passkey approves a reserved class.
+pub const RESERVED_CLASSES: [&str; 11] =
+    ["device", "approvals", "audit", "trust", "keys", "recovery", "setup", "hosts", "issuer", "store", "policy.rollback"];
 
 /// `segment(.segment)*`, each segment `[a-z0-9-]`, at most 128 characters.
 pub fn valid_class(class: &str) -> bool {
@@ -45,8 +51,38 @@ pub fn valid_class(class: &str) -> bool {
         && class.split('.').all(|segment| !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'))
 }
 
+/// Whether a class is a person's alone. A malformed class counts as one, so
+/// a typo never lands with a coordinator.
 pub fn is_reserved(class: &str) -> bool {
-    RESERVED_CLASSES.iter().any(|root| class == *root || class.strip_prefix(root).is_some_and(|rest| rest.starts_with('.')))
+    !valid_class(class) || RESERVED_CLASSES.iter().any(|root| class == *root || class.strip_prefix(root).is_some_and(|rest| rest.starts_with('.')))
+}
+
+/// Whose reach a request widens. Required: a request that doesn't say is
+/// never read as widening nobody.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "names", rename_all = "lowercase")]
+pub enum Reach {
+    /// It gives more to nobody (a deploy, a read, a narrowing).
+    None,
+    /// It gives more to exactly these actors.
+    Actors(Vec<Name>),
+    /// It gives more to anything these patterns match, now or later (a role
+    /// or binding edit).
+    Patterns(Vec<NamePattern>),
+    /// The primary can't bound it. No coordinator approves these.
+    Unbounded,
+}
+
+impl Reach {
+    /// Whether this widens `name`'s reach.
+    pub fn touches(&self, name: &Name) -> bool {
+        match self {
+            Reach::None => false,
+            Reach::Actors(names) => names.contains(name),
+            Reach::Patterns(patterns) => patterns.iter().any(|pattern| pattern.matches(name)),
+            Reach::Unbounded => true,
+        }
+    }
 }
 
 /// Text a device shows must be one plain token: printable ASCII with no
@@ -152,11 +188,11 @@ pub struct ApprovalRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zone: Option<Name>,
     pub action: Action,
-    /// Whose reach this changes, if it changes anyone's: the actors a grant
-    /// or binding would give more to. A coordinator never approves a request
-    /// that affects itself or anything in its lineage.
-    #[serde(default)]
-    pub affects: Vec<Name>,
+    /// Whose reach this widens. The primary computes it from policy.
+    pub affects: Reach,
+    /// Whether this gives anyone approver rights: `Action::Approve`, or a role
+    /// or binding change that includes `approve`. Always a person's to decide.
+    pub grants_approval: bool,
     pub created_at: u64,
     pub expires_at: u64,
 }
@@ -216,7 +252,9 @@ impl ApprovalRequest {
     /// SHA-256 over a fixed encoding of every field and the decision.
     ///
     /// `context || device_id || id || primary || org || class || actor || act_for? ||
-    /// chain[] || zone? || action || affects[] || created_at || expires_at || decision`,
+    /// chain[] || zone? || action || reach || grants_approval || created_at ||
+    /// expires_at || decision`, the reach as one tag byte (0 nobody, 1 actors,
+    /// 2 patterns, 3 unbounded) then for 1 and 2 a list, grants_approval as 0 or 1,
     /// strings as u64 big-endian length then bytes, optionals as 0 or 1 then
     /// the string, lists as a u64 count then each string, the action as one
     /// tag byte (1 read, 2 write, 3 token, 4 launch, 5 approve) then its
@@ -231,7 +269,19 @@ impl ApprovalRequest {
         list(&mut out, &self.chain.iter().map(Name::to_string).collect::<Vec<_>>());
         optional(&mut out, &self.zone);
         encode_action(&mut out, &self.action);
-        list(&mut out, &self.affects.iter().map(Name::to_string).collect::<Vec<_>>());
+        match &self.affects {
+            Reach::None => out.push(0),
+            Reach::Actors(names) => {
+                out.push(1);
+                list(&mut out, &names.iter().map(Name::to_string).collect::<Vec<_>>());
+            }
+            Reach::Patterns(patterns) => {
+                out.push(2);
+                list(&mut out, &patterns.iter().map(NamePattern::to_string).collect::<Vec<_>>());
+            }
+            Reach::Unbounded => out.push(3),
+        }
+        out.push(u8::from(self.grants_approval));
         out.extend_from_slice(&self.created_at.to_be_bytes());
         out.extend_from_slice(&self.expires_at.to_be_bytes());
         out.push(match decision {
@@ -260,9 +310,16 @@ impl ApprovalRequest {
         if let Some(zone) = &self.zone {
             text.push_str(&format!("; from {zone}"));
         }
-        if !self.affects.is_empty() {
-            let names: Vec<String> = self.affects.iter().map(Name::to_string).collect();
-            text.push_str(&format!("; gives more to {}", names.join(" ")));
+        match &self.affects {
+            Reach::None => {}
+            Reach::Actors(names) => text.push_str(&format!("; gives more to {}", names.iter().map(Name::to_string).collect::<Vec<_>>().join(" "))),
+            Reach::Patterns(patterns) => {
+                text.push_str(&format!("; gives more to anything matching {}", patterns.iter().map(NamePattern::to_string).collect::<Vec<_>>().join(" ")))
+            }
+            Reach::Unbounded => text.push_str("; gives more to an unknown set"),
+        }
+        if self.grants_approval {
+            text.push_str("; grants approver rights");
         }
         text
     }
@@ -270,7 +327,7 @@ impl ApprovalRequest {
     /// Whether only a person may approve this: a reserved class, or a grant
     /// of approver rights, whatever its class says.
     pub fn is_reserved(&self) -> bool {
-        is_reserved(&self.class) || matches!(self.action, Action::Approve { .. })
+        is_reserved(&self.class) || self.grants_approval || matches!(self.action, Action::Approve { .. })
     }
 
     /// The request itself is well formed, for this primary, and still open.
@@ -295,8 +352,11 @@ impl ApprovalRequest {
             }
         }
         if self.chain.len() > MAX_CHAIN
-            || self.affects.len() > MAX_CHAIN
-            || !self.affects.iter().all(|name| name.kind().is_actor())
+            || match &self.affects {
+                Reach::Actors(names) => names.is_empty() || names.len() > MAX_CHAIN || !names.iter().all(|name| name.kind().is_actor() && name.org() == &self.org),
+                Reach::Patterns(patterns) => patterns.is_empty() || patterns.len() > MAX_CHAIN || !patterns.iter().all(|pattern| pattern.kind().is_actor() && pattern.org() == &self.org),
+                Reach::None | Reach::Unbounded => false,
+            }
             || !self.actor.kind().is_actor()
             || self.zone.as_ref().is_some_and(|zone| zone.kind() != Kind::Zone)
             || self.act_for.as_ref().is_some_and(|who| !matches!(who.kind(), Kind::Human | Kind::User))
@@ -318,7 +378,7 @@ impl ApprovalRequest {
         if !texts.iter().all(|text| plain(text)) {
             return Err(ApprovalError::BadRequest);
         }
-        let mut names = std::iter::once(&self.actor).chain(&self.act_for).chain(&self.chain).chain(&self.zone).chain(&self.affects);
+        let mut names = std::iter::once(&self.actor).chain(&self.act_for).chain(&self.chain).chain(&self.zone);
         if names.any(|name| name.org() != &self.org) {
             return Err(ApprovalError::BadRequest);
         }
@@ -372,7 +432,7 @@ pub struct ApprovalRule {
     /// Humans who may approve.
     pub approvers: NamePattern,
     /// How many of one approver's distinct device keys must agree (at least
-    /// 1; the highest classes always need 2).
+    /// 1; reserved classes need at least the primary's `reserved_devices`).
     pub devices: u8,
 }
 
@@ -463,7 +523,7 @@ fn verify_webauthn(
     device: &ApproverDevice,
     rp: &Primary,
     challenge: &[u8; 32],
-    highest: bool,
+    reserved: bool,
     proof: (&[u8], &[u8], &[u8]),
 ) -> Result<u32, ApprovalError> {
     let (authenticator_data, client_data_json, signature) = proof;
@@ -503,7 +563,7 @@ fn verify_webauthn(
     signed.extend_from_slice(&Sha256::digest(client_data_json));
     let signature = Signature::from_der(signature).map_err(|_| ApprovalError::BadProof)?;
     key.verify(&signed, &signature).map_err(|_| ApprovalError::BadProof)?;
-    if highest && (device.backup_eligible || flags & (BACKUP_ELIGIBLE | BACKUP_STATE) != 0) {
+    if reserved && (device.backup_eligible || flags & (BACKUP_ELIGIBLE | BACKUP_STATE) != 0) {
         return Err(ApprovalError::SyncedPasskey);
     }
     let count = u32::from_be_bytes(authenticator_data[33..37].try_into().expect("four bytes"));
@@ -570,7 +630,8 @@ pub fn rule_for<'a>(rules: &'a [ApprovalRule], class: &str) -> Result<&'a Approv
 /// aside (`rejected`) and change nothing, so nobody can block a request by
 /// sending junk. A valid deny from an allowed approver ends it. Otherwise it
 /// is approved once one approver's distinct device keys reach the rule's
-/// count (two for the highest classes). Nobody approves a request they made.
+/// count (and, for a reserved class, the primary's `reserved_devices`).
+/// Nobody approves a request they made.
 ///
 /// What the caller owes:
 /// - verify each submission when it arrives (`verify_approval`) and keep at
@@ -644,23 +705,30 @@ pub fn decide(
 }
 
 /// Whether a coordinator (an agent or service approving through its role
-/// rather than a device) may approve this request. It may approve anything
-/// except:
-/// - a reserved class, or a grant of approver rights;
-/// - a request that gives more to itself or to anything that started it (no
-///   self-promotion; only a person widens what a coordinator holds);
-/// - its own request, a request from whoever it acts for, from anything that
+/// rather than a device) may approve this request. It may approve only the
+/// classes a person enabled for it (`enabled`: classes or `prefix.*`), never a
+/// reserved one, and never:
+/// - anything that grants approver rights, so it can never make another
+///   approver, and two coordinators can never promote each other;
+/// - anything whose reach is unbounded, or touches itself or anything that
+///   started it (no self-promotion; only a person widens what it holds);
+/// - its own request, one from whoever it acts for, from anything that
 ///   started it or that it started, or from a sibling under the same agent.
 ///
-/// Humans approve with a device and app users never approve. Whether its
-/// role allows `approve <class>`, and its rate limits, are the primary's call.
-pub fn delegation_allowed(request: &ApprovalRequest, approver: &Name, approver_chain: &[Name]) -> bool {
+/// Humans approve with a device and app users never approve. Its rate
+/// limits, and checking its role allows `approve`, are the primary's.
+pub fn delegation_allowed(request: &ApprovalRequest, approver: &Name, approver_chain: &[Name], enabled: &[String]) -> bool {
+    let class_enabled = enabled.iter().any(|pattern| match pattern.strip_suffix(".*") {
+        Some(prefix) => request.class.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('.')),
+        None => pattern == &request.class,
+    });
     let lineage = || std::iter::once(approver).chain(approver_chain);
     // Agents sharing an ancestor agent are one line. Services and brokers
     // that start everything don't count.
     let shared_agent = approver_chain.iter().any(|name| name.kind() == Kind::Agent && request.chain.contains(name));
-    let self_promotion = lineage().any(|name| request.affects.contains(name));
-    !request.is_reserved()
+    let self_promotion = matches!(request.affects, Reach::Unbounded) || lineage().any(|name| request.affects.touches(name));
+    class_enabled
+        && !request.is_reserved()
         && !shared_agent
         && !self_promotion
         && matches!(approver.kind(), Kind::Agent | Kind::Service)
@@ -698,7 +766,8 @@ mod tests {
             chain: vec![name("gg.addis.agent.orchestrator")],
             zone: Some(name("gg.addis.zone.vm-01jbx4k2m9q8r7s6")),
             action: Action::Token { audience: "https://api.simien.dev".into(), scopes: vec!["deploy:site".into()] },
-            affects: vec![],
+            affects: Reach::None,
+            grants_approval: false,
             created_at: NOW - 10,
             expires_at: NOW + 600,
         }
@@ -821,7 +890,7 @@ mod tests {
         // bump the context string instead of editing the encoding in place.
         let hex = |digest: [u8; 32]| digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
         let mut affecting = request("policy.widen");
-        affecting.affects = vec![name("gg.addis.agent.worker")];
+        affecting.affects = Reach::Actors(vec![name("gg.addis.agent.worker")]);
         assert_eq!(hex(affecting.challenge(Decision::Approve, "mac-1")), KNOWN_ANSWER_AFFECTS);
         assert_eq!(hex(request("deploy.production").challenge(Decision::Approve, "phone-1")), KNOWN_ANSWER);
         // Every optional absent, an empty chain, another kind of action, a deny.
@@ -844,12 +913,12 @@ mod tests {
 
     /// Computed by a separate Python script from the encoding written in
     /// `challenge`'s doc, not by this code, so the two had to agree.
-    const KNOWN_ANSWER: &str = "3a652c74a3080077c0eca6c8eb1bb16f47c7b5e003223780e7cc2f216368a580";
-    const KNOWN_ANSWER_AFFECTS: &str = "e45d5c48f4545524f3459925165c9d81214b3ec393b96ad8c8114eab3e3a0c3f";
-    const KNOWN_ANSWER_GRANT: &str = "a28a7df5b25a56216e205674b5f1dd0523e560b044ab39ea8d8110c112862e1c";
-    const KNOWN_ANSWER_WRITE: &str = "934b4c5e15b68af43fd20cb03662aa488a3afa845dc34bbaa7f57135c641687b";
-    const KNOWN_ANSWER_LAUNCH: &str = "5a85f55b0acdf97b827317c2c867aff6841d20b9406b3faf82d4a1bd71db15e0";
-    const KNOWN_ANSWER_BARE: &str = "18b44c5ac42239c85a0799cdd5b27d76ee8a17f4bcc4c171a873846e85b1a100";
+    const KNOWN_ANSWER: &str = "8839b531ca3f90b3c37b5014c7df1eab7b2c963546b2b43dcf111f7b6b60ecc1";
+    const KNOWN_ANSWER_AFFECTS: &str = "b7733ede4e6e7651d0c6a35237c0c1fb8e0bda2a84832ffedbbe9bad96ca0f0c";
+    const KNOWN_ANSWER_GRANT: &str = "673fe65c2beb3aea4f13f0762ad615354a831cec965be3742776b52655646a01";
+    const KNOWN_ANSWER_WRITE: &str = "4063400ce9215c7db1b7400e552a2bd59a08ffbc622492f97988892be8f566eb";
+    const KNOWN_ANSWER_LAUNCH: &str = "c98aeabb767901fe02da79c47d7acde522d39ecfcf8876a33febb85d0d034b41";
+    const KNOWN_ANSWER_BARE: &str = "e7de97f4c22bd87f62eaab7d67ca73c902cd3cb292d0fce61dc5fc90ee5e69fb";
 
     #[test]
     fn a_signature_fits_only_its_own_request_and_decision() {
@@ -871,7 +940,9 @@ mod tests {
             ("zone", Box::new(|r| r.zone = None)),
             ("action", Box::new(|r| r.action = Action::Token { audience: "https://api.simien.dev".into(), scopes: vec!["deploy:*".into()] })),
             ("action kind", Box::new(|r| r.action = Action::Read { path: "prod/site/DATABASE_URL".into() })),
-            ("affects", Box::new(|r| r.affects = vec![name("gg.addis.agent.worker")])),
+            ("affects", Box::new(|r| r.affects = Reach::Actors(vec![name("gg.addis.agent.worker")]))),
+            ("affects kind", Box::new(|r| r.affects = Reach::Unbounded)),
+            ("grants_approval", Box::new(|r| r.grants_approval = true)),
             ("created_at", Box::new(|r| r.created_at -= 1)),
             ("expires_at", Box::new(|r| r.expires_at += 1)),
         ];
@@ -1044,7 +1115,7 @@ mod tests {
         let mut grant = request("deploy.staging");
         grant.action = Action::Approve { class: "policy.widen".into() };
         assert!(grant.is_reserved());
-        assert!(!delegation_allowed(&grant, &name("gg.addis.agent.helper"), &[]));
+        assert!(!delegation_allowed(&grant, &name("gg.addis.agent.helper"), &[], &["deploy.*".into()]));
         let mut synced_grant = device("pk-9", "gg.addis.human.sami", DeviceKind::Passkey);
         synced_grant.device.backup_eligible = true;
         assert_eq!(rejected(&grant, &[passkey(&synced_grant, &grant, Decision::Approve, Assertion::default())], std::slice::from_ref(&synced_grant.device)), [ApprovalError::SyncedPasskey], "nor by a synced passkey");
@@ -1177,34 +1248,75 @@ mod tests {
     #[test]
     fn a_coordinator_approves_real_work_but_never_reserved_classes_or_its_own_line() {
         let helper = name("gg.addis.agent.helper");
-        let allowed = |request: &ApprovalRequest, approver: &Name| delegation_allowed(request, approver, &[]);
+        let enabled = || vec!["deploy.*".to_string(), "policy.widen".to_string(), "broker.request".to_string()];
+        let allowed = |request: &ApprovalRequest, approver: &Name| delegation_allowed(request, approver, &[], &enabled());
+        let widen = |reach: Reach| ApprovalRequest { affects: reach, ..request("policy.widen") };
         assert!(allowed(&request("deploy.staging"), &helper));
         assert!(allowed(&request("deploy.production"), &helper), "a coordinator can do real work");
-        assert!(allowed(&request("policy.widen"), &helper), "including widening other agents' reach");
-        for reserved in ["device.enroll", "approvals.rules", "audit.change", "trust.change", "keys.rotate"] {
-            assert!(!allowed(&request(reserved), &helper), "{reserved} is a person's alone");
+        assert!(allowed(&widen(Reach::Actors(vec![name("gg.addis.agent.worker")])), &helper), "including widening other agents' reach");
+        assert!(allowed(&widen(Reach::Patterns(vec!["gg.addis.service.*".parse().unwrap()])), &helper), "or every service's");
+
+        // Only what a person switched on; typos and unknown classes fail closed.
+        assert!(!allowed(&request("policy.narrow.x"), &helper), "not enabled");
+        assert!(!delegation_allowed(&request("deploy.staging"), &helper, &[], &[]), "nothing enabled, nothing approved");
+        for reserved in ["device.enroll", "approvals.rules", "audit.change", "trust.change", "keys.rotate", "recovery.codes", "setup.link", "hosts.enroll", "issuer.change", "store.restore", "policy.rollback"] {
+            assert!(!delegation_allowed(&request(reserved), &helper, &[], &[reserved.to_string()]), "{reserved} is a person's alone, even if enabled");
         }
-        // No self-promotion: never a request that gives more to itself or its lineage.
-        let mut widen_self = request("policy.widen");
-        widen_self.affects = vec![helper.clone()];
-        assert!(!allowed(&widen_self, &helper), "itself");
-        let mut widen_parent = request("policy.widen");
-        widen_parent.affects = vec![name("gg.addis.agent.boss")];
-        assert!(!delegation_allowed(&widen_parent, &helper, &[name("gg.addis.agent.boss")]), "what started it");
-        let mut widen_other = request("policy.widen");
-        widen_other.affects = vec![name("gg.addis.agent.worker")];
-        assert!(allowed(&widen_other, &helper), "another agent's reach is fine");
+
+        // No self-promotion: nothing that gives more to itself or its lineage,
+        // by name, by a pattern that matches it, or by a reach nobody can bound.
+        assert!(!allowed(&widen(Reach::Actors(vec![helper.clone()])), &helper), "itself");
+        assert!(!allowed(&widen(Reach::Patterns(vec!["gg.addis.agent.*".parse().unwrap()])), &helper), "a pattern that matches it");
+        assert!(!allowed(&widen(Reach::Unbounded), &helper), "a reach the primary can't bound");
+        let boss = name("gg.addis.agent.boss");
+        assert!(!delegation_allowed(&widen(Reach::Actors(vec![boss.clone()])), &helper, std::slice::from_ref(&boss), &enabled()), "what started it");
+
+        // Two coordinators can't promote each other: making a second approver
+        // is granting approver rights, which only a person approves.
+        let make_coordinator = ApprovalRequest { grants_approval: true, ..widen(Reach::Actors(vec![name("gg.addis.agent.n")])) };
+        assert!(make_coordinator.is_reserved());
+        assert!(!allowed(&make_coordinator, &helper), "A can't make N an approver");
+
         assert!(!allowed(&request("deploy.staging"), &name("gg.addis.agent.ava")), "the asker");
         assert!(!allowed(&request("deploy.staging"), &name("gg.addis.agent.orchestrator")), "what started the asker");
         assert!(!allowed(&request("deploy.staging"), &name("gg.addis.human.sami")), "humans approve with a device");
         assert!(!allowed(&request("deploy.staging"), &name("gg.addis.user.u-1")), "app users never approve");
         assert!(!allowed(&request("deploy.staging"), &name("com.acme.agent.helper")), "another org");
         let mut for_agent = request("deploy.staging");
-        for_agent.act_for = Some(helper.clone());
-        assert!(!allowed(&for_agent, &helper), "whom the asker acts for");
-        assert!(!delegation_allowed(&request("deploy.staging"), &helper, &[name("gg.addis.agent.ava")]), "something the asker started");
-        assert!(!delegation_allowed(&request("deploy.staging"), &helper, &[name("gg.addis.agent.orchestrator")]), "a sibling under the same agent");
-        assert!(delegation_allowed(&request("deploy.staging"), &helper, &[name("gg.addis.service.gild")]), "a service that starts everything isn't a shared line");
+        for_agent.act_for = None;
+        for_agent.actor = name("gg.addis.agent.ava");
+        assert!(allowed(&for_agent, &helper));
+        assert!(!delegation_allowed(&request("deploy.staging"), &helper, &[name("gg.addis.agent.ava")], &enabled()), "something the asker started");
+        assert!(!delegation_allowed(&request("deploy.staging"), &helper, &[name("gg.addis.agent.orchestrator")], &enabled()), "a sibling under the same agent");
+        assert!(delegation_allowed(&request("deploy.staging"), &helper, &[name("gg.addis.service.gild")], &enabled()), "a service that starts everything isn't a shared line");
+    }
+
+    #[test]
+    fn reserved_names_match_on_whole_segments_and_malformed_classes_count_as_reserved() {
+        assert!(is_reserved("device.enroll.extra"));
+        assert!(!is_reserved("devices.enroll"), "a different root");
+        assert!(!is_reserved("keysmith.x"));
+        assert!(is_reserved("policy.rollback.v1"));
+        assert!(!is_reserved("policy.rollbacks"));
+        for malformed in ["Device.enroll", "device..x", " device.enroll", "", "deploy.production "] {
+            assert!(is_reserved(malformed), "{malformed:?}");
+        }
+    }
+
+    #[test]
+    fn whose_reach_widens_is_shown_and_checked() {
+        let mut ask = request("policy.widen");
+        ask.affects = Reach::Patterns(vec!["gg.addis.agent.*".parse().unwrap()]);
+        assert!(ask.describe().ends_with("; gives more to anything matching gg.addis.agent.*"), "{}", ask.describe());
+        ask.affects = Reach::Unbounded;
+        assert!(ask.describe().ends_with("; gives more to an unknown set"));
+        ask.grants_approval = true;
+        assert!(ask.describe().ends_with("; grants approver rights"));
+        for bad in [Reach::Actors(vec![]), Reach::Actors(vec![name("com.acme.agent.x")]), Reach::Patterns(vec!["gg.addis.zone.*".parse().unwrap()])] {
+            let mut other = request("policy.widen");
+            other.affects = bad.clone();
+            assert_eq!(outcome(&other, &[], &[]), Err(ApprovalError::BadRequest), "{bad:?}");
+        }
     }
 
     #[test]
