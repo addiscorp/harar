@@ -2,7 +2,12 @@
 //! signs only after Face ID, Touch ID or a PIN, over the exact request, so a
 //! signature can't be replayed onto anything else. Machines and agents may
 //! approve only classes their role names, never the highest ones, and never
-//! their own requests.
+//! anything they asked for or started.
+//!
+//! What a device shows is `ApprovalRequest::describe`, computed from the same
+//! fields the signature covers; nothing the requester writes freely is shown.
+//! The signed bytes are a fixed binary encoding (`challenge`), pinned by a
+//! known-answer test, so the Simien app and passkey page can rebuild them.
 
 use crate::model::{Action, Kind, Name, NamePattern, Org};
 use crate::Jwk;
@@ -11,22 +16,40 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-const CHALLENGE_CONTEXT: &[u8] = b"harar.approval.v1";
+const CHALLENGE_CONTEXT: &[u8] = b"harar.approval.v2";
 
-/// Classes that always need two of the approver's devices, and that no
-/// machine or agent may ever approve.
+/// The longest a request may wait for approval.
+pub const MAX_REQUEST_SECONDS: u64 = 24 * 3600;
+const CLOCK_SKEW_SECONDS: u64 = 60;
+
+/// Classes that always need two of the approver's distinct device keys, that
+/// no synced passkey may approve, and that no machine or agent may ever
+/// approve. Anything under them (`policy.widen.x`) counts as them.
 pub const HIGHEST_CLASSES: [&str; 2] = ["policy.widen", "device.enroll"];
 
-fn is_highest(class: &str) -> bool {
-    HIGHEST_CLASSES.contains(&class)
+/// `segment(.segment)*`, each segment `[a-z0-9-]`, at most 128 characters.
+pub fn valid_class(class: &str) -> bool {
+    class.len() <= 128
+        && class.split('.').all(|segment| !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'))
+}
+
+pub fn is_highest(class: &str) -> bool {
+    HIGHEST_CLASSES.iter().any(|highest| class == *highest || class.strip_prefix(highest).is_some_and(|rest| rest.starts_with('.')))
+}
+
+/// Text a device shows must be plain: printable ASCII and spaces, no control
+/// or direction-changing characters that could make it read differently.
+fn plain(text: &str) -> bool {
+    !text.is_empty() && text.len() <= 512 && text.bytes().all(|b| b == b' ' || b.is_ascii_graphic())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DeviceKind {
-    /// The Secure Enclave key `harar agent` uses.
+    /// A Secure Enclave key on a Mac, made for approving, that asks first.
+    /// Never the key `harar agent` unlocks with.
     Mac,
     /// A WebAuthn passkey, on any phone or laptop.
     Passkey,
@@ -42,12 +65,36 @@ pub struct ApproverDevice {
     pub kind: DeviceKind,
     /// P-256.
     pub public_key: Jwk,
-    /// For passkeys: the relying party the credential belongs to, e.g. `id.simien.dev`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rp_id: Option<String>,
     pub enrolled_at: u64,
+    /// Enrollment proved (by platform attestation, or the passkey's UV flag)
+    /// that this key signs only after biometrics or a PIN. Devices without
+    /// it never approve.
+    pub user_verification: bool,
+    /// A synced passkey (WebAuthn backup-eligible): it lives in a cloud
+    /// account, not only in hardware the human carries. Never enough for the
+    /// highest classes.
+    #[serde(default)]
+    pub backup_eligible: bool,
+    /// The passkey's signature counter last seen. Each use must raise it, so
+    /// a cloned authenticator is caught (synced passkeys always send 0).
+    #[serde(default)]
+    pub sign_count: u32,
     #[serde(default)]
     pub revoked: bool,
+}
+
+impl ApproverDevice {
+    /// The key itself, so one key enrolled twice counts once.
+    fn key_bytes(&self) -> String {
+        format!("{}|{}", self.public_key.x, self.public_key.y.as_deref().unwrap_or_default())
+    }
+}
+
+/// The site passkeys belong to: set by the primary's own config, never taken
+/// from a device record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelyingParty {
+    pub rp_id: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,22 +104,28 @@ pub enum Decision {
     Deny,
 }
 
-/// Something waiting for a person. Everything a device shows is in here,
-/// and all of it is signed.
+/// Something waiting for a person. The primary fills every field from what
+/// it authenticated; none comes from the requester's own say-so.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalRequest {
+    /// Random, at least 128 bits, made by the primary.
     pub id: String,
+    /// Which primary is asking (its issuer URL), so an approval for one never
+    /// counts on another, staging and production included.
+    pub primary: String,
     pub org: Org,
     pub class: String,
     /// Who is asking.
     pub actor: Name,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub act_for: Option<Name>,
+    /// Everything that started the actor, nearest first: the session or
+    /// orchestrator that launched it, and so on up.
+    #[serde(default)]
+    pub chain: Vec<Name>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zone: Option<Name>,
     pub action: Action,
-    /// What the device shows, e.g. "Deploy addiscorp/site 4e1a9c0 to production".
-    pub summary: String,
     pub created_at: u64,
     pub expires_at: u64,
 }
@@ -82,26 +135,70 @@ fn field(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
+fn optional(out: &mut Vec<u8>, name: &Option<Name>) {
+    match name {
+        None => out.push(0),
+        Some(name) => {
+            out.push(1);
+            field(out, name.to_string().as_bytes());
+        }
+    }
+}
+
+fn list(out: &mut Vec<u8>, items: &[String]) {
+    out.extend_from_slice(&(items.len() as u64).to_be_bytes());
+    for item in items {
+        field(out, item.as_bytes());
+    }
+}
+
+/// One byte for the kind of action, then its fields.
+fn encode_action(out: &mut Vec<u8>, action: &Action) {
+    match action {
+        Action::Read { path } => {
+            out.push(1);
+            field(out, path.as_bytes());
+        }
+        Action::Write { path } => {
+            out.push(2);
+            field(out, path.as_bytes());
+        }
+        Action::Token { audience, scopes } => {
+            out.push(3);
+            field(out, audience.as_bytes());
+            list(out, scopes);
+        }
+        Action::Launch { profile } => {
+            out.push(4);
+            field(out, profile.to_string().as_bytes());
+        }
+        Action::Approve { class } => {
+            out.push(5);
+            field(out, class.as_bytes());
+        }
+    }
+}
+
 impl ApprovalRequest {
-    /// The 32 bytes a device signs: every field of the request and the
-    /// decision, so an approval can't be turned into another request's, or a
-    /// deny into an approve.
+    /// The bytes a device signs (and its signer hashes once more, as
+    /// `ecdsaSignatureMessageX962SHA256` / `SHA256withECDSA` / WebAuthn do):
+    /// SHA-256 over a fixed encoding of every field and the decision.
+    ///
+    /// `context || id || primary || org || class || actor || act_for? ||
+    /// chain[] || zone? || action || created_at || expires_at || decision`,
+    /// strings as u64 big-endian length then bytes, optionals as 0 or 1 then
+    /// the string, lists as a u64 count then each string, the action as one
+    /// tag byte (1 read, 2 write, 3 token, 4 launch, 5 approve) then its
+    /// fields, times as u64 big-endian, decision as 1 approve, 0 deny.
     pub fn challenge(&self, decision: Decision) -> [u8; 32] {
         let mut out = CHALLENGE_CONTEXT.to_vec();
-        let action = serde_json::to_vec(&self.action).expect("actions serialize");
-        let optional = |name: &Option<Name>| name.as_ref().map(|name| name.to_string()).unwrap_or_default();
-        for part in [
-            self.id.as_bytes(),
-            self.org.as_str().as_bytes(),
-            self.class.as_bytes(),
-            self.actor.to_string().as_bytes(),
-            optional(&self.act_for).as_bytes(),
-            optional(&self.zone).as_bytes(),
-            &action,
-            self.summary.as_bytes(),
-        ] {
-            field(&mut out, part);
+        for part in [self.id.as_str(), self.primary.as_str(), self.org.as_str(), self.class.as_str(), &self.actor.to_string()] {
+            field(&mut out, part.as_bytes());
         }
+        optional(&mut out, &self.act_for);
+        list(&mut out, &self.chain.iter().map(Name::to_string).collect::<Vec<_>>());
+        optional(&mut out, &self.zone);
+        encode_action(&mut out, &self.action);
         out.extend_from_slice(&self.created_at.to_be_bytes());
         out.extend_from_slice(&self.expires_at.to_be_bytes());
         out.push(match decision {
@@ -110,13 +207,60 @@ impl ApprovalRequest {
         });
         Sha256::digest(&out).into()
     }
+
+    /// What a device shows, computed only from signed fields.
+    pub fn describe(&self) -> String {
+        let what = match &self.action {
+            Action::Read { path } => format!("read the secret {path}"),
+            Action::Write { path } => format!("change the secret {path}"),
+            Action::Token { audience, scopes } => format!("get a token for {audience} with {}", if scopes.is_empty() { "no scopes".into() } else { scopes.join(", ") }),
+            Action::Launch { profile } => format!("start a {profile} zone"),
+            Action::Approve { class } => format!("approve {class} requests"),
+        };
+        let mut text = format!("{} wants to {what}", self.actor);
+        if let Some(act_for) = &self.act_for {
+            text.push_str(&format!(", for {act_for}"));
+        }
+        if let Some(zone) = &self.zone {
+            text.push_str(&format!(", from {zone}"));
+        }
+        text.push_str(&format!(" ({}, {})", self.class, self.org));
+        text
+    }
+
+    /// The request itself is well formed and still open.
+    fn check(&self, now: u64) -> Result<(), ApprovalError> {
+        if !valid_class(&self.class) || !plain(&self.id) || !plain(&self.primary) || self.id.len() < 22 {
+            return Err(ApprovalError::BadRequest);
+        }
+        let texts: Vec<&str> = match &self.action {
+            Action::Read { path } | Action::Write { path } => vec![path],
+            Action::Token { audience, scopes } => std::iter::once(audience.as_str()).chain(scopes.iter().map(String::as_str)).collect(),
+            Action::Approve { class } => vec![class],
+            Action::Launch { .. } => vec![],
+        };
+        if !texts.iter().all(|text| plain(text)) {
+            return Err(ApprovalError::BadRequest);
+        }
+        let mut names = std::iter::once(&self.actor).chain(&self.act_for).chain(&self.chain).chain(&self.zone);
+        if names.any(|name| name.org() != &self.org) {
+            return Err(ApprovalError::BadRequest);
+        }
+        if self.created_at > now + CLOCK_SKEW_SECONDS || self.expires_at <= self.created_at || self.expires_at - self.created_at > MAX_REQUEST_SECONDS {
+            return Err(ApprovalError::BadRequest);
+        }
+        if now >= self.expires_at {
+            return Err(ApprovalError::Expired);
+        }
+        Ok(())
+    }
 }
 
 /// How a device proved it signed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Proof {
-    /// Mac and phone: ECDSA P-256 over the challenge, DER, base64url.
+    /// Mac and phone: ECDSA P-256 (SHA-256) over the challenge, DER, base64url.
     Signature { signature: String },
     /// A passkey's WebAuthn assertion, each part base64url.
     WebAuthn { authenticator_data: String, client_data_json: String, signature: String },
@@ -130,16 +274,27 @@ pub struct Approval {
     pub proof: Proof,
 }
 
-/// Who may approve a class, and how many of their devices it takes.
+/// Who may approve a class, and how many of their device keys it takes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalRule {
-    /// A class, or a prefix ending in `*`.
+    /// A class, or a class prefix followed by `.*` (`deploy.*`).
     pub class: String,
     /// Humans who may approve.
     pub approvers: NamePattern,
-    /// How many of one approver's devices must agree (at least 1; the highest
-    /// classes always need 2).
+    /// How many of one approver's distinct device keys must agree (at least
+    /// 1; the highest classes always need 2).
     pub devices: u8,
+}
+
+impl ApprovalRule {
+    /// How closely the rule fits `class`: None if not at all; an exact class
+    /// beats any prefix, and a longer prefix beats a shorter one.
+    fn fit(&self, class: &str) -> Option<usize> {
+        match self.class.strip_suffix(".*") {
+            Some(prefix) => class.strip_prefix(prefix).filter(|rest| rest.starts_with('.')).map(|_| prefix.len()),
+            None => (self.class == class).then_some(usize::MAX),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,37 +304,49 @@ pub enum Outcome {
     Pending { have: usize, need: usize },
 }
 
+/// Where a request stands, which submissions didn't count and why, and the
+/// passkey counters to store for the ones that did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Decided {
+    pub outcome: Outcome,
+    pub rejected: Vec<(usize, ApprovalError)>,
+    pub sign_counts: BTreeMap<String, u32>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApprovalError {
+    BadRequest,
     Expired,
     NoRule,
+    AmbiguousRules,
     WrongRequest,
     UnknownDevice,
     DeviceRevoked,
+    DeviceTooNew,
+    DeviceUnverified,
     NotAnApprover,
     OwnRequest,
+    SyncedPasskey,
     BadProof,
 }
 
 impl ApprovalError {
     pub fn as_str(self) -> &'static str {
         match self {
+            ApprovalError::BadRequest => "bad_request",
             ApprovalError::Expired => "expired",
             ApprovalError::NoRule => "no_rule_for_class",
+            ApprovalError::AmbiguousRules => "ambiguous_rules",
             ApprovalError::WrongRequest => "wrong_request",
             ApprovalError::UnknownDevice => "unknown_device",
             ApprovalError::DeviceRevoked => "device_revoked",
+            ApprovalError::DeviceTooNew => "device_enrolled_after_request",
+            ApprovalError::DeviceUnverified => "device_not_user_verified",
             ApprovalError::NotAnApprover => "not_an_approver",
             ApprovalError::OwnRequest => "own_request",
+            ApprovalError::SyncedPasskey => "synced_passkey",
             ApprovalError::BadProof => "bad_proof",
         }
-    }
-}
-
-fn class_matches(pattern: &str, class: &str) -> bool {
-    match pattern.strip_suffix('*') {
-        Some(prefix) => class.starts_with(prefix),
-        None => pattern == class,
     }
 }
 
@@ -188,55 +355,79 @@ fn decode(value: &str) -> Result<Vec<u8>, ApprovalError> {
 }
 
 fn verifying_key(device: &ApproverDevice) -> Result<VerifyingKey, ApprovalError> {
+    if device.public_key.kty != "EC" || device.public_key.crv != "P-256" {
+        return Err(ApprovalError::BadProof);
+    }
     crate::oidc::es256_verifying_key(&device.public_key).map_err(|_| ApprovalError::BadProof)
 }
 
-/// Checks a WebAuthn assertion: the client data is a `webauthn.get` for this
-/// challenge from the relying party's own origin; the authenticator data is
-/// for that relying party, with the user present and verified; and the
-/// signature covers both.
+/// Checks a WebAuthn assertion (W3C WebAuthn, §7.2): a `webauthn.get` for
+/// this challenge from the relying party's own origin, not from inside
+/// another site's frame; authenticator data for that relying party with the
+/// user present and verified; a signature counter that moved on; and a
+/// signature over both. Returns the new counter.
 fn verify_webauthn(
     key: &VerifyingKey,
-    rp_id: &str,
+    device: &ApproverDevice,
+    rp: &RelyingParty,
     challenge: &[u8; 32],
-    authenticator_data: &[u8],
-    client_data_json: &[u8],
-    signature: &[u8],
-) -> Result<(), ApprovalError> {
+    highest: bool,
+    proof: (&[u8], &[u8], &[u8]),
+) -> Result<u32, ApprovalError> {
+    let (authenticator_data, client_data_json, signature) = proof;
     #[derive(Deserialize)]
     struct ClientData {
         #[serde(rename = "type")]
         kind: String,
         challenge: String,
         origin: String,
+        #[serde(rename = "crossOrigin", default)]
+        cross_origin: bool,
+        #[serde(rename = "topOrigin", default)]
+        top_origin: Option<String>,
     }
     let client: ClientData = serde_json::from_slice(client_data_json).map_err(|_| ApprovalError::BadProof)?;
-    if client.kind != "webauthn.get" || client.challenge != B64URL.encode(challenge) || client.origin != format!("https://{rp_id}") {
+    if client.kind != "webauthn.get"
+        || client.challenge != B64URL.encode(challenge)
+        || client.origin != format!("https://{}", rp.rp_id)
+        || client.cross_origin
+        || client.top_origin.is_some()
+    {
         return Err(ApprovalError::BadProof);
     }
     // rpIdHash (32) | flags (1) | signCount (4) | …
-    if authenticator_data.len() < 37 || authenticator_data[..32] != Sha256::digest(rp_id.as_bytes())[..] {
+    if authenticator_data.len() < 37 || authenticator_data[..32] != Sha256::digest(rp.rp_id.as_bytes())[..] {
         return Err(ApprovalError::BadProof);
     }
     let flags = authenticator_data[32];
     const USER_PRESENT: u8 = 0x01;
     const USER_VERIFIED: u8 = 0x04;
+    const BACKUP_ELIGIBLE: u8 = 0x08;
     if flags & USER_PRESENT == 0 || flags & USER_VERIFIED == 0 {
         return Err(ApprovalError::BadProof);
     }
     let mut signed = authenticator_data.to_vec();
     signed.extend_from_slice(&Sha256::digest(client_data_json));
     let signature = Signature::from_der(signature).map_err(|_| ApprovalError::BadProof)?;
-    key.verify(&signed, &signature).map_err(|_| ApprovalError::BadProof)
+    key.verify(&signed, &signature).map_err(|_| ApprovalError::BadProof)?;
+    if highest && (device.backup_eligible || flags & BACKUP_ELIGIBLE != 0) {
+        return Err(ApprovalError::SyncedPasskey);
+    }
+    let count = u32::from_be_bytes(authenticator_data[33..37].try_into().expect("four bytes"));
+    if (count != 0 || device.sign_count != 0) && count <= device.sign_count {
+        return Err(ApprovalError::BadProof);
+    }
+    Ok(count)
 }
 
-/// Checks one approval: its device, its proof over this request and decision.
-/// Returns the human it approves as.
+/// Checks one approval against its device and this request. Returns the
+/// device, and the passkey counter to store if it was a passkey.
 pub fn verify_approval<'a>(
     request: &ApprovalRequest,
     approval: &Approval,
     devices: &'a [ApproverDevice],
-) -> Result<&'a ApproverDevice, ApprovalError> {
+    rp: &RelyingParty,
+) -> Result<(&'a ApproverDevice, Option<u32>), ApprovalError> {
     if approval.request_id != request.id {
         return Err(ApprovalError::WrongRequest);
     }
@@ -247,71 +438,113 @@ pub fn verify_approval<'a>(
     if device.human.kind() != Kind::Human || device.human.org() != &request.org {
         return Err(ApprovalError::NotAnApprover);
     }
+    if device.enrolled_at >= request.created_at {
+        return Err(ApprovalError::DeviceTooNew);
+    }
+    if !device.user_verification {
+        return Err(ApprovalError::DeviceUnverified);
+    }
     let key = verifying_key(device)?;
     let challenge = request.challenge(approval.decision);
-    match (&approval.proof, device.kind) {
+    let count = match (&approval.proof, device.kind) {
         (Proof::Signature { signature }, DeviceKind::Mac | DeviceKind::Phone) => {
             let signature = Signature::from_der(&decode(signature)?).map_err(|_| ApprovalError::BadProof)?;
             key.verify(&challenge, &signature).map_err(|_| ApprovalError::BadProof)?;
+            None
         }
         (Proof::WebAuthn { authenticator_data, client_data_json, signature }, DeviceKind::Passkey) => {
-            let rp_id = device.rp_id.as_deref().ok_or(ApprovalError::BadProof)?;
-            verify_webauthn(&key, rp_id, &challenge, &decode(authenticator_data)?, &decode(client_data_json)?, &decode(signature)?)?;
+            let parts = (decode(authenticator_data)?, decode(client_data_json)?, decode(signature)?);
+            Some(verify_webauthn(&key, device, rp, &challenge, is_highest(&request.class), (&parts.0, &parts.1, &parts.2))?)
         }
         _ => return Err(ApprovalError::BadProof),
-    }
-    Ok(device)
+    };
+    Ok((device, count))
 }
 
-/// Where a request stands, given every approval received for it. A valid
-/// deny from any allowed approver ends it. Otherwise it is approved once one
-/// approver's devices reach the rule's count (two, for the highest classes).
-/// Nobody approves a request they made.
+/// The rule that governs `class`: the closest fit, whatever the list order.
+pub fn rule_for<'a>(rules: &'a [ApprovalRule], class: &str) -> Result<&'a ApprovalRule, ApprovalError> {
+    let mut fits: Vec<(usize, &ApprovalRule)> = rules.iter().filter_map(|rule| rule.fit(class).map(|fit| (fit, rule))).collect();
+    fits.sort_by_key(|(fit, _)| std::cmp::Reverse(*fit));
+    match fits.as_slice() {
+        [] => Err(ApprovalError::NoRule),
+        [(best, _), (next, _), ..] if best == next => Err(ApprovalError::AmbiguousRules),
+        [(_, rule), ..] => Ok(rule),
+    }
+}
+
+/// Where a request stands, given everything submitted for it. Submissions
+/// that don't verify, or come from someone the rule doesn't name, are set
+/// aside (`rejected`) and change nothing, so nobody can block a request by
+/// sending junk. A valid deny from an allowed approver ends it. Otherwise it
+/// is approved once one approver's distinct device keys reach the rule's
+/// count (two for the highest classes). Nobody approves a request they made.
+///
+/// The caller stores `sign_counts`, and latches Approved and Denied: once a
+/// request is acted on, it is never acted on again.
 pub fn decide(
     request: &ApprovalRequest,
     approvals: &[Approval],
     devices: &[ApproverDevice],
     rules: &[ApprovalRule],
+    rp: &RelyingParty,
     now: u64,
-) -> Result<Outcome, ApprovalError> {
-    if now >= request.expires_at {
-        return Err(ApprovalError::Expired);
-    }
-    let rule = rules.iter().find(|rule| class_matches(&rule.class, &request.class)).ok_or(ApprovalError::NoRule)?;
+) -> Result<Decided, ApprovalError> {
+    request.check(now)?;
+    let rule = rule_for(rules, &request.class)?;
     let need = usize::from(rule.devices.max(1)).max(if is_highest(&request.class) { 2 } else { 1 });
-    let mut approving: Vec<(&Name, BTreeSet<&str>)> = Vec::new();
-    for approval in approvals {
-        let device = verify_approval(request, approval, devices)?;
+    let mut rejected = Vec::new();
+    let mut sign_counts = BTreeMap::new();
+    let mut denied = false;
+    let mut keys: BTreeMap<&Name, BTreeSet<String>> = BTreeMap::new();
+    for (index, approval) in approvals.iter().enumerate() {
+        let (device, count) = match verify_approval(request, approval, devices, rp) {
+            Ok(verified) => verified,
+            Err(err) => {
+                rejected.push((index, err));
+                continue;
+            }
+        };
         if !rule.approvers.matches(&device.human) {
-            return Err(ApprovalError::NotAnApprover);
+            rejected.push((index, ApprovalError::NotAnApprover));
+            continue;
         }
         if device.human == request.actor {
-            return Err(ApprovalError::OwnRequest);
+            rejected.push((index, ApprovalError::OwnRequest));
+            continue;
+        }
+        if let Some(count) = count {
+            sign_counts.insert(device.id.clone(), count);
         }
         match approval.decision {
-            Decision::Deny => return Ok(Outcome::Denied),
-            Decision::Approve => match approving.iter_mut().find(|(human, _)| *human == &device.human) {
-                Some((_, ids)) => {
-                    ids.insert(device.id.as_str());
-                }
-                None => approving.push((&device.human, BTreeSet::from([device.id.as_str()]))),
-            },
+            Decision::Deny => denied = true,
+            Decision::Approve => {
+                keys.entry(&device.human).or_default().insert(device.key_bytes());
+            }
         }
     }
-    let have = approving.iter().map(|(_, ids)| ids.len()).max().unwrap_or(0);
-    Ok(if have >= need { Outcome::Approved } else { Outcome::Pending { have, need } })
+    let have = keys.values().map(BTreeSet::len).max().unwrap_or(0);
+    let outcome = if denied {
+        Outcome::Denied
+    } else if have >= need {
+        Outcome::Approved
+    } else {
+        Outcome::Pending { have, need }
+    };
+    Ok(Decided { outcome, rejected, sign_counts })
 }
 
 /// Whether a machine or agent, approving through its role rather than a
-/// device, may approve this request: the class is never one of the highest,
-/// the approver is an agent or service (humans approve with a device; app
-/// users never), and it is not the one asking nor the one the asker acts for.
+/// device, may approve this request: never the highest classes; only an agent
+/// or service of the same org (humans approve with a device; app users never);
+/// and never the asker, whom it acts for, or anything that started it.
 /// Whether its role allows `approve <class>` is `Policy::decide`'s call.
 pub fn delegation_allowed(request: &ApprovalRequest, approver: &Name) -> bool {
     !is_highest(&request.class)
         && matches!(approver.kind(), Kind::Agent | Kind::Service)
+        && approver.org() == &request.org
         && approver != &request.actor
         && request.act_for.as_ref() != Some(approver)
+        && !request.chain.contains(approver)
 }
 
 #[cfg(test)]
@@ -326,16 +559,21 @@ mod tests {
         text.parse().unwrap()
     }
 
+    fn rp() -> RelyingParty {
+        RelyingParty { rp_id: "account.addis.gg".into() }
+    }
+
     fn request(class: &str) -> ApprovalRequest {
         ApprovalRequest {
-            id: "ap_01jbx7".into(),
+            id: "ap_01jbx7q4m2k9z8w3v5t6".into(),
+            primary: "https://account.addis.gg".into(),
             org: "gg.addis".parse().unwrap(),
             class: class.into(),
             actor: name("gg.addis.agent.ava"),
             act_for: Some(name("gg.addis.human.sami")),
+            chain: vec![name("gg.addis.agent.orchestrator")],
             zone: Some(name("gg.addis.zone.vm-01jbx4k2m9q8r7s6")),
             action: Action::Token { audience: "https://api.simien.dev".into(), scopes: vec!["deploy:site".into()] },
-            summary: "Deploy addiscorp/site 4e1a9c0 to production".into(),
             created_at: NOW - 10,
             expires_at: NOW + 600,
         }
@@ -347,10 +585,22 @@ mod tests {
     }
 
     fn device(id: &str, human: &str, kind: DeviceKind) -> Device {
-        let key = SigningKey::random(&mut rand_core::OsRng);
-        let public_key = crate::oidc::es256_jwk(key.verifying_key());
-        let rp_id = (kind == DeviceKind::Passkey).then(|| "id.simien.dev".to_string());
-        Device { device: ApproverDevice { id: id.into(), human: name(human), kind, public_key, rp_id, enrolled_at: NOW - 100, revoked: false }, key }
+        with_key(id, human, kind, SigningKey::random(&mut rand_core::OsRng))
+    }
+
+    fn with_key(id: &str, human: &str, kind: DeviceKind, key: SigningKey) -> Device {
+        let device = ApproverDevice {
+            id: id.into(),
+            human: name(human),
+            kind,
+            public_key: crate::oidc::es256_jwk(key.verifying_key()),
+            enrolled_at: NOW - 100,
+            user_verification: true,
+            backup_eligible: false,
+            sign_count: 0,
+            revoked: false,
+        };
+        Device { key, device }
     }
 
     fn signed(device: &Device, request: &ApprovalRequest, decision: Decision) -> Approval {
@@ -363,18 +613,37 @@ mod tests {
         }
     }
 
-    /// What a browser hands back from navigator.credentials.get().
-    fn passkey(device: &Device, request: &ApprovalRequest, decision: Decision, origin: &str, flags: u8) -> Approval {
-        let rp_id = device.device.rp_id.clone().unwrap();
-        let mut authenticator_data = Sha256::digest(rp_id.as_bytes()).to_vec();
-        authenticator_data.push(flags);
-        authenticator_data.extend_from_slice(&7_u32.to_be_bytes());
-        let client_data_json = serde_json::json!({
-            "type": "webauthn.get",
-            "challenge": B64URL.encode(request.challenge(decision)),
-            "origin": origin,
-        })
-        .to_string();
+    /// What a browser hands back from navigator.credentials.get(), with knobs
+    /// for everything the check must refuse.
+    struct Assertion<'a> {
+        kind: &'a str,
+        challenge: Option<[u8; 32]>,
+        origin: &'a str,
+        rp_id: &'a str,
+        flags: u8,
+        count: u32,
+        extra: serde_json::Value,
+    }
+
+    impl Default for Assertion<'_> {
+        fn default() -> Self {
+            Assertion { kind: "webauthn.get", challenge: None, origin: "https://account.addis.gg", rp_id: "account.addis.gg", flags: 0x05, count: 7, extra: serde_json::json!({}) }
+        }
+    }
+
+    fn passkey(device: &Device, request: &ApprovalRequest, decision: Decision, a: Assertion<'_>) -> Approval {
+        let mut authenticator_data = Sha256::digest(a.rp_id.as_bytes()).to_vec();
+        authenticator_data.push(a.flags);
+        authenticator_data.extend_from_slice(&a.count.to_be_bytes());
+        let mut client = serde_json::json!({
+            "type": a.kind,
+            "challenge": B64URL.encode(a.challenge.unwrap_or(request.challenge(decision))),
+            "origin": a.origin,
+        });
+        for (key, value) in a.extra.as_object().unwrap() {
+            client[key] = value.clone();
+        }
+        let client_data_json = client.to_string();
         let mut message = authenticator_data.clone();
         message.extend_from_slice(&Sha256::digest(client_data_json.as_bytes()));
         let signature: Signature = device.key.sign(&message);
@@ -394,7 +663,16 @@ mod tests {
         vec![
             ApprovalRule { class: "deploy.*".into(), approvers: "gg.addis.human.*".parse().unwrap(), devices: 1 },
             ApprovalRule { class: "policy.*".into(), approvers: "gg.addis.human.sami".parse().unwrap(), devices: 1 },
+            ApprovalRule { class: "device.*".into(), approvers: "gg.addis.human.sami".parse().unwrap(), devices: 1 },
         ]
+    }
+
+    fn outcome(ask: &ApprovalRequest, approvals: &[Approval], devices: &[ApproverDevice]) -> Result<Outcome, ApprovalError> {
+        decide(ask, approvals, devices, &rules(), &rp(), NOW).map(|decided| decided.outcome)
+    }
+
+    fn rejected(ask: &ApprovalRequest, approvals: &[Approval], devices: &[ApproverDevice]) -> Vec<ApprovalError> {
+        decide(ask, approvals, devices, &rules(), &rp(), NOW).unwrap().rejected.into_iter().map(|(_, err)| err).collect()
     }
 
     #[test]
@@ -402,10 +680,22 @@ mod tests {
         let phone = device("phone-1", "gg.addis.human.sami", DeviceKind::Phone);
         let ask = request("deploy.production");
         let devices = [phone.device.clone()];
-        assert_eq!(decide(&ask, &[], &devices, &rules(), NOW), Ok(Outcome::Pending { have: 0, need: 1 }));
-        assert_eq!(decide(&ask, &[signed(&phone, &ask, Decision::Approve)], &devices, &rules(), NOW), Ok(Outcome::Approved));
-        assert_eq!(decide(&ask, &[signed(&phone, &ask, Decision::Deny)], &devices, &rules(), NOW), Ok(Outcome::Denied));
+        assert_eq!(outcome(&ask, &[], &devices), Ok(Outcome::Pending { have: 0, need: 1 }));
+        assert_eq!(outcome(&ask, &[signed(&phone, &ask, Decision::Approve)], &devices), Ok(Outcome::Approved));
+        assert_eq!(outcome(&ask, &[signed(&phone, &ask, Decision::Deny)], &devices), Ok(Outcome::Denied));
     }
+
+    #[test]
+    fn the_signed_bytes_are_pinned_so_other_implementations_can_match_them() {
+        // If this changes, every phone and passkey page must change with it:
+        // bump the context string instead of editing the encoding in place.
+        let hex: String = request("deploy.production").challenge(Decision::Approve).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, KNOWN_ANSWER);
+    }
+
+    /// Computed by a separate Python script from the encoding written in
+    /// `challenge`'s doc, not by this code, so the two had to agree.
+    const KNOWN_ANSWER: &str = "db500ef839f9cc22fecda5aa05ed3e58709084aa5f2297775a85c96e45e32500";
 
     #[test]
     fn a_signature_fits_only_its_own_request_and_decision() {
@@ -413,84 +703,224 @@ mod tests {
         let devices = [phone.device.clone()];
         let ask = request("deploy.production");
 
-        // A deny's signature relabelled as an approve.
         let mut flipped = signed(&phone, &ask, Decision::Deny);
         flipped.decision = Decision::Approve;
-        assert_eq!(decide(&ask, &[flipped], &devices, &rules(), NOW), Err(ApprovalError::BadProof));
+        assert_eq!(rejected(&ask, &[flipped], &devices), [ApprovalError::BadProof], "a deny relabelled as an approve");
 
-        // An approval for one request presented for a request that differs in any field.
         let approval = signed(&phone, &ask, Decision::Approve);
-        let mut others = Vec::new();
-        for change in 0..6 {
+        type Change = Box<dyn Fn(&mut ApprovalRequest)>;
+        let changes: Vec<(&str, Change)> = vec![
+            ("primary", Box::new(|r| r.primary = "https://staging.addis.gg".into())),
+            ("class", Box::new(|r| r.class = "deploy.staging".into())),
+            ("actor", Box::new(|r| r.actor = name("gg.addis.agent.eve"))),
+            ("act_for", Box::new(|r| r.act_for = None)),
+            ("chain", Box::new(|r| r.chain.clear())),
+            ("zone", Box::new(|r| r.zone = None)),
+            ("action", Box::new(|r| r.action = Action::Token { audience: "https://api.simien.dev".into(), scopes: vec!["deploy:*".into()] })),
+            ("action kind", Box::new(|r| r.action = Action::Read { path: "https://api.simien.dev".into() })),
+            ("created_at", Box::new(|r| r.created_at -= 1)),
+            ("expires_at", Box::new(|r| r.expires_at += 1)),
+        ];
+        for (what, change) in changes {
             let mut other = ask.clone();
-            match change {
-                0 => other.summary = "Deploy addiscorp/site 4e1a9c0 to staging".into(),
-                1 => other.zone = None,
-                2 => other.actor = name("gg.addis.agent.eve"),
-                3 => other.action = Action::Token { audience: "https://api.simien.dev".into(), scopes: vec!["deploy:*".into()] },
-                4 => other.expires_at += 1,
-                _ => other.class = "deploy.staging".into(),
-            }
-            others.push(other);
+            change(&mut other);
+            assert_eq!(rejected(&other, std::slice::from_ref(&approval), &devices), [ApprovalError::BadProof], "{what}");
         }
-        for other in others {
-            assert_eq!(decide(&other, std::slice::from_ref(&approval), &devices, &rules(), NOW), Err(ApprovalError::BadProof), "{other:?}");
-        }
+        // The same request under another id: its challenge differs too.
         let mut renamed = ask.clone();
-        renamed.id = "ap_other".into();
-        assert_eq!(decide(&renamed, &[approval], &devices, &rules(), NOW), Err(ApprovalError::WrongRequest));
+        renamed.id = "ap_01jbx7q4m2k9z8w3v5t7".into();
+        let mut moved = approval.clone();
+        moved.request_id = renamed.id.clone();
+        assert_eq!(rejected(&renamed, &[moved], &devices), [ApprovalError::BadProof], "id");
+        // Another org's copy fails before any signature is checked.
+        let mut elsewhere = ask.clone();
+        elsewhere.org = "com.acme".parse().unwrap();
+        assert_eq!(outcome(&elsewhere, std::slice::from_ref(&approval), &devices), Err(ApprovalError::BadRequest), "org");
     }
 
     #[test]
-    fn passkeys_must_be_for_this_site_this_challenge_and_a_verified_user() {
-        let passkey_device = device("pk-1", "gg.addis.human.sami", DeviceKind::Passkey);
-        let devices = [passkey_device.device.clone()];
+    fn what_a_device_shows_comes_from_the_signed_fields() {
         let ask = request("deploy.production");
-        let ok = passkey(&passkey_device, &ask, Decision::Approve, "https://id.simien.dev", 0x05);
-        assert_eq!(decide(&ask, &[ok], &devices, &rules(), NOW), Ok(Outcome::Approved));
-        for (origin, flags, what) in [
-            ("https://evil.example", 0x05, "another origin"),
-            ("https://id.simien.dev", 0x01, "user not verified"),
-            ("https://id.simien.dev", 0x04, "user not present"),
-        ] {
-            let approval = passkey(&passkey_device, &ask, Decision::Approve, origin, flags);
-            assert_eq!(decide(&ask, &[approval], &devices, &rules(), NOW), Err(ApprovalError::BadProof), "{what}");
+        assert_eq!(
+            ask.describe(),
+            "gg.addis.agent.ava wants to get a token for https://api.simien.dev with deploy:site, for gg.addis.human.sami, from gg.addis.zone.vm-01jbx4k2m9q8r7s6 (deploy.production, gg.addis)"
+        );
+        // Text that could read differently from what it is never gets that far.
+        for path in ["prod/site/\u{202e}YEK", "prod/site/\nKEY", ""] {
+            let mut sneaky = ask.clone();
+            sneaky.action = Action::Read { path: path.into() };
+            assert_eq!(outcome(&sneaky, &[], &[]), Err(ApprovalError::BadRequest), "{path:?}");
         }
-        // A plain signature can't stand in for a passkey's assertion.
-        let raw = signed(&passkey_device, &ask, Decision::Approve);
-        assert_eq!(decide(&ask, &[raw], &devices, &rules(), NOW), Err(ApprovalError::BadProof));
     }
 
     #[test]
-    fn the_highest_classes_need_two_of_the_approvers_devices() {
+    fn passkeys_follow_webauthn_to_the_letter() {
+        let pk = device("pk-1", "gg.addis.human.sami", DeviceKind::Passkey);
+        let devices = [pk.device.clone()];
+        let ask = request("deploy.production");
+        let ok = passkey(&pk, &ask, Decision::Approve, Assertion::default());
+        let decided = decide(&ask, &[ok], &devices, &rules(), &rp(), NOW).unwrap();
+        assert_eq!(decided.outcome, Outcome::Approved);
+        assert_eq!(decided.sign_counts.get("pk-1"), Some(&7), "the counter to store");
+
+        let other = device("pk-other", "gg.addis.human.sami", DeviceKind::Passkey);
+        let cases: Vec<(&str, Approval)> = vec![
+            ("another origin", passkey(&pk, &ask, Decision::Approve, Assertion { origin: "https://evil.example", ..Assertion::default() })),
+            ("another relying party", passkey(&pk, &ask, Decision::Approve, Assertion { rp_id: "evil.example", ..Assertion::default() })),
+            ("not a get", passkey(&pk, &ask, Decision::Approve, Assertion { kind: "webauthn.create", ..Assertion::default() })),
+            ("another challenge", passkey(&pk, &ask, Decision::Approve, Assertion { challenge: Some([0; 32]), ..Assertion::default() })),
+            ("user not verified", passkey(&pk, &ask, Decision::Approve, Assertion { flags: 0x01, ..Assertion::default() })),
+            ("user not present", passkey(&pk, &ask, Decision::Approve, Assertion { flags: 0x04, ..Assertion::default() })),
+            ("inside another site's frame", passkey(&pk, &ask, Decision::Approve, Assertion { extra: serde_json::json!({"crossOrigin": true}), ..Assertion::default() })),
+            ("with a top origin", passkey(&pk, &ask, Decision::Approve, Assertion { extra: serde_json::json!({"topOrigin": "https://evil.example"}), ..Assertion::default() })),
+            ("signed by another key", {
+                let mut approval = passkey(&other, &ask, Decision::Approve, Assertion::default());
+                approval.device_id = "pk-1".into();
+                approval
+            }),
+            ("a deny relabelled", {
+                let mut approval = passkey(&pk, &ask, Decision::Deny, Assertion::default());
+                approval.decision = Decision::Approve;
+                approval
+            }),
+            ("a raw signature in a passkey's place", signed(&pk, &ask, Decision::Approve)),
+        ];
+        for (what, approval) in cases {
+            assert_eq!(rejected(&ask, &[approval], &devices), [ApprovalError::BadProof], "{what}");
+        }
+
+        // The relying party comes from the primary, not the device record.
+        let elsewhere = RelyingParty { rp_id: "evil.example".into() };
+        let forged = passkey(&pk, &ask, Decision::Approve, Assertion { origin: "https://evil.example", rp_id: "evil.example", ..Assertion::default() });
+        assert_eq!(decide(&ask, std::slice::from_ref(&forged), &devices, &rules(), &rp(), NOW).unwrap().outcome, Outcome::Pending { have: 0, need: 1 });
+        assert_eq!(decide(&ask, &[forged], &devices, &rules(), &elsewhere, NOW).unwrap().outcome, Outcome::Approved, "only when the primary itself is that site");
+    }
+
+    #[test]
+    fn a_cloned_passkey_is_caught_by_its_counter() {
+        let mut pk = device("pk-1", "gg.addis.human.sami", DeviceKind::Passkey);
+        pk.device.sign_count = 7;
+        let devices = [pk.device.clone()];
+        let ask = request("deploy.production");
+        let replayed = passkey(&pk, &ask, Decision::Approve, Assertion { count: 7, ..Assertion::default() });
+        assert_eq!(rejected(&ask, &[replayed], &devices), [ApprovalError::BadProof], "a counter that didn't move");
+        let ahead = passkey(&pk, &ask, Decision::Approve, Assertion { count: 8, ..Assertion::default() });
+        assert_eq!(outcome(&ask, &[ahead], &devices), Ok(Outcome::Approved));
+        // Synced passkeys always say 0, and that's allowed when we've only seen 0.
+        let synced = device("pk-2", "gg.addis.human.sami", DeviceKind::Passkey);
+        let zero = passkey(&synced, &ask, Decision::Approve, Assertion { count: 0, ..Assertion::default() });
+        assert_eq!(outcome(&ask, &[zero], std::slice::from_ref(&synced.device)), Ok(Outcome::Approved));
+    }
+
+    #[test]
+    fn the_highest_classes_need_two_distinct_keys_never_synced() {
         let phone = device("phone-1", "gg.addis.human.sami", DeviceKind::Phone);
         let mac = device("mac-1", "gg.addis.human.sami", DeviceKind::Mac);
         let devices = [phone.device.clone(), mac.device.clone()];
+        for class in ["policy.widen", "policy.widen.network", "device.enroll"] {
+            let ask = request(class);
+            let once = signed(&phone, &ask, Decision::Approve);
+            assert_eq!(outcome(&ask, std::slice::from_ref(&once), &devices), Ok(Outcome::Pending { have: 1, need: 2 }), "{class}: the rule says 1; the floor is 2");
+            assert_eq!(outcome(&ask, &[once.clone(), once.clone()], &devices), Ok(Outcome::Pending { have: 1, need: 2 }), "{class}: one device twice");
+            assert_eq!(outcome(&ask, &[once, signed(&mac, &ask, Decision::Approve)], &devices), Ok(Outcome::Approved), "{class}");
+        }
+
+        // One key enrolled under two ids is still one key.
+        let twin = with_key("mac-2", "gg.addis.human.sami", DeviceKind::Mac, phone.key.clone());
         let ask = request("policy.widen");
-        let once = signed(&phone, &ask, Decision::Approve);
-        assert_eq!(decide(&ask, std::slice::from_ref(&once), &devices, &rules(), NOW), Ok(Outcome::Pending { have: 1, need: 2 }), "the rule says 1; the floor is 2");
-        assert_eq!(decide(&ask, &[once.clone(), once.clone()], &devices, &rules(), NOW), Ok(Outcome::Pending { have: 1, need: 2 }), "one device twice is still one");
-        assert_eq!(decide(&ask, &[once, signed(&mac, &ask, Decision::Approve)], &devices, &rules(), NOW), Ok(Outcome::Approved));
+        let both = [phone.device.clone(), twin.device.clone()];
+        assert_eq!(outcome(&ask, &[signed(&phone, &ask, Decision::Approve), signed(&twin, &ask, Decision::Approve)], &both), Ok(Outcome::Pending { have: 1, need: 2 }));
+
+        // A synced passkey can approve a deploy, never the highest classes.
+        let mut synced = device("pk-1", "gg.addis.human.sami", DeviceKind::Passkey);
+        synced.device.backup_eligible = true;
+        let deploy = request("deploy.production");
+        assert_eq!(outcome(&deploy, &[passkey(&synced, &deploy, Decision::Approve, Assertion::default())], std::slice::from_ref(&synced.device)), Ok(Outcome::Approved));
+        let widen = request("policy.widen");
+        assert_eq!(rejected(&widen, &[passkey(&synced, &widen, Decision::Approve, Assertion::default())], std::slice::from_ref(&synced.device)), [ApprovalError::SyncedPasskey]);
+        let flagged = device("pk-2", "gg.addis.human.sami", DeviceKind::Passkey);
+        let says_synced = passkey(&flagged, &widen, Decision::Approve, Assertion { flags: 0x0d, ..Assertion::default() });
+        assert_eq!(rejected(&widen, &[says_synced], std::slice::from_ref(&flagged.device)), [ApprovalError::SyncedPasskey], "the BE flag on the assertion counts too");
     }
 
     #[test]
-    fn devices_must_be_enrolled_live_and_belong_to_an_allowed_human() {
+    fn classes_are_checked_and_the_closest_rule_governs() {
+        assert_eq!(outcome(&request("Policy.widen"), &[], &[]), Err(ApprovalError::BadRequest));
+        assert_eq!(outcome(&request("policy.widen "), &[], &[]), Err(ApprovalError::BadRequest));
+        assert_eq!(outcome(&request("policy..widen"), &[], &[]), Err(ApprovalError::BadRequest));
+        assert_eq!(outcome(&request("unknown.class"), &[], &[]), Err(ApprovalError::NoRule));
+
+        let loose = ApprovalRule { class: "deploy.*".into(), approvers: "gg.addis.human.*".parse().unwrap(), devices: 1 };
+        let strict = ApprovalRule { class: "deploy.production".into(), approvers: "gg.addis.human.sami".parse().unwrap(), devices: 2 };
+        for order in [vec![loose.clone(), strict.clone()], vec![strict.clone(), loose.clone()]] {
+            assert_eq!(rule_for(&order, "deploy.production"), Ok(&strict), "exact beats a prefix, in any order");
+            assert_eq!(rule_for(&order, "deploy.staging"), Ok(&loose));
+        }
+        let deeper = ApprovalRule { class: "deploy.production.*".into(), ..loose.clone() };
+        assert_eq!(rule_for(&[loose.clone(), deeper.clone()], "deploy.production.eu"), Ok(&deeper), "a longer prefix beats a shorter one");
+        assert_eq!(rule_for(&[loose.clone(), loose.clone()], "deploy.x"), Err(ApprovalError::AmbiguousRules));
+        assert_eq!(rule_for(&[loose], "deployx"), Err(ApprovalError::NoRule), "deploy.* doesn't cover deployx");
+    }
+
+    #[test]
+    fn junk_submissions_change_nothing() {
         let phone = device("phone-1", "gg.addis.human.sami", DeviceKind::Phone);
-        let stranger = device("phone-2", "gg.addis.human.eve", DeviceKind::Phone);
+        let eve = device("phone-eve", "gg.addis.human.eve", DeviceKind::Phone);
+        let devices = [phone.device.clone(), eve.device.clone()];
         let ask = request("policy.narrow");
-        let mut revoked = phone.device.clone();
-        revoked.revoked = true;
-        assert_eq!(decide(&ask, &[signed(&phone, &ask, Decision::Approve)], &[], &rules(), NOW), Err(ApprovalError::UnknownDevice));
-        assert_eq!(decide(&ask, &[signed(&phone, &ask, Decision::Approve)], &[revoked], &rules(), NOW), Err(ApprovalError::DeviceRevoked));
-        // policy.* is sami's alone.
-        assert_eq!(decide(&ask, &[signed(&stranger, &ask, Decision::Approve)], std::slice::from_ref(&stranger.device), &rules(), NOW), Err(ApprovalError::NotAnApprover));
-        // A device whose key isn't the one enrolled.
+        let garbage = Approval { request_id: ask.id.clone(), device_id: "phone-1".into(), decision: Decision::Approve, proof: Proof::Signature { signature: "AAAA".into() } };
+        let real = signed(&phone, &ask, Decision::Approve);
+        let decided = decide(&ask, &[garbage.clone(), real], &devices, &rules(), &rp(), NOW).unwrap();
+        assert_eq!(decided.outcome, Outcome::Approved, "junk ahead of a real approval doesn't block it");
+        assert_eq!(decided.rejected, [(0, ApprovalError::BadProof)]);
+
+        // eve isn't an approver for policy.*: her deny is set aside, not a veto.
+        let eves_deny = signed(&eve, &ask, Decision::Deny);
+        assert_eq!(outcome(&ask, &[eves_deny], &devices), Ok(Outcome::Pending { have: 0, need: 1 }));
+        // And junk can't hide a real deny either.
+        assert_eq!(outcome(&ask, &[garbage, signed(&phone, &ask, Decision::Deny)], &devices), Ok(Outcome::Denied));
+    }
+
+    #[test]
+    fn devices_must_be_enrolled_before_the_request_live_verified_and_allowed() {
+        let phone = device("phone-1", "gg.addis.human.sami", DeviceKind::Phone);
+        let ask = request("policy.narrow");
+        let approval = signed(&phone, &ask, Decision::Approve);
+        let with = |change: &dyn Fn(&mut ApproverDevice)| {
+            let mut device = phone.device.clone();
+            change(&mut device);
+            rejected(&ask, std::slice::from_ref(&approval), &[device])
+        };
+        assert_eq!(rejected(&ask, std::slice::from_ref(&approval), &[]), [ApprovalError::UnknownDevice]);
+        assert_eq!(with(&|d| d.revoked = true), [ApprovalError::DeviceRevoked]);
+        assert_eq!(with(&|d| d.enrolled_at = ask.created_at), [ApprovalError::DeviceTooNew], "enrolled after the request was made");
+        assert_eq!(with(&|d| d.user_verification = false), [ApprovalError::DeviceUnverified], "a key that signs without asking");
+        assert_eq!(with(&|d| d.human = name("com.acme.human.sami")), [ApprovalError::NotAnApprover], "another org's human");
+        assert_eq!(with(&|d| d.public_key.crv = "P-384".into()), [ApprovalError::BadProof]);
         let impostor = device("phone-1", "gg.addis.human.sami", DeviceKind::Phone);
-        assert_eq!(decide(&ask, &[signed(&impostor, &ask, Decision::Approve)], std::slice::from_ref(&phone.device), &rules(), NOW), Err(ApprovalError::BadProof));
-        let mut late = ask.clone();
+        assert_eq!(rejected(&ask, &[signed(&impostor, &ask, Decision::Approve)], std::slice::from_ref(&phone.device)), [ApprovalError::BadProof], "a key that isn't the one enrolled");
+        let stranger = device("phone-2", "gg.addis.human.eve", DeviceKind::Phone);
+        assert_eq!(rejected(&ask, &[signed(&stranger, &ask, Decision::Approve)], std::slice::from_ref(&stranger.device)), [ApprovalError::NotAnApprover], "policy.* is sami's alone");
+    }
+
+    #[test]
+    fn requests_are_short_lived_and_well_formed() {
+        let mut late = request("deploy.production");
         late.expires_at = NOW;
-        assert_eq!(decide(&late, &[], std::slice::from_ref(&phone.device), &rules(), NOW), Err(ApprovalError::Expired));
-        assert_eq!(decide(&request("unknown.class"), &[], &[], &rules(), NOW), Err(ApprovalError::NoRule));
+        assert_eq!(outcome(&late, &[], &[]), Err(ApprovalError::Expired));
+        let mut long = request("deploy.production");
+        long.expires_at = long.created_at + MAX_REQUEST_SECONDS + 1;
+        assert_eq!(outcome(&long, &[], &[]), Err(ApprovalError::BadRequest), "a year-long window");
+        let mut future = request("deploy.production");
+        future.created_at = NOW + 3600;
+        future.expires_at = NOW + 3700;
+        assert_eq!(outcome(&future, &[], &[]), Err(ApprovalError::BadRequest), "made in the future");
+        let mut short_id = request("deploy.production");
+        short_id.id = "ap_1".into();
+        assert_eq!(outcome(&short_id, &[], &[]), Err(ApprovalError::BadRequest), "ids are long and random");
+        let mut foreign = request("deploy.production");
+        foreign.zone = Some(name("com.acme.zone.x"));
+        assert_eq!(outcome(&foreign, &[], &[]), Err(ApprovalError::BadRequest), "every name in the request is the org's");
     }
 
     #[test]
@@ -499,20 +929,23 @@ mod tests {
         let mut ask = request("deploy.production");
         ask.actor = name("gg.addis.human.sami");
         ask.act_for = None;
-        assert_eq!(decide(&ask, &[signed(&phone, &ask, Decision::Approve)], std::slice::from_ref(&phone.device), &rules(), NOW), Err(ApprovalError::OwnRequest));
+        assert_eq!(rejected(&ask, &[signed(&phone, &ask, Decision::Approve)], std::slice::from_ref(&phone.device)), [ApprovalError::OwnRequest]);
     }
 
     #[test]
-    fn delegated_approval_never_reaches_the_highest_classes_or_the_asker() {
-        let orchestrator = name("gg.addis.agent.orchestrator");
-        assert!(delegation_allowed(&request("deploy.staging"), &orchestrator));
-        assert!(!delegation_allowed(&request("policy.widen"), &orchestrator));
-        assert!(!delegation_allowed(&request("device.enroll"), &orchestrator));
+    fn delegated_approval_never_reaches_the_highest_classes_or_the_askers_line() {
+        let helper = name("gg.addis.agent.helper");
+        assert!(delegation_allowed(&request("deploy.staging"), &helper));
+        assert!(!delegation_allowed(&request("policy.widen"), &helper));
+        assert!(!delegation_allowed(&request("policy.widen.network"), &helper));
+        assert!(!delegation_allowed(&request("device.enroll"), &helper));
         assert!(!delegation_allowed(&request("deploy.staging"), &name("gg.addis.agent.ava")), "the asker");
+        assert!(!delegation_allowed(&request("deploy.staging"), &name("gg.addis.agent.orchestrator")), "what started the asker");
         assert!(!delegation_allowed(&request("deploy.staging"), &name("gg.addis.human.sami")), "humans approve with a device");
-        let mut for_agent = request("deploy.staging");
-        for_agent.act_for = Some(orchestrator.clone());
-        assert!(!delegation_allowed(&for_agent, &orchestrator), "whom the asker acts for");
         assert!(!delegation_allowed(&request("deploy.staging"), &name("gg.addis.user.u-1")), "app users never approve");
+        assert!(!delegation_allowed(&request("deploy.staging"), &name("com.acme.agent.helper")), "another org");
+        let mut for_agent = request("deploy.staging");
+        for_agent.act_for = Some(helper.clone());
+        assert!(!delegation_allowed(&for_agent, &helper), "whom the asker acts for");
     }
 }
