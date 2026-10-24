@@ -9,7 +9,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -75,7 +75,6 @@ impl Primary {
             .args(["--issuer", &url, "--public-listen", &address])
             .args(&extra)
             .env("GILD_VAULT_MASTER_KEY_PATH", dir.path().join("master.key"))
-            .env_remove("HARAR_POSTGRES")
             .stdout(Stdio::null())
             .stderr(fs::File::create(dir.path().join("serve.log")).unwrap())
             .spawn()
@@ -236,7 +235,11 @@ fn a_postgres_primary_keeps_secrets_and_policy_encrypted_across_a_restart() {
     };
     // The primary's schema has a fixed name; the test database is disposable.
     sql(&url, "DROP SCHEMA IF EXISTS harar_primary CASCADE");
-    let primary = Primary::start_with(vec!["--postgres".into(), url.clone()]);
+    let conninfo = tempfile::Builder::new().prefix("hpg").tempdir().unwrap();
+    let file = conninfo.path().join("postgres");
+    fs::write(&file, &url).unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    let primary = Primary::start_with(vec!["--postgres-file".into(), file.to_str().unwrap().into()]);
     let mut put = Command::new(env!("CARGO_BIN_EXE_harar"));
     put.args(["put", "prod/site/DATABASE_URL", "--secret-stdin"]).env("HARAR_SOCKET", &primary.socket).stdin(Stdio::piped()).stdout(Stdio::piped());
     let mut child = put.spawn().unwrap();
@@ -255,4 +258,49 @@ fn a_postgres_primary_keeps_secrets_and_policy_encrypted_across_a_restart() {
     for plaintext in [&b"plaintext-marker"[..], b"gg.addis.role.kept", b"gg.addis.human.owner"] {
         assert!(!stored.windows(plaintext.len()).any(|w| w == plaintext), "{} is stored in the clear", String::from_utf8_lossy(plaintext));
     }
+}
+
+/// Runs a `harar serve` that must refuse to start, and returns what it said.
+/// One that starts anyway is stopped and fails the test, rather than hanging it.
+fn refused_to_start(command: &mut Command) -> String {
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let mut child = command.stdout(Stdio::null()).stderr(log.reopen().unwrap()).spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("a second primary started: {}", fs::read_to_string(log.path()).unwrap_or_default());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(!status.success());
+    fs::read_to_string(log.path()).unwrap()
+}
+
+#[test]
+fn a_second_primary_on_the_same_state_refuses_to_start() {
+    let primary = Primary::start();
+    let dir = primary._dir.path();
+    let state = dir.join("state");
+    let serve = |socket: &Path, state: &Path, audit: &str| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_harar"));
+        command
+            .arg("serve")
+            .args(["--socket", socket.to_str().unwrap(), "--org", "gg.addis", "--machine", "testbox", "--owner", OWNER])
+            .args(["--state-path", state.join("keys.age").to_str().unwrap()])
+            .args(["--audit-log", dir.join(audit).to_str().unwrap()])
+            .args(["--signing-key-file", state.join("signing.key").to_str().unwrap()])
+            .env("GILD_VAULT_MASTER_KEY_PATH", dir.join("master.key"));
+        command
+    };
+    let said = refused_to_start(&mut serve(&dir.join("other.sock"), &state, "audit.log"));
+    assert!(said.contains("another harar primary is using this state folder"), "{said}");
+    // Nor may anything take over a socket a live primary serves.
+    let said = refused_to_start(&mut serve(&primary.socket, &dir.join("state2"), "audit2.log"));
+    assert!(said.contains("another harar is serving"), "{said}");
+    assert_eq!(primary.ok(&["policy", "show"])["users"][me()], OWNER, "the first one still answers");
 }

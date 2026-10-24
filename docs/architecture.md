@@ -313,7 +313,7 @@ PRs #31–#36 stay open as reference until their code is moved over.
 
 ## 12. Decided
 
-- **The Addis primary is bugsy** (a Mac): `harar serve --postgres … --org gg.addis`.
+- **The Addis primary is bugsy** (a Mac): `harar serve --postgres-file … --org gg.addis`.
   - Its key ladder starts at bugsy's Secure Enclave, with a key that doesn't
     require presence, so the primary restarts with nobody there. The chip
     still keeps the key from being copied.

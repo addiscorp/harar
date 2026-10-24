@@ -37,6 +37,8 @@ async fn with_identity(dir: &Path, identity: &age::x25519::Identity) -> Primary 
         storage: Storage::File { path, recipient: identity.to_public() },
         issuer: oidc::Issuer::new("https://account.addis.gg", oidc::generate_es256_key(), harar_client::generate_signing_key()),
         audit_log: dir.join("audit.log"),
+        // Every user exists here except the ghosts.
+        user_exists: |user| !user.starts_with("ghost"),
     }
 }
 
@@ -149,6 +151,68 @@ async fn the_primarys_own_entries_are_never_secrets() {
         assert_eq!(refused(&ask(&primary, "sami", PrimaryRequest::Delete { key: key.into() }).await), "reserved_key", "{key}");
     }
     assert!(ask(&primary, "sami", PrimaryRequest::List).await.keys.unwrap().is_empty(), "nor listed");
+    let decide = PrimaryRequest::Decide { actor: None, action: Action::Read { path: POLICY_KEY.into() } };
+    assert_eq!(ask(&primary, "sami", decide).await.decision.as_deref(), Some("reserved_key"), "a dry run agrees with the real thing");
+}
+
+#[tokio::test]
+async fn one_scope_is_one_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let (primary, _) = primary(dir.path()).await;
+    let token = |scopes: &[&str]| PrimaryRequest::Token(TokenAsk { audience: "https://api.simien.dev".into(), scopes: scopes.iter().map(|s| s.to_string()).collect(), ttl_seconds: None, act: None, alg: None });
+    // The owner may ask for any scope, but never one that a token would carry as two.
+    assert!(ask(&primary, "sami", token(&["deploy:x", "admin"])).await.ok);
+    for smuggled in ["deploy:x admin", "deploy:x\nadmin", ""] {
+        assert_eq!(refused(&ask(&primary, "sami", token(&[smuggled])).await), "bad_scope", "{smuggled:?}");
+    }
+}
+
+#[tokio::test]
+async fn giving_approver_rights_needs_its_own_approval() {
+    let dir = tempfile::tempdir().unwrap();
+    let (primary, _) = primary(dir.path()).await;
+    add_site(&primary).await;
+    // ava may change policy, but not grant approver rights.
+    let admin = Role { name: name("gg.addis.role.policy-admin"), allows: vec![Permission { verb: Verb::Approve, resource: "policy.*".into(), scopes: vec![] }] };
+    let bugsy = || ZoneMatch::Name("gg.addis.zone.bugsy".parse().unwrap());
+    for setup in [
+        PolicyChange::SetRole { role: admin },
+        PolicyChange::Bind { binding: Binding { actor: "gg.addis.agent.ava".parse().unwrap(), zone: bugsy(), role: name("gg.addis.role.policy-admin") } },
+        PolicyChange::MapUser { user: "ava".into(), actor: name("gg.addis.agent.ava") },
+    ] {
+        assert!(ask(&primary, "sami", change(setup.clone())).await.ok, "{setup:?}");
+    }
+    let approver = Role { name: name("gg.addis.role.site"), allows: vec![Permission { verb: Verb::Approve, resource: "*".into(), scopes: vec![] }] };
+    for grant in [
+        PolicyChange::SetRole { role: approver },
+        PolicyChange::Bind { binding: Binding { actor: "gg.addis.agent.ava".parse().unwrap(), zone: bugsy(), role: name("gg.addis.role.owner") } },
+        PolicyChange::MapUser { user: "ava2".into(), actor: name("gg.addis.human.sami") },
+        PolicyChange::MapUser { user: "ava2".into(), actor: name("gg.addis.agent.ava") },
+        PolicyChange::Bind { binding: Binding { actor: "gg.addis.agent.*".parse().unwrap(), zone: bugsy(), role: name("gg.addis.role.policy-admin") } },
+    ] {
+        assert_eq!(refused(&ask(&primary, "ava", change(grant.clone())).await), "no_binding", "{grant:?}");
+    }
+    // Changes that give no one approver rights still go through.
+    let reader = Role { name: name("gg.addis.role.reader"), allows: vec![Permission { verb: Verb::Read, resource: "docs/*".into(), scopes: vec![] }] };
+    assert!(ask(&primary, "ava", change(PolicyChange::SetRole { role: reader })).await.ok);
+    assert!(ask(&primary, "ava", change(PolicyChange::MapUser { user: "site2".into(), actor: name("gg.addis.service.site") })).await.ok);
+}
+
+#[tokio::test]
+async fn a_change_that_cant_be_audited_is_not_made() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut primary, _) = primary(dir.path()).await;
+    primary.audit_log = dir.path().join("missing").join("audit.log");
+    assert_eq!(refused(&ask(&primary, "sami", PrimaryRequest::Put { key: "prod/a".into(), value: "v".into() }).await), "audit_failed");
+    assert_eq!(refused(&ask(&primary, "sami", PrimaryRequest::Get { key: "prod/a".into() }).await), "not_found", "nothing was written");
+}
+
+#[tokio::test]
+async fn a_user_who_doesnt_exist_never_counts_as_an_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let (primary, _) = primary(dir.path()).await;
+    assert_eq!(refused(&ask(&primary, "sami", change(PolicyChange::MapUser { user: "ghost-sami".into(), actor: name("gg.addis.human.sami") })).await), "unknown_os_user");
+    assert_eq!(refused(&ask(&primary, "sami", change(PolicyChange::UnmapUser { user: "sami".into() })).await), "would_lock_out");
 }
 
 #[tokio::test]
@@ -194,15 +258,18 @@ async fn an_actor_who_may_only_narrow_cannot_widen() {
 async fn bad_changes_are_refused_and_good_ones_survive_a_restart() {
     let dir = tempfile::tempdir().unwrap();
     let (primary, identity) = primary(dir.path()).await;
-    for bad in [
-        PolicyChange::MapUser { user: "x".into(), actor: name("com.acme.service.x") },
-        PolicyChange::MapUser { user: "x".into(), actor: name("gg.addis.user.u-1") },
-        PolicyChange::MapUser { user: "".into(), actor: name("gg.addis.service.x") },
-        PolicyChange::SetRole { role: Role { name: name("gg.addis.profile.x"), allows: vec![] } },
-        PolicyChange::Bind { binding: Binding { actor: "gg.addis.service.x".parse().unwrap(), zone: ZoneMatch::Name("gg.addis.zone.bugsy".parse().unwrap()), role: name("gg.addis.profile.x") } },
-        PolicyChange::RemoveRole { name: name("gg.addis.role.nothing") },
+    let smuggler = Role { name: name("gg.addis.role.x"), allows: vec![Permission { verb: Verb::Token, resource: "https://api.simien.dev".into(), scopes: vec!["deploy:x admin".into()] }] };
+    for (bad, reason) in [
+        (PolicyChange::MapUser { user: "x".into(), actor: name("com.acme.service.x") }, "bad_name"),
+        (PolicyChange::MapUser { user: "x".into(), actor: name("gg.addis.user.u-1") }, "bad_name"),
+        (PolicyChange::MapUser { user: "".into(), actor: name("gg.addis.service.x") }, "bad_name"),
+        (PolicyChange::MapUser { user: "ghost".into(), actor: name("gg.addis.service.x") }, "unknown_os_user"),
+        (PolicyChange::SetRole { role: Role { name: name("gg.addis.profile.x"), allows: vec![] } }, "bad_name"),
+        (PolicyChange::SetRole { role: smuggler }, "policy_invalid"),
+        (PolicyChange::Bind { binding: Binding { actor: "gg.addis.service.x".parse().unwrap(), zone: ZoneMatch::Name("gg.addis.zone.bugsy".parse().unwrap()), role: name("gg.addis.profile.x") } }, "policy_invalid"),
+        (PolicyChange::RemoveRole { name: name("gg.addis.role.nothing") }, "not_found"),
     ] {
-        assert!(!ask(&primary, "sami", change(bad.clone())).await.ok, "{bad:?}");
+        assert_eq!(refused(&ask(&primary, "sami", change(bad.clone())).await), reason, "{bad:?}");
     }
     add_site(&primary).await;
     assert!(ask(&primary, "sami", PrimaryRequest::Put { key: "prod/site/KEY".into(), value: "v".into() }).await.ok);
@@ -235,6 +302,18 @@ async fn every_request_is_audited_with_who_asked() {
     let lines: Vec<serde_json::Value> = log.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
     assert_eq!(lines[0]["actor"], "gg.addis.human.sami");
     assert_eq!(lines[0]["subject"], "prod/a");
-    assert_eq!(lines[1]["result"], "unknown_caller");
+    assert_eq!((&lines[0]["result"], &lines[1]["result"]), (&"pending".into(), &"ok".into()), "a change is logged before it is made");
+    assert_eq!(lines[2]["result"], "unknown_caller");
     assert!(!log.contains("secret-value-123"), "never the value");
+}
+
+#[tokio::test]
+async fn a_caller_who_sends_nothing_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (primary, _) = primary(dir.path()).await;
+    let (_caller, ours) = UnixStream::pair().unwrap();
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(Duration::from_secs(5), connection(ours, &primary, Duration::from_millis(100))).await;
+    assert!(result.expect("the connection gave up by itself").is_err());
+    assert!(started.elapsed() < Duration::from_secs(1));
 }

@@ -13,7 +13,7 @@ use clap::Args;
 use harar_client::model::{Action, Binding, Decision, Kind, Name, Org, Permission, Policy, Request, Role, Verb, Zone, ZoneKind, ZoneMatch};
 use harar_client::oidc::{self, Alg, IdentityRequest};
 use harar_client::primary::{PolicyChange, PolicyView, PrimaryRequest, PrimaryResponse};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -36,14 +36,14 @@ const DEFAULT_TOKEN_SECONDS: u64 = 300;
 #[derive(Debug, Args)]
 pub struct Serve {
     /// The local socket callers on this machine use.
-    #[arg(long, env = "HARAR_SOCKET", default_value = "/run/harar.sock")]
+    #[arg(long, default_value = "/run/harar.sock")]
     socket: PathBuf,
     /// The org this primary serves, e.g. gg.addis.
-    #[arg(long, env = "HARAR_ORG")]
+    #[arg(long)]
     org: String,
     /// This machine's name in the org, e.g. bugsy: its zone is
     /// <org>.zone.<machine> and its broker <org>.broker.<machine>.
-    #[arg(long, env = "HARAR_MACHINE")]
+    #[arg(long)]
     machine: String,
     /// On a new primary: the person who owns it, e.g. gg.addis.human.sami.
     #[arg(long)]
@@ -52,9 +52,11 @@ pub struct Serve {
     /// user running harar).
     #[arg(long)]
     owner_user: Option<String>,
-    /// Keep secrets in Postgres, as ciphertext. Without it, in the state file.
-    #[arg(long, env = "HARAR_POSTGRES")]
-    postgres: Option<String>,
+    /// Keep secrets in Postgres, as ciphertext: a file (yours, 0600) holding
+    /// the connection string, so a password never shows in `ps`. Without it,
+    /// secrets stay in the state file.
+    #[arg(long)]
+    postgres_file: Option<PathBuf>,
     /// The encrypted state file (without --postgres), and where the store's
     /// anchor lives (with it).
     #[arg(long, default_value = "/var/lib/harar/keys.age")]
@@ -73,10 +75,10 @@ pub struct Serve {
     #[arg(long)]
     es256_key_file: Option<PathBuf>,
     /// The issuer URL tokens name.
-    #[arg(long, env = "HARAR_ISSUER", default_value = "https://account.addis.gg")]
+    #[arg(long, default_value = "https://account.addis.gg")]
     issuer: String,
     /// A TCP address serving only the discovery document and JWKS.
-    #[arg(long, env = "HARAR_PUBLIC_LISTEN")]
+    #[arg(long)]
     public_listen: Option<String>,
 }
 
@@ -94,6 +96,15 @@ pub(crate) struct Primary {
     storage: Storage,
     issuer: oidc::Issuer,
     audit_log: PathBuf,
+    /// Whether an OS user exists on this machine. Only users that do may be
+    /// mapped, so the lockout guard never counts a typo as an owner.
+    user_exists: fn(&str) -> bool,
+}
+
+/// What answering a request comes to: a reply, or a new key map to save.
+enum Outcome {
+    Reply(Box<PrimaryResponse>),
+    Commit(HashMap<String, String>),
 }
 
 /// The store's master key comes from the vault's own master key, so whatever
@@ -121,6 +132,27 @@ fn load_policy(keys: &HashMap<String, String>) -> Result<(Policy, BTreeMap<Strin
 fn store_policy(keys: &mut HashMap<String, String>, policy: &Policy, users: &BTreeMap<String, Name>) {
     keys.insert(POLICY_KEY.into(), serde_json::to_string(policy).expect("policies serialize"));
     keys.insert(USERS_KEY.into(), serde_json::to_string(users).expect("user maps serialize"));
+}
+
+/// Approving that makes a change give someone approver rights.
+const GRANT_APPROVAL_CLASS: &str = "approvals.grant";
+
+/// Who may approve what, as comparable lines: every binding to a role with
+/// an approve permission, and every OS user whose actor such a binding
+/// covers. A change that adds a line gives someone approver rights.
+fn approver_reach(policy: &Policy, users: &BTreeMap<String, Name>) -> BTreeSet<String> {
+    let mut reach = BTreeSet::new();
+    for binding in &policy.bindings {
+        let Some(role) = policy.roles.iter().find(|role| role.name == binding.role) else { continue };
+        for permission in role.allows.iter().filter(|permission| permission.verb == Verb::Approve) {
+            let zone = serde_json::to_string(&binding.zone).unwrap_or_default();
+            reach.insert(format!("{} in {zone} approves {}", binding.actor, permission.resource));
+            for (user, actor) in users.iter().filter(|(_, actor)| binding.actor.matches(actor)) {
+                reach.insert(format!("OS user {user} as {actor} in {zone} approves {}", permission.resource));
+            }
+        }
+    }
+    reach
 }
 
 /// A new primary's first policy: its own machine zone, an owner role that may
@@ -165,8 +197,18 @@ impl Primary {
         Ok((policy, users, actor))
     }
 
-    fn decide(&self, policy: &Policy, actor: &Name, action: &Action) -> Decision {
-        policy.decide(&Request { actor, zone: &self.zone, via: Some(&self.broker), action, session: None }, now_epoch_seconds())
+    /// Every decision the primary makes: its own entries are never secrets,
+    /// then the policy decides, in this machine's zone, via its broker.
+    fn check(&self, policy: &Policy, actor: &Name, action: &Action) -> Result<Name, &'static str> {
+        if let Action::Read { path } | Action::Write { path } = action
+            && reserved(path)
+        {
+            return Err("reserved_key");
+        }
+        match policy.decide(&Request { actor, zone: &self.zone, via: Some(&self.broker), action, session: None }, now_epoch_seconds()) {
+            Decision::Allow { by_role } => Ok(by_role),
+            Decision::Deny(reason) => Err(reason.as_str()),
+        }
     }
 
     /// Saves the whole key map: to Postgres (what changed, all or nothing),
@@ -194,7 +236,7 @@ impl Primary {
         }
     }
 
-    fn audit(&self, peer: &PeerCred, actor: Option<&Name>, op: &str, subject: Option<&str>, result: &str) {
+    fn audit(&self, peer: &PeerCred, actor: Option<&Name>, op: &str, subject: Option<&str>, result: &str) -> Result<()> {
         let line = serde_json::json!({
             "at": now_epoch_seconds(),
             "uid": peer.uid,
@@ -205,15 +247,13 @@ impl Primary {
             "subject": subject,
             "result": result,
         });
-        let written = OpenOptions::new()
+        OpenOptions::new()
             .create(true)
             .append(true)
             .mode(0o600)
             .open(&self.audit_log)
-            .and_then(|mut file| writeln!(file, "{line}"));
-        if let Err(err) = written {
-            eprintln!("harar: audit {}: {err}", self.audit_log.display());
-        }
+            .and_then(|mut file| writeln!(file, "{line}"))
+            .with_context(|| format!("audit {}", self.audit_log.display()))
     }
 
     pub(crate) async fn handle(&self, peer: &PeerCred, request: PrimaryRequest) -> PrimaryResponse {
@@ -222,86 +262,79 @@ impl Primary {
         let (policy, users, actor) = match self.caller(&keys, peer) {
             Ok(caller) => caller,
             Err(reason) => {
-                self.audit(peer, None, op, None, reason);
+                if let Err(err) = self.audit(peer, None, op, None, reason) {
+                    eprintln!("harar: {err:#}");
+                }
                 return PrimaryResponse::error(reason);
             }
         };
-        let (subject, response) = self.answer(&mut keys, policy, users, &actor, request).await;
+        let (subject, outcome) = self.answer(&keys, policy, users, &actor, request);
+        let response = match outcome {
+            Outcome::Reply(response) => *response,
+            // A change is written to the audit log before it is made, and
+            // not made if it can't be.
+            Outcome::Commit(next) => match self.audit(peer, Some(&actor), op, subject.as_deref(), "pending") {
+                Ok(()) => self.commit(&mut keys, next).await,
+                Err(err) => {
+                    eprintln!("harar: {err:#}; refusing the change");
+                    return PrimaryResponse::error("audit_failed");
+                }
+            },
+        };
         let result = if response.ok { "ok" } else { response.error.as_deref().unwrap_or("error") };
-        self.audit(peer, Some(&actor), op, subject.as_deref(), result);
+        if let Err(err) = self.audit(peer, Some(&actor), op, subject.as_deref(), result) {
+            eprintln!("harar: {err:#}");
+        }
         response
     }
 
-    async fn answer(
-        &self,
-        keys: &mut HashMap<String, String>,
-        policy: Policy,
-        mut users: BTreeMap<String, Name>,
-        actor: &Name,
-        request: PrimaryRequest,
-    ) -> (Option<String>, PrimaryResponse) {
-        let denied = |decision: Decision| match decision {
-            Decision::Allow { .. } => None,
-            Decision::Deny(reason) => Some(PrimaryResponse::error(reason.as_str())),
-        };
+    fn answer(&self, keys: &HashMap<String, String>, policy: Policy, mut users: BTreeMap<String, Name>, actor: &Name, request: PrimaryRequest) -> (Option<String>, Outcome) {
+        let reply = |response| Outcome::Reply(Box::new(response));
+        let refuse = |reason: &str| Outcome::Reply(Box::new(PrimaryResponse::error(reason)));
         match request {
-            PrimaryRequest::Health => (None, PrimaryResponse { version: Some(VERSION.into()), ..PrimaryResponse::ok() }),
+            PrimaryRequest::Health => (None, reply(PrimaryResponse { version: Some(VERSION.into()), ..PrimaryResponse::ok() })),
             PrimaryRequest::Get { key } => {
-                if reserved(&key) {
-                    return (Some(key), PrimaryResponse::error("reserved_key"));
-                }
-                if let Some(refused) = denied(self.decide(&policy, actor, &Action::Read { path: key.clone() })) {
-                    return (Some(key), refused);
+                if let Err(reason) = self.check(&policy, actor, &Action::Read { path: key.clone() }) {
+                    return (Some(key), refuse(reason));
                 }
                 let response = match keys.get(&key) {
                     Some(value) => PrimaryResponse { value: Some(value.clone()), ..PrimaryResponse::ok() },
                     None => PrimaryResponse::error("not_found"),
                 };
-                (Some(key), response)
+                (Some(key), reply(response))
             }
             PrimaryRequest::Put { key, value } => {
-                if reserved(&key) {
-                    return (Some(key), PrimaryResponse::error("reserved_key"));
-                }
-                if let Some(refused) = denied(self.decide(&policy, actor, &Action::Write { path: key.clone() })) {
-                    return (Some(key), refused);
+                if let Err(reason) = self.check(&policy, actor, &Action::Write { path: key.clone() }) {
+                    return (Some(key), refuse(reason));
                 }
                 let mut next = keys.clone();
                 next.insert(key.clone(), value);
-                (Some(key), self.commit(keys, next).await)
+                (Some(key), Outcome::Commit(next))
             }
             PrimaryRequest::Delete { key } => {
-                if reserved(&key) {
-                    return (Some(key), PrimaryResponse::error("reserved_key"));
-                }
-                if let Some(refused) = denied(self.decide(&policy, actor, &Action::Write { path: key.clone() })) {
-                    return (Some(key), refused);
+                if let Err(reason) = self.check(&policy, actor, &Action::Write { path: key.clone() }) {
+                    return (Some(key), refuse(reason));
                 }
                 if !keys.contains_key(&key) {
-                    return (Some(key), PrimaryResponse::error("not_found"));
+                    return (Some(key), refuse("not_found"));
                 }
                 let mut next = keys.clone();
                 next.remove(&key);
-                (Some(key), self.commit(keys, next).await)
+                (Some(key), Outcome::Commit(next))
             }
             PrimaryRequest::List => {
-                let mut readable: Vec<String> = keys
-                    .keys()
-                    .filter(|key| !reserved(key))
-                    .filter(|key| matches!(self.decide(&policy, actor, &Action::Read { path: (*key).clone() }), Decision::Allow { .. }))
-                    .cloned()
-                    .collect();
+                let mut readable: Vec<String> = keys.keys().filter(|key| self.check(&policy, actor, &Action::Read { path: (*key).clone() }).is_ok()).cloned().collect();
                 readable.sort();
-                (None, PrimaryResponse { keys: Some(readable), ..PrimaryResponse::ok() })
+                (None, reply(PrimaryResponse { keys: Some(readable), ..PrimaryResponse::ok() }))
             }
             PrimaryRequest::Token(ask) => {
                 let subject = Some(ask.audience.clone());
                 if ask.act.is_some() {
-                    return (subject, PrimaryResponse::error("act_not_supported"));
+                    return (subject, refuse("act_not_supported"));
                 }
                 let action = Action::Token { audience: ask.audience.clone(), scopes: ask.scopes.clone() };
-                if let Some(refused) = denied(self.decide(&policy, actor, &action)) {
-                    return (subject, refused);
+                if let Err(reason) = self.check(&policy, actor, &action) {
+                    return (subject, refuse(reason));
                 }
                 let mut extra = BTreeMap::new();
                 extra.insert("org".into(), serde_json::Value::String(self.org.to_string()));
@@ -319,47 +352,55 @@ impl Primary {
                     Ok((token, claims)) => PrimaryResponse { token: Some(token), claims: Some(claims), ..PrimaryResponse::ok() },
                     Err(err) => PrimaryResponse::error(format!("token_refused: {err}")),
                 };
-                (subject, response)
+                (subject, reply(response))
             }
             PrimaryRequest::PolicyShow => {
-                if let Some(refused) = denied(self.decide(&policy, actor, &Action::Approve { class: "policy.show".into() })) {
-                    return (None, refused);
+                if let Err(reason) = self.check(&policy, actor, &Action::Approve { class: "policy.show".into() }) {
+                    return (None, refuse(reason));
                 }
                 let view = PolicyView { policy, users, zone: self.zone.clone(), broker: self.broker.clone() };
-                (None, PrimaryResponse { policy: Some(view), ..PrimaryResponse::ok() })
+                (None, reply(PrimaryResponse { policy: Some(view), ..PrimaryResponse::ok() }))
             }
             PrimaryRequest::Decide { actor: asked, action } => {
-                if let Some(refused) = denied(self.decide(&policy, actor, &Action::Approve { class: "policy.show".into() })) {
-                    return (None, refused);
+                if let Err(reason) = self.check(&policy, actor, &Action::Approve { class: "policy.show".into() }) {
+                    return (None, refuse(reason));
                 }
-                let decision = match self.decide(&policy, asked.as_ref().unwrap_or(actor), &action) {
-                    Decision::Allow { by_role } => format!("allow by {by_role}"),
-                    Decision::Deny(reason) => reason.as_str().to_string(),
+                let decision = match self.check(&policy, asked.as_ref().unwrap_or(actor), &action) {
+                    Ok(by_role) => format!("allow by {by_role}"),
+                    Err(reason) => reason.to_string(),
                 };
-                (None, PrimaryResponse { decision: Some(decision), ..PrimaryResponse::ok() })
+                (None, reply(PrimaryResponse { decision: Some(decision), ..PrimaryResponse::ok() }))
             }
             PrimaryRequest::PolicyChange { change } => {
                 let class = if change.narrows() { "policy.narrow" } else { "policy.widen" };
                 let subject = Some(format!("{class} {}", serde_json::to_string(&change).unwrap_or_default()));
-                if let Some(refused) = denied(self.decide(&policy, actor, &Action::Approve { class: class.into() })) {
-                    return (subject, refused);
+                if let Err(reason) = self.check(&policy, actor, &Action::Approve { class: class.into() }) {
+                    return (subject, refuse(reason));
                 }
-                let mut next_policy = policy;
+                let before = approver_reach(&policy, &users);
+                let mut next_policy = policy.clone();
                 if let Err(reason) = self.apply(&mut next_policy, &mut users, change) {
-                    return (subject, PrimaryResponse::error(reason));
+                    return (subject, refuse(reason));
                 }
                 // Load it back the way a restart would, so a change that
                 // leaves a policy that can't load is refused now.
                 let next_policy: Policy = match serde_json::to_string(&next_policy).ok().and_then(|text| serde_json::from_str(&text).ok()) {
                     Some(policy) => policy,
-                    None => return (subject, PrimaryResponse::error("policy_invalid")),
+                    None => return (subject, refuse("policy_invalid")),
                 };
+                // Giving anyone approver rights they didn't have is its own,
+                // stronger class (architecture, section 6).
+                if !approver_reach(&next_policy, &users).is_subset(&before)
+                    && let Err(reason) = self.check(&policy, actor, &Action::Approve { class: GRANT_APPROVAL_CLASS.into() })
+                {
+                    return (subject, refuse(reason));
+                }
                 if !self.someone_can_change_policy(&next_policy, &users) {
-                    return (subject, PrimaryResponse::error("would_lock_out"));
+                    return (subject, refuse("would_lock_out"));
                 }
                 let mut next = keys.clone();
                 store_policy(&mut next, &next_policy, &users);
-                (subject, self.commit(keys, next).await)
+                (subject, Outcome::Commit(next))
             }
         }
     }
@@ -422,6 +463,9 @@ impl Primary {
                 if user.is_empty() || !actor.kind().is_actor() || actor.org() != &self.org || actor.kind() == Kind::User {
                     return Err("bad_name");
                 }
+                if !(self.user_exists)(&user) {
+                    return Err("unknown_os_user");
+                }
                 users.insert(user, actor);
             }
             PolicyChange::UnmapUser { user } => {
@@ -437,7 +481,7 @@ impl Primary {
     /// leave nobody able to change it again.
     fn someone_can_change_policy(&self, policy: &Policy, users: &BTreeMap<String, Name>) -> bool {
         let widen = Action::Approve { class: "policy.widen".into() };
-        users.values().any(|actor| matches!(self.decide(policy, actor, &widen), Decision::Allow { .. }))
+        users.values().any(|actor| self.check(policy, actor, &widen).is_ok())
     }
 
     async fn commit(&self, keys: &mut HashMap<String, String>, next: HashMap<String, String>) -> PrimaryResponse {
@@ -524,12 +568,14 @@ async fn open(config: &Serve) -> Result<Primary> {
     let state_dir = config.state_path.parent().ok_or_else(|| anyhow!("the state path has no parent folder"))?;
     ensure_private_dir(state_dir, "state")?;
     let identity = crate::master_key::load_master_key()?;
-    let (storage, mut keys) = match &config.postgres {
+    let (storage, mut keys) = match &config.postgres_file {
         None => {
             let keys = load_keys(&config.state_path, &identity)?;
             (Storage::File { path: config.state_path.clone(), recipient: identity.to_public() }, keys)
         }
-        Some(url) => {
+        Some(file) => {
+            let url = read_private_file(file, "Postgres connection file")?;
+            let url = url.trim();
             let options = postgres::Options {
                 anchor: Some(config.state_path.with_file_name("store.anchor")),
                 accept_unanchored: config.accept_unanchored,
@@ -550,6 +596,7 @@ async fn open(config: &Serve) -> Result<Primary> {
     let es256 = load_or_create_key(&es256_path, "ES256 key", oidc::generate_es256_key, |key| oidc::es256_key_bytes(key).to_vec(), |bytes| {
         oidc::es256_key_from_bytes(bytes).map_err(|err| anyhow!("{err}"))
     })?;
+    check_audit_log(&config.audit_log)?;
     let primary = Primary {
         org: org.clone(),
         zone: zone.clone(),
@@ -558,6 +605,7 @@ async fn open(config: &Serve) -> Result<Primary> {
         storage,
         issuer: oidc::Issuer::new(config.issuer.clone(), es256, signing),
         audit_log: config.audit_log.clone(),
+        user_exists: crate::common::user_exists,
     };
     match keys.get(POLICY_KEY) {
         Some(_) => {
@@ -577,6 +625,9 @@ async fn open(config: &Serve) -> Result<Primary> {
                 // SAFETY: geteuid has no preconditions.
                 None => crate::common::username_for_uid(unsafe { libc::geteuid() }).ok_or_else(|| anyhow!("can't tell who is running harar; pass --owner-user"))?,
             };
+            if !(primary.user_exists)(&owner_user) {
+                return Err(anyhow!("--owner-user {owner_user} is not a user on this machine"));
+            }
             let (policy, users) = first_policy(&org, &zone, &broker, &owner, &owner_user, now_epoch_seconds())?;
             let mut next = keys.clone();
             store_policy(&mut next, &policy, &users);
@@ -602,6 +653,27 @@ fn ensure_private_dir(path: &Path, kind: &str) -> Result<()> {
     }
     if !existed {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// A file only this user can read: their own, with no group or other bits.
+fn read_private_file(path: &Path, kind: &str) -> Result<String> {
+    let metadata = fs::symlink_metadata(path).with_context(|| format!("read the {kind} {}", path.display()))?;
+    // SAFETY: geteuid has no preconditions.
+    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(anyhow!("refusing a {kind} others can read, or this user doesn't own: {}", path.display()));
+    }
+    fs::read_to_string(path).with_context(|| format!("read the {kind} {}", path.display()))
+}
+
+/// The audit log is this user's and private, or the primary doesn't start.
+fn check_audit_log(path: &Path) -> Result<()> {
+    let file = OpenOptions::new().create(true).append(true).mode(0o600).open(path).with_context(|| format!("open the audit log {}", path.display()))?;
+    let metadata = file.metadata()?;
+    // SAFETY: geteuid has no preconditions.
+    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(anyhow!("refusing an audit log others can read, or this user doesn't own: {}", path.display()));
     }
     Ok(())
 }
@@ -645,7 +717,12 @@ fn bind_socket(path: &Path) -> Result<UnixListener> {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(path).with_context(|| format!("remove the stale {}", path.display()))?,
+        Ok(metadata) if metadata.file_type().is_socket() => {
+            if std::os::unix::net::UnixStream::connect(path).is_ok() {
+                return Err(anyhow!("another harar is serving on {}", path.display()));
+            }
+            fs::remove_file(path).with_context(|| format!("remove the stale {}", path.display()))?
+        }
         Ok(_) => return Err(anyhow!("{} exists and is not a socket", path.display())),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err).with_context(|| format!("stat {}", path.display())),
@@ -659,6 +736,10 @@ fn bind_socket(path: &Path) -> Result<UnixListener> {
 
 pub async fn run(config: Serve) -> Result<()> {
     crate::agent::disable_core_dumps()?;
+    let state_dir = config.state_path.parent().ok_or_else(|| anyhow!("the state path has no parent folder"))?;
+    ensure_private_dir(state_dir, "state")?;
+    // Held until the process exits: one primary per state folder.
+    let _lock = crate::common::lock_exclusive(&state_dir.join("primary.lock")).context("another harar primary is using this state folder")?;
     let primary = Arc::new(open(&config).await?);
     let listener = bind_socket(&config.socket)?;
     eprintln!("harar primary for {} in {} on {}", primary.org, primary.zone, config.socket.display());
@@ -667,7 +748,9 @@ pub async fn run(config: Serve) -> Result<()> {
         eprintln!("harar serving discovery and JWKS on {address} as {}", primary.issuer.url());
         tokio::spawn(serve_public(public, Arc::clone(&primary), PUBLIC_LIMITS));
     }
+    let slots = Arc::new(tokio::sync::Semaphore::new(LOCAL_LIMITS.connections));
     loop {
+        let slot = Arc::clone(&slots).acquire_owned().await.expect("the semaphore is never closed");
         let (stream, _) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(err) => {
@@ -678,22 +761,28 @@ pub async fn run(config: Serve) -> Result<()> {
         };
         let primary = Arc::clone(&primary);
         tokio::spawn(async move {
-            if let Err(err) = connection(stream, &primary).await {
+            let _slot = slot;
+            if let Err(err) = connection(stream, &primary, LOCAL_LIMITS.exchange).await {
                 eprintln!("harar connection error: {err:#}");
             }
         });
     }
 }
 
-async fn connection(mut stream: UnixStream, primary: &Primary) -> Result<()> {
+/// Limits for the local socket, which any OS user on this machine can open.
+const LOCAL_LIMITS: Limits = Limits { connections: 64, exchange: Duration::from_secs(5) };
+
+/// Reading the request and writing the reply each get `limit`; deciding and
+/// saving in between are never cut off halfway.
+async fn connection(mut stream: UnixStream, primary: &Primary, limit: Duration) -> Result<()> {
     let peer = peer_credentials(&stream).context("read the caller's credentials")?;
-    let bytes = read_request_bytes(&mut stream).await?;
+    let bytes = tokio::time::timeout(limit, read_request_bytes(&mut stream)).await.map_err(|_| anyhow!("the caller sent nothing in time"))??;
     let response = match serde_json::from_slice::<PrimaryRequest>(&bytes) {
         Ok(request) => primary.handle(&peer, request).await,
         Err(_) => PrimaryResponse::error("bad_request"),
     };
-    stream.write_all(&serde_json::to_vec(&response)?).await.context("write the response")?;
-    Ok(())
+    let reply = serde_json::to_vec(&response)?;
+    tokio::time::timeout(limit, stream.write_all(&reply)).await.map_err(|_| anyhow!("the caller read nothing in time"))?.context("write the response")
 }
 
 // The public listener: discovery and JWKS only, for anyone on the network.
@@ -704,9 +793,9 @@ struct HttpRequest {
     path: String,
 }
 
-/// Limits for the public listener, which anyone on the network can reach.
+/// Limits for a listener others can reach.
 #[derive(Clone, Copy)]
-struct PublicLimits {
+struct Limits {
     /// Connections served at once. Past this, accepting waits, so a flood
     /// queues in the kernel instead of using up this process's file handles.
     connections: usize,
@@ -714,7 +803,7 @@ struct PublicLimits {
     exchange: Duration,
 }
 
-const PUBLIC_LIMITS: PublicLimits = PublicLimits { connections: 256, exchange: Duration::from_secs(10) };
+const PUBLIC_LIMITS: Limits = Limits { connections: 256, exchange: Duration::from_secs(10) };
 
 fn public_reply(primary: &Primary, request: &HttpRequest) -> Option<(u16, serde_json::Value)> {
     let body = match request.path.as_str() {
@@ -725,7 +814,7 @@ fn public_reply(primary: &Primary, request: &HttpRequest) -> Option<(u16, serde_
     Some((200, body))
 }
 
-async fn serve_public(listener: TcpListener, primary: Arc<Primary>, limits: PublicLimits) {
+async fn serve_public(listener: TcpListener, primary: Arc<Primary>, limits: Limits) {
     let slots = Arc::new(tokio::sync::Semaphore::new(limits.connections));
     loop {
         let slot = Arc::clone(&slots).acquire_owned().await.expect("the semaphore is never closed");

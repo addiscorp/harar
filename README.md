@@ -27,10 +27,13 @@ A primary holds one org's vault and policy and issues its tokens. The OS user
 named by `--owner-user` speaks as the owner; everyone else is refused until
 the owner maps them.
 
+The Postgres connection string lives in a file only the primary's user can
+read (0600), so a password never shows in `ps`.
+
 ```sh
 sudo harar serve --org gg.addis --machine bugsy \
   --owner gg.addis.human.sami --owner-user sami \
-  --postgres 'host=/var/run/postgresql dbname=harar'
+  --postgres-file /var/lib/harar/postgres
 
 harar policy show
 harar policy role set gg.addis.role.site --read 'prod/site/*' \

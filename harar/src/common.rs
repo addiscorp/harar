@@ -74,6 +74,30 @@ pub(crate) fn username_for_uid(uid: u32) -> Option<String> {
     Some(name.to_string_lossy().into_owned())
 }
 
+/// Whether `name` is a user on this machine, through the system user
+/// database (so macOS accounts count too).
+pub(crate) fn user_exists(name: &str) -> bool {
+    let Ok(name) = std::ffi::CString::new(name) else { return false };
+    let mut buf = vec![0 as libc::c_char; 4096];
+    // SAFETY: an all-zero passwd is a valid out-parameter for getpwnam_r.
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: every pointer is valid for the call.
+    let rc = unsafe { libc::getpwnam_r(name.as_ptr(), &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result) };
+    rc == 0 && !result.is_null()
+}
+
+/// Takes an exclusive lock on `path` (made 0600 if missing), or fails at once
+/// if another process holds it. The lock lasts as long as the file is open.
+pub(crate) fn lock_exclusive(path: &Path) -> Result<fs::File> {
+    let file = OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).open(path).with_context(|| format!("open {}", path.display()))?;
+    // SAFETY: the descriptor is open for the whole call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(anyhow!("{} is locked: {}", path.display(), std::io::Error::last_os_error()));
+    }
+    Ok(file)
+}
+
 /// Reads one JSON request. Clients don't always half-close the socket, so a
 /// complete JSON value ends it too.
 pub(crate) async fn read_request_bytes(stream: &mut UnixStream) -> Result<Vec<u8>> {
