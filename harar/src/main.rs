@@ -253,51 +253,58 @@ struct PrimaryStore {
 }
 
 /// The store's master key comes from the vault's own master key, so whatever
-/// protects that (Secure Enclave, TPM, a 0400 file) protects this too.
+/// protects that (Secure Enclave, TPM, a 0400 file) protects this too. The
+/// store derives its wrapping and tagging keys from it with HMAC.
 fn store_master_key(identity: &age::x25519::Identity) -> store::envelope::MasterKey {
     use age::secrecy::ExposeSecret;
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(b"harar.store-master-key.v1");
-    hasher.update(identity.to_string().expose_secret().as_bytes());
-    store::envelope::MasterKey::from_bytes(format!("age:{}", identity.to_public()), hasher.finalize().into())
+    let secret = identity.to_string();
+    store::envelope::MasterKey::from_secret(format!("age:{}", identity.to_public()), secret.expose_secret().as_bytes())
 }
 
-/// Saves the whole key map: to Postgres when there's a store (only what
-/// changed, as new versions), otherwise to the encrypted state file.
+/// Saves the whole key map: to Postgres when there's a store (what changed,
+/// in one all-or-nothing write), otherwise to the encrypted state file.
+/// Callers save the new map first and only then make it the live one, so a
+/// failed save leaves memory and storage agreeing.
 async fn save_keys(state: &AppState, keys: &HashMap<String, String>) -> Result<()> {
     let Some(store) = &state.store else {
         return persist_keys(&state.state_path, &state.master_recipient, keys);
     };
-    let written_by = format!("{}.service.harar", store.org);
     let mut saved = store.saved.lock().await;
-    for (key, value) in keys {
-        if saved.get(key) != Some(value) {
-            store.pg.put(&store.org, key, value.as_bytes(), &written_by, None).await.map_err(|err| anyhow!("save {key}: {err}"))?;
-            saved.insert(key.clone(), value.clone());
-        }
+    let mut changes: Vec<store::postgres::Change<'_>> = keys
+        .iter()
+        .filter(|(key, value)| saved.get(*key) != Some(*value))
+        .map(|(key, value)| store::postgres::Change { path: key, value: Some(value.as_bytes()) })
+        .collect();
+    changes.extend(saved.keys().filter(|key| !keys.contains_key(*key)).map(|key| store::postgres::Change { path: key, value: None }));
+    if changes.is_empty() {
+        return Ok(());
     }
-    let removed: Vec<String> = saved.keys().filter(|key| !keys.contains_key(*key)).cloned().collect();
-    for key in removed {
-        store.pg.delete(&store.org, &key, &written_by, None).await.map_err(|err| anyhow!("delete {key}: {err}"))?;
-        saved.remove(&key);
-    }
+    let written_by = format!("{}.service.harar", store.org);
+    store.pg.write(&store.org, &changes, &written_by, None).await.map_err(|err| anyhow!("save: {err}"))?;
+    drop(changes);
+    *saved = keys.clone();
     Ok(())
 }
 
-/// Every secret's newest value, from Postgres.
+/// With a store, keys are secret paths: refused up front, before anything
+/// changes, rather than failing halfway through a save.
+fn storable_key(state: &AppState, key: &str) -> bool {
+    state.store.is_none() || harar_client::model::valid_secret_path(key)
+}
+
+/// Every secret's newest value, after the store checks itself whole.
 async fn load_store_keys(pg: &store::postgres::PgStore, org: &str) -> Result<HashMap<String, String>> {
     let mut keys = HashMap::new();
-    for path in pg.list(org, "").await.map_err(|err| anyhow!("list secrets: {err}"))? {
-        let (_, value) = pg.get(org, &path).await.map_err(|err| anyhow!("read {path}: {err}"))?;
+    for (path, value) in pg.load_all(org).await.map_err(|err| anyhow!("load secrets: {err}"))? {
         let value = String::from_utf8(value.to_vec()).map_err(|_| anyhow!("{path} is not text"))?;
         keys.insert(path, value);
     }
     Ok(keys)
 }
 
-/// Opens the store and returns what it holds. An existing state file is moved
-/// in only when asked (`--import-state`), and only into an empty store.
+/// Opens the store and returns what it holds. An existing state file moves in
+/// only when asked (`--import-state`), only into an empty store, all at once,
+/// and is then renamed so it is never read again.
 async fn open_primary_store(
     pg: store::postgres::PgStore,
     org: &str,
@@ -307,11 +314,14 @@ async fn open_primary_store(
 ) -> Result<(PrimaryStore, HashMap<String, String>)> {
     let saved = load_store_keys(&pg, org).await?;
     let store = PrimaryStore { pg, org: org.to_string(), saved: Mutex::new(saved.clone()) };
-    if !state_path.exists() || !saved.is_empty() {
-        if import_state && !saved.is_empty() {
-            return Err(anyhow!("--import-state: Postgres already holds secrets for {org}; nothing was imported"));
-        }
+    if !state_path.exists() {
         return Ok((store, saved));
+    }
+    if !saved.is_empty() {
+        return Err(anyhow!(
+            "both {} and Postgres hold secrets for {org}; harar won't guess which is right. Move the file aside once you've checked.",
+            state_path.display()
+        ));
     }
     if !import_state {
         return Err(anyhow!(
@@ -320,12 +330,18 @@ async fn open_primary_store(
         ));
     }
     let file_keys = load_keys(state_path, identity)?;
-    let written_by = format!("{org}.service.harar");
-    for (key, value) in &file_keys {
-        store.pg.put(org, key, value.as_bytes(), &written_by, None).await.map_err(|err| anyhow!("import {key}: {err}"))?;
-    }
+    let changes: Vec<store::postgres::Change<'_>> =
+        file_keys.iter().map(|(key, value)| store::postgres::Change { path: key, value: Some(value.as_bytes()) }).collect();
+    store.pg.write(org, &changes, &format!("{org}.service.harar"), None).await.map_err(|err| anyhow!("import: {err}; nothing was imported"))?;
+    drop(changes);
+    let imported = state_path.with_extension("age.imported");
+    fs::rename(state_path, &imported).with_context(|| format!("rename {} to {}", state_path.display(), imported.display()))?;
     *store.saved.lock().await = file_keys.clone();
-    eprintln!("harar: imported {} secrets from {} into Postgres; that file is no longer read", file_keys.len(), state_path.display());
+    eprintln!(
+        "harar: imported {} secrets into Postgres and renamed the file to {}; delete it once you've checked",
+        file_keys.len(),
+        imported.display()
+    );
     Ok((store, file_keys))
 }
 
@@ -587,9 +603,11 @@ pub(crate) async fn run_daemon() -> Result<()> {
             }
             let org = config.org.as_deref().ok_or_else(|| anyhow!("--postgres needs --org (e.g. gg.addis)"))?;
             org.parse::<harar_client::model::Org>().map_err(|err| anyhow!("--org {org}: {err}"))?;
-            let pg = store::postgres::PgStore::connect(url, "harar_primary", store_master_key(&master_key))
+            let anchor = config.state_path.with_file_name("store.anchor");
+            let pg = store::postgres::PgStore::connect(url, "harar_primary", store_master_key(&master_key), Some(anchor))
                 .await
                 .map_err(|err| anyhow!("open the secret store: {err}"))?;
+            pg.hold_as_primary().await.map_err(|err| anyhow!("open the secret store: {err}"))?;
             let (store, keys) = open_primary_store(pg, org, &config.state_path, &master_key, config.import_state).await?;
             (Some(store), keys)
         }
@@ -1007,9 +1025,14 @@ async fn handle_request(
             }
         }
         VaultRequest::Put { key, value, .. } => {
+            if !storable_key(state, &key) {
+                return Ok(VaultResponse::error("bad_key"));
+            }
             let mut keys = state.keys.lock().await;
-            keys.insert(key.clone(), value);
-            save_keys(state, &keys).await?;
+            let mut next = keys.clone();
+            next.insert(key.clone(), value);
+            save_keys(state, &next).await?;
+            *keys = next;
             append_replication_log(state, "put", &key, keys.get(&key).cloned()).await?;
             VaultResponse::ok()
         }
@@ -1028,8 +1051,10 @@ async fn handle_request(
         }
         VaultRequest::Delete { key, .. } => {
             let mut keys = state.keys.lock().await;
-            keys.remove(&key);
-            save_keys(state, &keys).await?;
+            let mut next = keys.clone();
+            next.remove(&key);
+            save_keys(state, &next).await?;
+            *keys = next;
             append_replication_log(state, "delete", &key, None).await?;
             VaultResponse::ok()
         }
@@ -1133,9 +1158,14 @@ async fn handle_request(
                 VaultResponse::error("missing_jti")
             } else {
                 let key = revoked_jti_key(&jti);
+                if !storable_key(state, &key) {
+                    return Ok(VaultResponse::error("bad_key"));
+                }
                 let mut keys = state.keys.lock().await;
-                keys.insert(key.clone(), "revoked".to_string());
-                save_keys(state, &keys).await?;
+                let mut next = keys.clone();
+                next.insert(key.clone(), "revoked".to_string());
+                save_keys(state, &next).await?;
+                *keys = next;
                 append_replication_log(state, "put", &key, Some("revoked".to_string())).await?;
                 VaultResponse::ok()
             }
@@ -1218,8 +1248,10 @@ async fn update_identity(
         Ok(true) => {}
     }
     let text = identity::store(&policy);
-    keys.insert(identity::POLICY_KEY.to_string(), text.clone());
-    save_keys(state, &keys).await?;
+    let mut next = keys.clone();
+    next.insert(identity::POLICY_KEY.to_string(), text.clone());
+    save_keys(state, &next).await?;
+    *keys = next;
     append_replication_log(state, "put", identity::POLICY_KEY, Some(text)).await?;
     Ok(VaultResponse {
         identity: Some(policy),
@@ -4599,7 +4631,7 @@ mod tests {
     }
 
     async fn test_pg(url: &str, identity: &age::x25519::Identity, schema: &str) -> store::postgres::PgStore {
-        store::postgres::PgStore::connect(url, schema, store_master_key(identity)).await.unwrap()
+        store::postgres::PgStore::connect(url, schema, store_master_key(identity), None).await.unwrap()
     }
 
     fn test_schema(name: &str) -> String {
@@ -4656,9 +4688,43 @@ mod tests {
 
         let (_, imported) = open_primary_store(test_pg(&url, &identity, &schema).await, "gg.addis", &state_path, &identity, true).await.unwrap();
         assert_eq!(imported, keys);
-        let (_, again) = open_primary_store(test_pg(&url, &identity, &schema).await, "gg.addis", &state_path, &identity, false).await.unwrap();
-        assert_eq!(again, keys, "after the import, the store is what's read");
-        let twice = open_primary_store(test_pg(&url, &identity, &schema).await, "gg.addis", &state_path, &identity, true).await;
-        assert!(twice.err().unwrap().to_string().contains("already holds"), "never imported over existing secrets");
+        assert!(!state_path.exists() && state_path.with_extension("age.imported").exists(), "the file is renamed, never read again");
+        let (_, again) = open_primary_store(test_pg(&url, &identity, &schema).await, "gg.addis", &state_path, &identity, true).await.unwrap();
+        assert_eq!(again, keys, "after the import, the store is what's read, even with the flag left on");
+
+        // A state file next to a store that already holds secrets is never merged.
+        persist_keys(&state_path, &identity.to_public(), &HashMap::from([("prod/a".to_string(), "stale".to_string())])).unwrap();
+        let both = open_primary_store(test_pg(&url, &identity, &schema).await, "gg.addis", &state_path, &identity, true).await;
+        assert!(both.err().unwrap().to_string().contains("both"), "harar won't guess which is right");
+    }
+
+    #[tokio::test]
+    async fn a_save_that_fails_changes_nothing_and_blocks_nothing() {
+        let Some(url) = test_database_url() else { return };
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path());
+        let pg = test_pg(&url, &state.master_identity, &test_schema("failed_save")).await;
+        let (primary, _) = open_primary_store(pg, "gg.addis", &state.state_path, &state.master_identity, false).await.unwrap();
+        state.store = Some(primary);
+        let root = peer(0, "root");
+        let put = |key: &str, value: &str| VaultRequest::Put { key: key.into(), value: value.into(), shop_id: None };
+
+        // A key that isn't a secret path is refused before anything changes.
+        let refused = handle_request(&state, &root, put("prod//bad", "x")).await.unwrap();
+        assert_eq!(refused.error.as_deref(), Some("bad_key"));
+        assert!(!state.keys.lock().await.contains_key("prod//bad"), "memory never took it");
+        assert!(handle_request(&state, &root, put("prod/good", "y")).await.unwrap().ok, "later writes still work");
+
+        // A save Postgres refuses leaves memory as it was.
+        let before = state.keys.lock().await.clone();
+        let client = {
+            let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await.unwrap();
+            tokio::spawn(connection);
+            client
+        };
+        let schema = test_schema("failed_save");
+        client.batch_execute(&format!("UPDATE {schema}.store_state SET tag = '\\x00'")).await.unwrap();
+        assert!(handle_request(&state, &root, put("prod/after", "z")).await.is_err());
+        assert_eq!(*state.keys.lock().await, before, "the failed write never reached memory");
     }
 }

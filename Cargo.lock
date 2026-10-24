@@ -1060,6 +1060,7 @@ dependencies = [
  "ed25519-dalek",
  "harar-client",
  "harar-proxy",
+ "hmac 0.12.1",
  "libc",
  "p256",
  "security-framework",
