@@ -382,7 +382,7 @@ fn es256_kid(key: &p256::ecdsa::VerifyingKey) -> String {
     format!("harar-es256-{}", &b64_url(x)[..16])
 }
 
-fn es256_jwk(key: &p256::ecdsa::VerifyingKey) -> Jwk {
+pub(crate) fn es256_jwk(key: &p256::ecdsa::VerifyingKey) -> Jwk {
     let (x, y) = es256_coordinates(key);
     Jwk {
         kty: "EC".to_string(),
@@ -395,7 +395,7 @@ fn es256_jwk(key: &p256::ecdsa::VerifyingKey) -> Jwk {
     }
 }
 
-fn es256_verifying_key(jwk: &Jwk) -> Result<p256::ecdsa::VerifyingKey, TokenError> {
+pub(crate) fn es256_verifying_key(jwk: &Jwk) -> Result<p256::ecdsa::VerifyingKey, TokenError> {
     let bad = || TokenError::InvalidToken("bad P-256 key".to_string());
     let x: [u8; 32] = b64_url_decode(&jwk.x)?.as_slice().try_into().map_err(|_| bad())?;
     let y: [u8; 32] = b64_url_decode(jwk.y.as_deref().ok_or_else(bad)?)?
