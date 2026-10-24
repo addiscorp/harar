@@ -28,6 +28,7 @@ mod identity;
 mod mask;
 mod screen;
 mod ssh;
+mod store;
 mod template;
 #[cfg(target_os = "macos")]
 mod enclave;
