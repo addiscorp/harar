@@ -23,6 +23,10 @@ const CHALLENGE_CONTEXT: &[u8] = b"harar.approval.v4";
 
 /// The longest a request may wait for approval.
 pub const MAX_REQUEST_SECONDS: u64 = 24 * 3600;
+
+/// How long a device enrolled with a recovery code waits before it may
+/// approve reserved classes.
+pub const RECOVERY_COOLDOWN_SECONDS: u64 = 24 * 3600;
 const CLOCK_SKEW_SECONDS: u64 = 60;
 
 /// What only a person may approve, on their own device: the actions that
@@ -147,6 +151,13 @@ pub struct ApproverDevice {
 }
 
 impl ApproverDevice {
+    /// Marks a device enrolled with a recovery code: everyday approvals at
+    /// once, reserved classes only after `RECOVERY_COOLDOWN_SECONDS`.
+    pub fn enrolled_by_recovery(mut self, now: u64) -> ApproverDevice {
+        self.reserved_after = now + RECOVERY_COOLDOWN_SECONDS;
+        self
+    }
+
     /// The key itself, so one key enrolled twice counts once.
     fn key_bytes(&self) -> String {
         format!("{}|{}", self.public_key.x, self.public_key.y.as_deref().unwrap_or_default())
@@ -688,7 +699,8 @@ pub fn decide(
             rejected.push((index, ApprovalError::OwnRequest));
             continue;
         }
-        if request.is_reserved() && now < device.reserved_after {
+        // A cooling device can always say no.
+        if approval.decision == Decision::Approve && request.is_reserved() && now < device.reserved_after {
             rejected.push((index, ApprovalError::DeviceCooling));
             continue;
         }
@@ -734,8 +746,10 @@ pub fn decide(
 ///   under the same agent.
 ///
 /// `line` is everything the approver acts through, as the primary knows it:
-/// what started it, whom it acts for, and everything it started. The request
-/// must also pass the same checks `decide` makes.
+/// what started it, whom it acts for, and everything it started. `approvers`
+/// must be complete and current: a short or stale list lets a coordinator
+/// widen an approver it leaves out. The request must also pass the same
+/// checks `decide` makes.
 ///
 /// Humans approve with a device and app users never approve. Its rate
 /// limits, and checking its role allows `approve`, are the primary's.
@@ -1353,12 +1367,15 @@ mod tests {
     #[test]
     fn a_device_enrolled_by_recovery_waits_before_it_approves_reserved_classes() {
         let mut fresh = device("phone-new", "gg.addis.human.sami", DeviceKind::Phone);
+        fresh.device = fresh.device.enrolled_by_recovery(NOW - 50);
+        assert_eq!(fresh.device.reserved_after, NOW - 50 + RECOVERY_COOLDOWN_SECONDS);
         fresh.device.reserved_after = NOW + 300;
         let devices = [fresh.device.clone()];
         let deploy = request("deploy.production");
         assert_eq!(outcome(&deploy, &[signed(&fresh, &deploy, Decision::Approve)], &devices), Ok(Outcome::Approved), "everyday approvals at once");
         let rotate = request("keys.rotate");
         assert_eq!(rejected(&rotate, &[signed(&fresh, &rotate, Decision::Approve)], &devices), [ApprovalError::DeviceCooling]);
+        assert_eq!(outcome(&rotate, &[signed(&fresh, &rotate, Decision::Deny)], &devices), Ok(Outcome::Denied), "but it can say no at once");
         assert_eq!(decide(&rotate, &[signed(&fresh, &rotate, Decision::Approve)], &devices, &rules(), &rp(), NOW + 300).unwrap().outcome, Outcome::Approved, "and reserved ones after the wait");
     }
 

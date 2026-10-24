@@ -179,7 +179,10 @@ orchestration isn't held up. The safety is in the blast radius and the record:
   started it, whom it acts for, or anything it started, nor a sibling under
   the same agent.
 - A device enrolled with a recovery code waits a day before it may approve
-  reserved classes, so a stolen code isn't instant full control.
+  reserved classes (it can deny at once), so a stolen code isn't instant full
+  control.
+- A name that holds no `approve` today can be widened by a coordinator; if a
+  person later makes it an approver, it keeps that reach.
 - Classes it wasn't given, misspelled ones included, fail closed.
 - The primary adds: every coordinator approval audited with its lineage, a
   daily digest to the person, optional rate limits per class, and revoking its
