@@ -70,7 +70,7 @@ pub struct Serve {
     #[arg(long, default_value = "/var/log/harar.log")]
     audit_log: PathBuf,
     /// The master key every stored secret is encrypted to (0400, yours).
-    #[arg(long, default_value = crate::master_key::DEFAULT_MASTER_KEY_PATH)]
+    #[arg(long, default_value_os_t = crate::master_key::default_master_key_path())]
     master_key_file: PathBuf,
     #[arg(long, default_value = "/var/lib/harar/harar-signing.key")]
     signing_key_file: PathBuf,
@@ -695,7 +695,7 @@ fn ensure_private_dir(path: &Path, kind: &str) -> Result<()> {
 /// A file only this user can read: their own, with no group or other bits.
 /// The checks are made on the file that was opened, never on a symlink.
 fn read_private_file(path: &Path, kind: &str) -> Result<String> {
-    let mut file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path).with_context(|| format!("open the {kind} {}", path.display()))?;
+    let mut file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path).with_context(|| format!("open the {kind} {}", path.display()))?;
     let metadata = file.metadata()?;
     // SAFETY: geteuid has no preconditions.
     if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } || metadata.permissions().mode() & 0o077 != 0 {
@@ -858,8 +858,12 @@ impl Drop for UidSlot<'_> {
 /// saving in between are never cut off halfway.
 async fn connection(mut stream: UnixStream, primary: &Primary, per_uid: &PerUid, limit: Duration) -> Result<()> {
     let peer = peer_credentials(&stream).context("read the caller's credentials")?;
+    // Over the limit, the caller hears why; nothing is logged, so a flood
+    // can't fill the journal either.
     let Some(_uid_slot) = per_uid.take(peer.uid) else {
-        return Err(anyhow!("uid {} already has {CONNECTIONS_PER_UID} connections open", peer.uid));
+        let reply = serde_json::to_vec(&PrimaryResponse::error("too_many_connections"))?;
+        let _ = tokio::time::timeout(limit, stream.write_all(&reply)).await;
+        return Ok(());
     };
     let bytes = tokio::time::timeout(limit, read_request_bytes(&mut stream)).await.map_err(|_| anyhow!("the caller sent nothing in time"))??;
     let response = match serde_json::from_slice::<PrimaryRequest>(&bytes) {

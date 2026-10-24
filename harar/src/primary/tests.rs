@@ -394,3 +394,20 @@ fn private_files_must_be_private() {
     fs::set_permissions(&audit, fs::Permissions::from_mode(0o600)).unwrap();
     assert!(check_audit_log(&audit).is_ok());
 }
+
+#[tokio::test]
+async fn a_connection_over_the_limit_is_told_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let (primary, _) = primary(dir.path()).await;
+    let per_uid = PerUid::default();
+    // SAFETY: geteuid has no preconditions.
+    let me = unsafe { libc::geteuid() };
+    let _held: Vec<_> = (0..CONNECTIONS_PER_UID).map(|_| per_uid.take(me).unwrap()).collect();
+    let (mut caller, ours) = UnixStream::pair().unwrap();
+    let started = std::time::Instant::now();
+    connection(ours, &primary, &per_uid, Duration::from_secs(5)).await.unwrap();
+    let mut reply = Vec::new();
+    caller.read_to_end(&mut reply).await.unwrap();
+    assert_eq!(serde_json::from_slice::<PrimaryResponse>(&reply).unwrap().error.as_deref(), Some("too_many_connections"));
+    assert!(started.elapsed() < Duration::from_secs(1), "refused before reading anything");
+}
