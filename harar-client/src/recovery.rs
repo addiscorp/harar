@@ -54,11 +54,12 @@ pub struct StoredCode {
 }
 
 /// A code as typed or pasted, reduced to its 16 characters: ASCII letters and
-/// digits only (dashes, spaces and anything else dropped), lowercase, and
+/// digits only (dashes, spaces, and anything a chat app pastes around them,
+/// like non-breaking spaces and Unicode dashes, dropped), lowercase, and
 /// Crockford's look-alikes read as what they look like (o as 0, i and l as 1).
 /// None if it can't be a code.
 fn normalize(code: &str) -> Option<String> {
-    if code.len() > MAX_INPUT || !code.is_ascii() {
+    if code.len() > MAX_INPUT {
         return None;
     }
     let out: String = code
@@ -188,13 +189,20 @@ mod tests {
         let codes = replace_recovery_codes(&mut stored, &sami);
         // Spaces for dashes, capitals.
         assert!(use_recovery_code(&mut stored, &sami, &codes[0].replace('-', " ").to_uppercase()));
-        // Look-alikes: whatever Crockford's 0 and 1 look like.
-        let lookalike = codes[1].replace('0', "O").replace('1', "l");
-        assert!(use_recovery_code(&mut stored, &sami, &lookalike));
+        // Pasted from a chat app: non-breaking spaces and Unicode dashes.
+        let pasted = codes[1].replace('-', "\u{2011}").replace('a', "a\u{00a0}");
+        assert!(use_recovery_code(&mut stored, &sami, &pasted));
         // Not codes at all.
         for junk in ["", "0000-0000-0000-0000", "\u{212a}", &"a".repeat(100), &codes[2][..10]] {
             assert!(!use_recovery_code(&mut stored, &sami, junk), "{junk:?}");
         }
+    }
+
+    #[test]
+    fn crockford_look_alikes_read_as_what_they_look_like() {
+        // A fixed code with 0s and 1s, so the check never passes by luck.
+        assert_eq!(normalize("10O1-lI00-0000-1111").as_deref(), Some("1001110000001111"));
+        assert_eq!(normalize("ABCD-0123-EFGH-4567"), normalize("abcd o123 efgh 4567"));
     }
 
     #[test]

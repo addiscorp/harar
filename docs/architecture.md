@@ -167,15 +167,19 @@ reserved class needs the primary's `reserved_devices` count of distinct keys
 A coordinator agent (a "CTO") may approve the classes a person switched on for
 it (say `deploy.*`, `policy.widen`), including widening other agents' reach, so
 orchestration isn't held up. The safety is in the blast radius and the record:
-- **It can never make another approver**: granting approver rights is
-  reserved. So two coordinators can never promote each other, and only a
-  person widens what any coordinator holds.
+- **It can never make another approver, nor widen one**: granting approver
+  rights is reserved, and a coordinator refuses anything that widens any name
+  holding `approve`. So coordinators can't promote each other, and only a
+  person widens what any approver holds.
 - **Every request says whose reach it widens** (`Reach`: nobody, these
   actors, anything these patterns match, or unknown). It's signed and shown.
   A coordinator never approves an unknown reach, or one that touches itself or
   anything that started it, by name or by a pattern that matches it.
-- It never approves its own request, one from whoever it acts for, from its
-  lineage, or from a sibling under the same agent.
+- Nothing it acts through: it never widens, or approves a request from, what
+  started it, whom it acts for, or anything it started, nor a sibling under
+  the same agent.
+- A device enrolled with a recovery code waits a day before it may approve
+  reserved classes, so a stolen code isn't instant full control.
 - Classes it wasn't given, misspelled ones included, fail closed.
 - The primary adds: every coordinator approval audited with its lineage, a
   daily digest to the person, optional rate limits per class, and revoking its
