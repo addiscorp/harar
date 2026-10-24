@@ -2036,34 +2036,55 @@ async fn persist_current_replication_meta(state: &AppState) -> Result<()> {
 }
 
 /// Reads the replication log. Each line is one entry encrypted to the master
-/// key, because entries carry the values they replicate. Lines written in plain
-/// JSON by older versions are read once and the file is rewritten encrypted.
+/// key, because entries carry the values they replicate.
+///
+/// - A log written in plain JSON by an older version is read once and
+///   rewritten encrypted. Plain lines are accepted only when every line is
+///   plain, so nobody can slip a plain entry into an encrypted log.
+/// - A torn last line (a crash mid-append) is dropped and the file is
+///   rewritten without it. A bad line anywhere else is an error.
+/// - Versions must rise by one from line to line.
 fn load_replication_log(path: &Path, identity: &age::x25519::Identity) -> Result<Vec<ReplicationLogEntry>> {
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
     };
-    let mut plain_lines = false;
-    let entries = contents
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            let json = if line.trim_start().starts_with('{') {
-                plain_lines = true;
-                line.as_bytes().to_vec()
-            } else {
-                let sealed = BASE64
-                    .decode(line.trim())
-                    .with_context(|| format!("decode replication log entry in {}", path.display()))?;
-                age::decrypt(identity, &sealed)
-                    .with_context(|| format!("decrypt replication log entry in {}", path.display()))?
-            };
-            serde_json::from_slice::<ReplicationLogEntry>(&json)
-                .with_context(|| format!("parse replication log entry in {}", path.display()))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if plain_lines {
+    let lines: Vec<&str> = contents.lines().filter(|line| !line.trim().is_empty()).collect();
+    let all_plain = !lines.is_empty() && lines.iter().all(|line| line.trim_start().starts_with('{'));
+    let torn_tail = !contents.is_empty() && !contents.ends_with('\n');
+    let mut entries = Vec::with_capacity(lines.len());
+    let mut rewrite = all_plain;
+    for (index, line) in lines.iter().enumerate() {
+        let entry = if all_plain {
+            serde_json::from_str::<ReplicationLogEntry>(line).map_err(anyhow::Error::from)
+        } else {
+            BASE64
+                .decode(line.trim())
+                .map_err(anyhow::Error::from)
+                .and_then(|sealed| age::decrypt(identity, &sealed).map_err(anyhow::Error::from))
+                .and_then(|json| serde_json::from_slice::<ReplicationLogEntry>(&json).map_err(anyhow::Error::from))
+        };
+        match entry {
+            Ok(entry) => entries.push(entry),
+            Err(_) if torn_tail && index + 1 == lines.len() => {
+                eprintln!("harar: dropping a torn last line in {}", path.display());
+                rewrite = true;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("replication log {} line {} is not a valid entry", path.display(), index + 1));
+            }
+        }
+    }
+    if let Some(pair) = entries.windows(2).find(|pair| pair[1].version != pair[0].version + 1) {
+        return Err(anyhow!(
+            "replication log {} goes from version {} to {}; versions must rise by one",
+            path.display(),
+            pair[0].version,
+            pair[1].version
+        ));
+    }
+    if rewrite {
         rewrite_replication_log(path, &identity.to_public(), &entries)?;
     }
     Ok(entries)
@@ -2085,16 +2106,21 @@ fn rewrite_replication_log(
     for entry in entries {
         text.push_str(&sealed_replication_line(recipient, entry)?);
     }
-    let tmp = path.with_extension(format!("rewrite-{}", std::process::id()));
+    // A fixed name: one left by a crash is simply overwritten next time.
+    let tmp = path.with_extension("log.rewrite");
     let mut file = OpenOptions::new()
         .write(true)
-        .create_new(true)
+        .create(true)
+        .truncate(true)
         .mode(0o600)
         .open(&tmp)
         .with_context(|| format!("create {}", tmp.display()))?;
     file.write_all(text.as_bytes()).context("write replication log")?;
     file.sync_all().context("sync replication log")?;
     fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))?;
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent).and_then(|dir| dir.sync_all()).with_context(|| format!("sync {}", parent.display()))?;
+    }
     try_chown(path, Some("gild-vault"), None);
     Ok(())
 }
@@ -3703,6 +3729,71 @@ mod tests {
         assert!(response.ok);
         assert!(state.replication_log_path.exists(), "the put was replicated");
         assert_eq!(files_containing(dir.path(), value.as_bytes()), Vec::<PathBuf>::new());
+    }
+
+    fn log_entry(version: u64, value: &str) -> ReplicationLogEntry {
+        ReplicationLogEntry {
+            version,
+            timestamp: 1,
+            op: "put".to_string(),
+            key: format!("K{version}"),
+            value: Some(value.to_string()),
+        }
+    }
+
+    #[test]
+    fn a_rewrite_left_behind_by_a_crash_does_not_stop_the_next_start() {
+        let dir = tempdir().unwrap();
+        let identity = age::x25519::Identity::generate();
+        let path = dir.path().join("keys.replication.log");
+        fs::write(path.with_extension("log.rewrite"), b"half a rewrite").unwrap();
+        fs::write(&path, format!("{}\n", serde_json::to_string(&log_entry(1, "v1")).unwrap())).unwrap();
+        assert_eq!(load_replication_log(&path, &identity).unwrap(), vec![log_entry(1, "v1")]);
+        assert!(!path.with_extension("log.rewrite").exists(), "the rewrite took its place");
+    }
+
+    #[test]
+    fn a_torn_last_line_is_dropped_and_the_log_keeps_working() {
+        let dir = tempdir().unwrap();
+        let identity = age::x25519::Identity::generate();
+        let path = dir.path().join("keys.replication.log");
+        append_persistent_replication_log(&path, &identity.to_public(), &log_entry(1, "v1")).unwrap();
+        append_persistent_replication_log(&path, &identity.to_public(), &log_entry(2, "v2")).unwrap();
+        // A crash halfway through writing the third line.
+        let third = sealed_replication_line(&identity.to_public(), &log_entry(3, "v3")).unwrap();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&third.as_bytes()[..third.len() / 2]).unwrap();
+        drop(file);
+
+        assert_eq!(load_replication_log(&path, &identity).unwrap(), vec![log_entry(1, "v1"), log_entry(2, "v2")]);
+        append_persistent_replication_log(&path, &identity.to_public(), &log_entry(3, "v3")).unwrap();
+        assert_eq!(load_replication_log(&path, &identity).unwrap().len(), 3, "the next append lands on its own line");
+    }
+
+    #[test]
+    fn a_damaged_or_reordered_log_is_refused() {
+        let dir = tempdir().unwrap();
+        let identity = age::x25519::Identity::generate();
+        let recipient = identity.to_public();
+        let path = dir.path().join("keys.replication.log");
+
+        // A plain line slipped into an encrypted log.
+        append_persistent_replication_log(&path, &recipient, &log_entry(1, "v1")).unwrap();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "{}", serde_json::to_string(&log_entry(2, "planted")).unwrap()).unwrap();
+        drop(file);
+        assert!(load_replication_log(&path, &identity).is_err());
+
+        // A bad line that isn't the last one.
+        let sealed = |entry: &ReplicationLogEntry| sealed_replication_line(&recipient, entry).unwrap();
+        fs::write(&path, format!("{}garbage\n{}", sealed(&log_entry(1, "v1")), sealed(&log_entry(2, "v2")))).unwrap();
+        assert!(load_replication_log(&path, &identity).is_err());
+
+        // Versions out of order, or with a gap.
+        fs::write(&path, format!("{}{}", sealed(&log_entry(2, "v2")), sealed(&log_entry(1, "v1")))).unwrap();
+        assert!(load_replication_log(&path, &identity).unwrap_err().to_string().contains("rise by one"));
+        fs::write(&path, format!("{}{}", sealed(&log_entry(1, "v1")), sealed(&log_entry(3, "v3")))).unwrap();
+        assert!(load_replication_log(&path, &identity).is_err());
     }
 
     #[test]
