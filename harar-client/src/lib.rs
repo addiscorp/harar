@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use base64::Engine;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand_core::{OsRng, RngCore};
 use seam_ir::{SeamBoundary, SeamContract, SeamDefinition, SeamPrimitive, SeamRecord, SeamType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -12,6 +12,7 @@ use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
 pub mod model;
+pub mod oidc;
 
 const DEFAULT_SOCKET_PATH: &str = "/run/tana-vault.sock";
 pub const DEFAULT_GILD_VAULT_SOCKET_PATH: &str = "/run/harar.sock";
@@ -200,6 +201,9 @@ pub struct Jwk {
     #[serde(rename = "use")]
     pub key_use: String,
     pub x: String,
+    /// Only on EC keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -293,6 +297,17 @@ enum VaultRequest<'a> {
         jti: &'a str,
     },
     Health,
+    Token(&'a oidc::TokenAsk),
+    WorkloadAdd(&'a oidc::Workload),
+    WorkloadRemove {
+        sub: &'a str,
+    },
+    Grant(&'a oidc::Grant),
+    Ungrant {
+        sub: &'a str,
+        audience: &'a str,
+    },
+    Identity,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -314,6 +329,8 @@ struct VaultResponse {
     scopes: Option<Vec<String>>,
     valid: Option<bool>,
     sub: Option<String>,
+    claims: Option<oidc::IdentityClaims>,
+    identity: Option<oidc::IdentityPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -714,6 +731,55 @@ impl VaultClient {
         })
     }
 
+    /// An identity token for this process's workload.
+    pub async fn token(
+        &self,
+        ask: &oidc::TokenAsk,
+    ) -> Result<(String, oidc::IdentityClaims), VaultClientError> {
+        let response = self.identity_request(&VaultRequest::Token(ask), "token_failed").await?;
+        match (response.token, response.claims) {
+            (Some(token), Some(claims)) => Ok((token, claims)),
+            _ => Err(VaultClientError::InvalidResponse("missing token".to_string())),
+        }
+    }
+
+    pub async fn workload_add(&self, workload: &oidc::Workload) -> Result<oidc::IdentityPolicy, VaultClientError> {
+        self.policy_request(&VaultRequest::WorkloadAdd(workload)).await
+    }
+
+    pub async fn workload_remove(&self, sub: &str) -> Result<oidc::IdentityPolicy, VaultClientError> {
+        self.policy_request(&VaultRequest::WorkloadRemove { sub }).await
+    }
+
+    pub async fn grant(&self, grant: &oidc::Grant) -> Result<oidc::IdentityPolicy, VaultClientError> {
+        self.policy_request(&VaultRequest::Grant(grant)).await
+    }
+
+    pub async fn ungrant(&self, sub: &str, audience: &str) -> Result<oidc::IdentityPolicy, VaultClientError> {
+        self.policy_request(&VaultRequest::Ungrant { sub, audience }).await
+    }
+
+    /// The issuer's workloads and grants.
+    pub async fn identity(&self) -> Result<oidc::IdentityPolicy, VaultClientError> {
+        self.policy_request(&VaultRequest::Identity).await
+    }
+
+    async fn policy_request(&self, request: &VaultRequest<'_>) -> Result<oidc::IdentityPolicy, VaultClientError> {
+        self.identity_request(request, "identity_failed")
+            .await?
+            .identity
+            .ok_or_else(|| VaultClientError::InvalidResponse("missing identity".to_string()))
+    }
+
+    async fn identity_request(&self, request: &VaultRequest<'_>, fallback: &str) -> Result<VaultResponse, VaultClientError> {
+        let response = self.request(request).await?;
+        if response.ok {
+            Ok(response)
+        } else {
+            Err(VaultClientError::Vault(response.error.unwrap_or_else(|| fallback.to_string())))
+        }
+    }
+
     async fn request(&self, request: &VaultRequest<'_>) -> Result<VaultResponse, VaultClientError> {
         let mut stream = UnixStream::connect(&self.socket_path)
             .await
@@ -983,6 +1049,7 @@ pub fn jwks_for_key(verifying_key: &VerifyingKey) -> Jwks {
             alg: "EdDSA".to_string(),
             key_use: "sig".to_string(),
             x: b64_url(verifying_key.as_bytes()),
+            y: None,
         }],
     }
 }
@@ -1052,37 +1119,8 @@ pub fn verify_token(
             "token alg must be EdDSA".to_string(),
         ));
     }
-    let kid = header
-        .get("kid")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| TokenError::InvalidToken("missing kid".to_string()))?;
-    let jwk = jwks
-        .keys
-        .iter()
-        .find(|key| key.kid == kid)
-        .ok_or(TokenError::KeyNotFound)?;
-    if jwk.kty != "OKP" || jwk.crv != "Ed25519" || jwk.alg != "EdDSA" {
-        return Err(TokenError::InvalidToken("unsupported jwk".to_string()));
-    }
-    let key_bytes = b64_url_decode(&jwk.x)?;
-    let key_array: [u8; 32] = key_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| TokenError::InvalidToken("bad Ed25519 key".to_string()))?;
-    let verifying_key = VerifyingKey::from_bytes(&key_array)
-        .map_err(|_| TokenError::InvalidToken("bad Ed25519 key".to_string()))?;
-    let signature_bytes = b64_url_decode(parts[2])?;
-    let signature_array: [u8; 64] = signature_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| TokenError::InvalidToken("bad signature length".to_string()))?;
-    let signature = Signature::from_bytes(&signature_array);
-    let signing_input = format!("{}.{}", parts[0], parts[1]);
-    verifying_key
-        .verify(signing_input.as_bytes(), &signature)
-        .map_err(|_| TokenError::BadSignature)?;
-
-    let claims: TokenClaims = serde_json::from_slice(&b64_url_decode(parts[1])?)
+    let payload = oidc::verify_signature(jwks, token)?;
+    let claims: TokenClaims = serde_json::from_slice(&payload)
         .map_err(|err| TokenError::Json(err.to_string()))?;
     if claims.iss != ISSUER {
         return Err(TokenError::InvalidToken("wrong issuer".to_string()));
