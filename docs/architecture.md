@@ -292,7 +292,11 @@ primary is its own root; Addis services accept its tokens only through trust row
 
 ## 11. From the current code
 
-| Today | Becomes |
+The primary runs on this model only (#56): `harar serve --org`, `harar policy`
+and `harar token` decide by actors, zones and bindings, and the old workload,
+grant, mint, proxy and setup commands are gone.
+
+| Before | Now |
 |---|---|
 | Mac agent, Secure Enclave master key, `run`, `import`, `inject`, plugins, SSH (#14–#21, merged) | Kept as is: the personal vault |
 | Issuer, JWKS, token verification (#30) | Kept; claims extended per section 5 |
@@ -309,7 +313,7 @@ PRs #31–#36 stay open as reference until their code is moved over.
 
 ## 12. Decided
 
-- **The Addis primary is bugsy** (a Mac): `harar serve --postgres … --org gg.addis`.
+- **The Addis primary is bugsy** (a Mac): `harar serve --postgres-file … --org gg.addis`.
   - Its key ladder starts at bugsy's Secure Enclave, with a key that doesn't
     require presence, so the primary restarts with nobody there. The chip
     still keeps the key from being copied.

@@ -96,11 +96,8 @@ pub fn default_recovery_path(master_key_path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-pub fn load_master_key() -> Result<age::x25519::Identity> {
-    let path = std::env::var_os("GILD_VAULT_MASTER_KEY_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(default_master_key_path);
-    FileMasterKeySource::new(path)
+pub fn load_master_key(path: &Path) -> Result<age::x25519::Identity> {
+    FileMasterKeySource::new(path.to_path_buf())
         .load()?
         .ok_or_else(|| anyhow!("master key source returned none"))
 }

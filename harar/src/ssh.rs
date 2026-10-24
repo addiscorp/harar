@@ -6,7 +6,7 @@
 //! every terminal session approved once.
 
 use crate::agent::{Vault, session_of};
-use crate::peer_credentials;
+use crate::common::peer_credentials;
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;

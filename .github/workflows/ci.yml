@@ -57,13 +57,6 @@ jobs:
           sccache --start-server
           sccache --show-stats | tee sccache-stats.txt
           grep -q "$SCCACHE_BUCKET" sccache-stats.txt || { echo "::error::sccache is not using the R2 bucket $SCCACHE_BUCKET"; exit 1; }
-      # The real-topology tests run the daemon as a second uid inside an
-      # unprivileged user namespace, which Ubuntu's AppArmor blocks by default.
-      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-      # The custody test maps its uid onto the git-server user, uid 994.
-      - run: |
-          getent passwd 994 || sudo useradd --system --uid 994 --no-create-home git-server
-          test "$(getent passwd 994 | cut -d: -f1)" = git-server
       - run: cargo check --locked --workspace --all-targets
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --locked --workspace

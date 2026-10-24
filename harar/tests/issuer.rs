@@ -1,6 +1,6 @@
-//! Starts a real `harar serve` as an OIDC issuer, sets up a workload and a
-//! grant with the CLI, then checks its tokens the way a receiver would: by
-//! fetching the discovery document and JWKS over HTTP.
+//! Starts a real `harar serve` as a new primary owned by whoever runs the
+//! test, drives it with the CLI, and checks its tokens the way a receiver
+//! would: by fetching the discovery document and JWKS over HTTP.
 
 use age::secrecy::ExposeSecret;
 use harar_client::Jwks;
@@ -9,53 +9,57 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const AUD: &str = "https://api.example.test";
+const OWNER: &str = "gg.addis.human.owner";
 
-struct Issuer {
+struct Primary {
     child: Child,
     socket: PathBuf,
     address: String,
     url: String,
+    /// More `harar serve` flags, kept for a restart.
+    extra: Vec<String>,
     _dir: tempfile::TempDir,
 }
 
-impl Drop for Issuer {
+impl Drop for Primary {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
 
-impl Issuer {
+impl Primary {
     fn start() -> Self {
-        let dir = tempfile::Builder::new().prefix("hi").tempdir().unwrap();
+        Self::start_with(vec![])
+    }
+
+    fn start_with(extra: Vec<String>) -> Self {
+        let dir = tempfile::Builder::new().prefix("hp").tempdir().unwrap();
         let state = dir.path().join("state");
         fs::create_dir(&state).unwrap();
         fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
         let key = dir.path().join("master.key");
         fs::write(&key, age::x25519::Identity::generate().to_string().expose_secret()).unwrap();
         fs::set_permissions(&key, fs::Permissions::from_mode(0o400)).unwrap();
-        fs::write(dir.path().join("replication-token"), "test-replication-token\n").unwrap();
-        Self::spawn(dir)
+        Self::spawn(dir, extra)
     }
 
-    /// Stops this issuer and starts another on the same state.
+    /// Stops this primary and starts another on the same state.
     fn restart(mut self) -> Self {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = fs::remove_file(&self.socket);
         let dir = std::mem::replace(&mut self._dir, tempfile::tempdir().unwrap());
-        Self::spawn(dir)
+        Self::spawn(dir, std::mem::take(&mut self.extra))
     }
 
-    fn spawn(dir: tempfile::TempDir) -> Self {
+    fn spawn(dir: tempfile::TempDir, extra: Vec<String>) -> Self {
         let state = dir.path().join("state");
-        let key = dir.path().join("master.key");
-        let replication = dir.path().join("replication-token");
         let socket = dir.path().join("harar.sock");
         let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let address = format!("127.0.0.1:{port}");
@@ -64,38 +68,44 @@ impl Issuer {
         let child = Command::new(env!("CARGO_BIN_EXE_harar"))
             .arg("serve")
             .args(["--socket", &path(socket.clone())])
+            .args(["--org", "gg.addis", "--machine", "testbox", "--owner", OWNER, "--owner-user", &me()])
             .args(["--state-path", &path(state.join("keys.age"))])
             .args(["--audit-log", &path(dir.path().join("audit.log"))])
-            .args(["--replication-token-file", &path(replication)])
             .args(["--signing-key-file", &path(state.join("signing.key"))])
             .args(["--issuer", &url, "--public-listen", &address])
-            .env("GILD_VAULT_MASTER_KEY_PATH", &key)
+            .args(&extra)
+            .args(["--master-key-file", &path(dir.path().join("master.key"))])
             .stdout(Stdio::null())
             .stderr(fs::File::create(dir.path().join("serve.log")).unwrap())
             .spawn()
             .expect("spawn harar serve");
+        // Hold it first, so a failed start below still stops it.
+        let primary = Primary { child, socket, address, url, extra, _dir: dir };
         // Generous: macOS scans a freshly built binary on its first runs.
         let deadline = Instant::now() + Duration::from_secs(30);
-        while std::os::unix::net::UnixStream::connect(&socket).is_err() || TcpStream::connect(&address).is_err() {
-            let log = fs::read_to_string(dir.path().join("serve.log")).unwrap_or_default();
+        while std::os::unix::net::UnixStream::connect(&primary.socket).is_err() || TcpStream::connect(&primary.address).is_err() {
+            let log = fs::read_to_string(primary._dir.path().join("serve.log")).unwrap_or_default();
             assert!(Instant::now() < deadline, "harar serve did not start: {log}");
             std::thread::sleep(Duration::from_millis(25));
         }
-        Issuer { child, socket, address, url, _dir: dir }
+        primary
     }
 
     fn harar(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_harar"))
-            .args(args)
-            .env("HARAR_SOCKET", &self.socket)
-            .output()
-            .expect("run harar")
+        Command::new(env!("CARGO_BIN_EXE_harar")).args(args).env("HARAR_SOCKET", &self.socket).output().expect("run harar")
     }
 
     fn ok(&self, args: &[&str]) -> serde_json::Value {
         let out = self.harar(args);
         assert!(out.status.success(), "harar {args:?}: {}", String::from_utf8_lossy(&out.stderr));
         serde_json::from_slice(&out.stdout).unwrap()
+    }
+
+    fn refused(&self, args: &[&str], reason: &str) {
+        let out = self.harar(args);
+        assert!(!out.status.success(), "{args:?} was allowed");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(reason), "{args:?}: {stderr}");
     }
 
     /// A plain HTTP request to the public listener: (status, body).
@@ -114,8 +124,7 @@ impl Issuer {
         assert_eq!(status, 200);
         assert_eq!(discovery["issuer"], self.url);
         let jwks_uri = discovery["jwks_uri"].as_str().unwrap();
-        let path = jwks_uri.strip_prefix(&self.url).unwrap();
-        let (status, jwks) = self.http("GET", path);
+        let (status, jwks) = self.http("GET", jwks_uri.strip_prefix(&self.url).unwrap());
         assert_eq!(status, 200);
         serde_json::from_value(jwks).unwrap()
     }
@@ -130,87 +139,168 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
 
-fn grant_me(issuer: &Issuer) {
-    issuer.ok(&["workload", "add", "svc:ci@test", "--user", &me()]);
-    issuer.ok(&["policy", "allow", "svc:ci@test", "--aud", AUD, "--scope", "deploy:*", "--may-act-for", "agent:*"]);
-}
-
 #[test]
 fn tokens_verify_against_the_published_discovery_and_jwks() {
-    let issuer = Issuer::start();
-    grant_me(&issuer);
-    let jwks = issuer.jwks();
+    let primary = Primary::start();
+    let jwks = primary.jwks();
     assert_eq!(jwks.keys.iter().map(|k| k.alg.as_str()).collect::<Vec<_>>(), ["ES256", "EdDSA"]);
-
     for alg in ["ES256", "EdDSA"] {
-        let out = issuer.ok(&[
-            "token", "--aud", AUD, "--scope", "deploy:staging", "--act", "agent:ava", "--session", "s_123", "--alg", alg,
-        ]);
-        let token = out["token"].as_str().unwrap();
-        let claims: IdentityClaims = oidc::verify_identity(&jwks, token, &issuer.url, AUD, now()).unwrap();
-        assert_eq!(claims.sub, "svc:ci@test", "the subject comes from the calling OS user");
+        let out = primary.ok(&["token", "--aud", AUD, "--scope", "deploy:staging", "--alg", alg]);
+        let claims: IdentityClaims = oidc::verify_identity(&jwks, out["token"].as_str().unwrap(), &primary.url, AUD, now()).unwrap();
+        assert_eq!(claims.sub, OWNER, "the subject comes from the calling OS user");
+        assert_eq!(claims.extra["zone"], "gg.addis.zone.testbox");
+        assert_eq!(claims.extra["via"], "gg.addis.broker.testbox");
         assert!(claims.has_scope("deploy:staging"));
-        assert_eq!(claims.act.as_ref().unwrap().sid.as_deref(), Some("s_123"));
         assert_eq!(claims.exp - claims.iat, oidc::DEFAULT_TTL_SECONDS);
         assert_eq!(serde_json::to_value(&claims).unwrap(), out["claims"]);
     }
-
-    let raw = issuer.harar(&["token", "--aud", AUD, "--ttl", "1h", "--raw"]);
+    let raw = primary.harar(&["token", "--aud", AUD, "--ttl", "1h", "--raw"]);
     assert!(raw.status.success());
-    let token = String::from_utf8(raw.stdout).unwrap();
-    let claims = oidc::verify_identity(&jwks, token.trim(), &issuer.url, AUD, now()).unwrap();
+    let claims = oidc::verify_identity(&jwks, String::from_utf8(raw.stdout).unwrap().trim(), &primary.url, AUD, now()).unwrap();
     assert_eq!(claims.exp - claims.iat, 3600);
+    primary.refused(&["token", "--aud", AUD, "--ttl", "61m"], "token_refused");
 }
 
 #[test]
-fn the_issuer_refuses_what_was_not_granted() {
-    let issuer = Issuer::start();
-    let refused = |args: &[&str], reason: &str| {
-        let out = issuer.harar(args);
-        assert!(!out.status.success(), "{args:?} was allowed");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains(reason), "{args:?}: {stderr}");
-    };
-    refused(&["token", "--aud", AUD], "not_a_workload");
-    grant_me(&issuer);
-    refused(&["token", "--aud", "https://other.example.test"], "audience_not_granted");
-    refused(&["token", "--aud", AUD, "--scope", "admin:all"], "scope_not_granted");
-    refused(&["token", "--aud", AUD, "--act", "user:sami"], "act_not_granted");
-    refused(&["token", "--aud", AUD, "--ttl", "61m"], "ttl_out_of_bounds");
+fn secrets_and_policy_through_the_cli() {
+    let primary = Primary::start();
+    let mut put = Command::new(env!("CARGO_BIN_EXE_harar"));
+    put.args(["put", "prod/site/DATABASE_URL", "--secret-stdin"]).env("HARAR_SOCKET", &primary.socket).stdin(Stdio::piped()).stdout(Stdio::piped());
+    let mut child = put.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"postgres://site\n").unwrap();
+    assert!(child.wait_with_output().unwrap().status.success());
+    assert_eq!(primary.ok(&["get", "prod/site/DATABASE_URL"])["value"], "postgres://site");
 
-    let test = issuer.ok(&["policy", "test", &me(), "--aud", AUD, "--scope", "deploy:prod"]);
-    assert_eq!(test["allowed"], true);
-    assert_eq!(test["sub"], "svc:ci@test");
-    let test = issuer.ok(&["policy", "test", "someone-else", "--aud", AUD]);
-    assert_eq!(test["reason"], "not_a_workload");
+    primary.ok(&["policy", "role", "set", "gg.addis.role.site", "--read", "prod/site/*", "--token", &format!("{AUD} deploy:site")]);
+    primary.ok(&["policy", "bind", "gg.addis.service.site", "--role", "gg.addis.role.site", "--zone", "gg.addis.zone.testbox"]);
+    let shown = primary.ok(&["policy", "show"]);
+    assert_eq!(shown["users"][me()], OWNER);
+    assert_eq!(shown["policy"]["bindings"].as_array().unwrap().len(), 2);
 
-    issuer.ok(&["policy", "remove", "svc:ci@test", "--aud", AUD]);
-    refused(&["token", "--aud", AUD], "audience_not_granted");
-    issuer.ok(&["workload", "remove", "svc:ci@test"]);
-    refused(&["token", "--aud", AUD], "not_a_workload");
+    let test = |args: &[&str]| primary.ok(&[&["policy", "test", "--actor", "gg.addis.service.site"][..], args].concat())["decision"].as_str().unwrap().to_string();
+    assert_eq!(test(&["--read", "prod/site/DATABASE_URL"]), "allow by gg.addis.role.site");
+    assert_eq!(test(&["--read", "prod/billing/KEY"]), "no_binding");
+    assert_eq!(test(&["--token", &format!("{AUD} deploy:site")]), "allow by gg.addis.role.site");
+    assert_eq!(test(&["--token", &format!("{AUD} admin")]), "no_binding");
+
+    primary.refused(&["policy", "user", "unmap", &me()], "would_lock_out");
+    primary.refused(&["get", "harar:policy"], "reserved_key");
 }
 
 #[test]
 fn the_public_listener_serves_only_discovery_and_keys() {
-    let issuer = Issuer::start();
-    issuer.ok(&["workload", "add", "svc:ci@test", "--user", &me()]);
-    let listed = issuer.ok(&["workload", "list"]);
-    assert_eq!(listed[0]["sub"], "svc:ci@test");
-
-    // Over the socket, the vault answers this; over TCP, nothing does.
-    assert_eq!(issuer.http("GET", "/v1/secret/harar:identity").0, 404);
-    assert_eq!(issuer.http("POST", oidc::JWKS_PATH).0, 405);
-    assert_eq!(issuer.http("GET", "/replication/snapshot").0, 404);
-    assert_eq!(issuer.http("GET", oidc::JWKS_PATH).0, 200);
+    let primary = Primary::start();
+    assert_eq!(primary.http("GET", "/v1/secret/prod/site/DATABASE_URL").0, 404);
+    assert_eq!(primary.http("POST", oidc::JWKS_PATH).0, 405);
+    assert_eq!(primary.http("GET", oidc::JWKS_PATH).0, 200);
+    assert_eq!(primary.http("GET", oidc::DISCOVERY_PATH).0, 200);
 }
 
 #[test]
-fn keys_and_rules_survive_a_restart() {
-    let issuer = Issuer::start();
-    grant_me(&issuer);
-    let before = issuer.jwks();
-    let issuer = issuer.restart();
-    assert_eq!(issuer.jwks(), before, "the signing keys were read back, not regenerated");
-    let token = issuer.ok(&["token", "--aud", AUD, "--scope", "deploy:staging"]);
-    assert!(oidc::verify_identity(&before, token["token"].as_str().unwrap(), &issuer.url, AUD, now()).is_ok());
+fn keys_secrets_and_policy_survive_a_restart() {
+    let primary = Primary::start();
+    primary.ok(&["policy", "role", "set", "gg.addis.role.kept", "--read", "kept/*"]);
+    let before = primary.jwks();
+    let primary = primary.restart();
+    assert_eq!(primary.jwks(), before, "the signing keys were read back, not regenerated");
+    let roles = primary.ok(&["policy", "show"])["policy"]["roles"].clone();
+    assert!(roles.as_array().unwrap().iter().any(|role| role["name"] == "gg.addis.role.kept"));
+    let token = primary.ok(&["token", "--aud", AUD]);
+    assert!(oidc::verify_identity(&before, token["token"].as_str().unwrap(), &primary.url, AUD, now()).is_ok());
+}
+
+/// Runs one statement against the test database and returns every bytea and
+/// text cell it produced, as bytes.
+fn sql(url: &str, statement: &str) -> Vec<Vec<u8>> {
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    runtime.block_on(async {
+        let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls).await.unwrap();
+        tokio::spawn(connection);
+        let mut cells = Vec::new();
+        for message in client.simple_query(statement).await.unwrap() {
+            if let tokio_postgres::SimpleQueryMessage::Row(row) = message {
+                cells.extend((0..row.len()).filter_map(|i| row.get(i).map(|cell| cell.as_bytes().to_vec())));
+            }
+        }
+        cells
+    })
+}
+
+#[test]
+fn a_postgres_primary_keeps_secrets_and_policy_encrypted_across_a_restart() {
+    let Ok(url) = std::env::var("HARAR_TEST_DATABASE_URL") else {
+        assert!(std::env::var_os("HARAR_TEST_NO_POSTGRES").is_some(), "set HARAR_TEST_DATABASE_URL to a disposable Postgres, or HARAR_TEST_NO_POSTGRES=1 where there is none");
+        eprintln!("SKIPPED: no Postgres on this machine (HARAR_TEST_NO_POSTGRES)");
+        return;
+    };
+    // The primary's schema has a fixed name; the test database is disposable.
+    sql(&url, "DROP SCHEMA IF EXISTS harar_primary CASCADE");
+    let conninfo = tempfile::Builder::new().prefix("hpg").tempdir().unwrap();
+    let file = conninfo.path().join("postgres");
+    fs::write(&file, &url).unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    let primary = Primary::start_with(vec!["--postgres-file".into(), file.to_str().unwrap().into()]);
+    let mut put = Command::new(env!("CARGO_BIN_EXE_harar"));
+    put.args(["put", "prod/site/DATABASE_URL", "--secret-stdin"]).env("HARAR_SOCKET", &primary.socket).stdin(Stdio::piped()).stdout(Stdio::piped());
+    let mut child = put.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"postgres://plaintext-marker\n").unwrap();
+    assert!(child.wait_with_output().unwrap().status.success());
+    primary.ok(&["policy", "role", "set", "gg.addis.role.kept", "--read", "kept/*"]);
+
+    let primary = primary.restart();
+    assert_eq!(primary.ok(&["get", "prod/site/DATABASE_URL"])["value"], "postgres://plaintext-marker");
+    let roles = primary.ok(&["policy", "show"])["policy"]["roles"].clone();
+    assert!(roles.as_array().unwrap().iter().any(|role| role["name"] == "gg.addis.role.kept"));
+
+    let paths = sql(&url, "SELECT path FROM harar_primary.secrets");
+    assert!(paths.contains(&b"prod/site/DATABASE_URL".to_vec()) && paths.contains(&b"harar:policy".to_vec()), "both live in Postgres");
+    let stored = sql(&url, "SELECT encode(ciphertext, 'escape') FROM harar_primary.secrets").concat();
+    for plaintext in [&b"plaintext-marker"[..], b"gg.addis.role.kept", b"gg.addis.human.owner"] {
+        assert!(!stored.windows(plaintext.len()).any(|w| w == plaintext), "{} is stored in the clear", String::from_utf8_lossy(plaintext));
+    }
+}
+
+/// Runs a `harar serve` that must refuse to start, and returns what it said.
+/// One that starts anyway is stopped and fails the test, rather than hanging it.
+fn refused_to_start(command: &mut Command) -> String {
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let mut child = command.stdout(Stdio::null()).stderr(log.reopen().unwrap()).spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("a second primary started: {}", fs::read_to_string(log.path()).unwrap_or_default());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(!status.success());
+    fs::read_to_string(log.path()).unwrap()
+}
+
+#[test]
+fn a_second_primary_on_the_same_state_refuses_to_start() {
+    let primary = Primary::start();
+    let dir = primary._dir.path();
+    let state = dir.join("state");
+    let serve = |socket: &Path, state: &Path, audit: &str| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_harar"));
+        command
+            .arg("serve")
+            .args(["--socket", socket.to_str().unwrap(), "--org", "gg.addis", "--machine", "testbox", "--owner", OWNER])
+            .args(["--state-path", state.join("keys.age").to_str().unwrap()])
+            .args(["--audit-log", dir.join(audit).to_str().unwrap()])
+            .args(["--signing-key-file", state.join("signing.key").to_str().unwrap()])
+            .args(["--master-key-file", dir.join("master.key").to_str().unwrap()]);
+        command
+    };
+    let said = refused_to_start(&mut serve(&dir.join("other.sock"), &state, "audit.log"));
+    assert!(said.contains("another harar primary is using this state folder"), "{said}");
+    // Nor may anything take over a socket a live primary serves.
+    let said = refused_to_start(&mut serve(&primary.socket, &dir.join("state2"), "audit2.log"));
+    assert!(said.contains("another harar is serving"), "{said}");
+    assert_eq!(primary.ok(&["policy", "show"])["users"][me()], OWNER, "the first one still answers");
 }
