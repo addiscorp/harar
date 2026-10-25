@@ -398,7 +398,11 @@ pub fn valid_host(host: &str) -> bool {
     let label = |l: &&str| {
         !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
     };
-    host.len() <= 253 && labels.len() >= 2 && labels.iter().all(label) && !labels.last().unwrap().bytes().all(|b| b.is_ascii_digit())
+    // The last label has a letter, and isn't hex (`0x7f`): nothing a resolver
+    // reads as an address.
+    let last = labels.last().unwrap();
+    let not_an_address = last.bytes().any(|b| b.is_ascii_lowercase()) && !last.starts_with("0x");
+    host.len() <= 253 && labels.len() >= 2 && labels.iter().all(label) && not_an_address
 }
 
 pub fn valid_host_pattern(pattern: &str) -> bool {
@@ -933,7 +937,7 @@ mod tests {
         for good in ["api.stripe.com", "a.b", "x-1.example.co", "*.stripe.com"] {
             assert!(valid_host_pattern(good), "{good}");
         }
-        for bad in ["localhost", "10.0.0.1", "API.stripe.com", "*.com.", "a..b", "-a.b", "*", "*.", "stripe.com:443", "a.b/c", "**.b.c"] {
+        for bad in ["localhost", "10.0.0.1", "127.0x1", "a.0x7f", "a.123", "API.stripe.com", "*.com.", "a..b", "-a.b", "*", "*.", "stripe.com:443", "a.b/c", "**.b.c"] {
             assert!(!valid_host_pattern(bad), "{bad}");
         }
         assert!(!valid_host("*.stripe.com"), "a host sent to is never a pattern");

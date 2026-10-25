@@ -54,9 +54,23 @@ fn reserved(key: &str) -> bool {
     key.starts_with(RESERVED_PREFIX)
 }
 
-/// Each secret, and the host patterns it may go to.
-fn hosts_of(keys: &HashMap<String, String>) -> std::collections::BTreeMap<String, Vec<String>> {
-    keys.get(HOSTS_KEY).and_then(|text| serde_json::from_str(text).ok()).unwrap_or_default()
+/// Each secret, and the host patterns it may go to. A list that doesn't read
+/// is an error, never an empty list a change would write over.
+fn hosts_of(keys: &HashMap<String, String>) -> Result<std::collections::BTreeMap<String, Vec<String>>, &'static str> {
+    match keys.get(HOSTS_KEY) {
+        None => Ok(Default::default()),
+        Some(text) => serde_json::from_str(text).map_err(|_| "hosts_unreadable"),
+    }
+}
+
+/// `next` without `key`'s hosts: a secret removed or replaced goes nowhere
+/// until the owner says again, so a new value never inherits an old one's hosts.
+fn forget_hosts(next: &mut HashMap<String, String>, key: &str) -> Result<(), &'static str> {
+    let mut all = hosts_of(next)?;
+    if all.remove(key).is_some() {
+        next.insert(HOSTS_KEY.into(), serde_json::to_string(&all).expect("hosts serialize"));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -205,10 +219,13 @@ impl Vault {
                 Some(value) => VaultResponse { value: Some(value.clone()), ..VaultResponse::ok() },
                 None => VaultResponse::error("not_found"),
             },
-            AgentRequest::Hosts { key } => VaultResponse { hosts: Some(hosts_of(&unlocked.keys).remove(&key).unwrap_or_default()), ..VaultResponse::ok() },
+            AgentRequest::Hosts { key } => match hosts_of(&unlocked.keys) {
+                Ok(mut all) => VaultResponse { hosts: Some(all.remove(&key).unwrap_or_default()), ..VaultResponse::ok() },
+                Err(reason) => VaultResponse::error(reason),
+            },
             AgentRequest::Send { key, host } => {
                 let allowed = harar_client::model::valid_host(&host)
-                    && hosts_of(&unlocked.keys).get(&key).is_some_and(|hosts| hosts.iter().any(|pattern| harar_client::model::host_matches(pattern, &host)));
+                    && hosts_of(&unlocked.keys).is_ok_and(|all| all.get(&key).is_some_and(|hosts| hosts.iter().any(|pattern| harar_client::model::host_matches(pattern, &host))));
                 match unlocked.keys.get(&key) {
                     _ if !allowed || reserved(&key) => VaultResponse::error("not_allowed"),
                     Some(value) => VaultResponse { value: Some(value.clone()), ..VaultResponse::ok() },
@@ -219,7 +236,10 @@ impl Vault {
                 if reserved(&key) || !harar_client::model::valid_secret_path(&key) || !harar_client::model::valid_host_pattern(&host) {
                     return AgentReply::Vault(Box::new(VaultResponse::error("bad_host")));
                 }
-                let mut all = hosts_of(&unlocked.keys);
+                let mut all = match hosts_of(&unlocked.keys) {
+                    Ok(all) => all,
+                    Err(reason) => return AgentReply::Vault(Box::new(VaultResponse::error(reason))),
+                };
                 let hosts = all.entry(key).or_default();
                 if !hosts.contains(&host) {
                     hosts.push(host);
@@ -230,7 +250,10 @@ impl Vault {
                 self.persist(next)
             }
             AgentRequest::RevokeHost { key, host } => {
-                let mut all = hosts_of(&unlocked.keys);
+                let mut all = match hosts_of(&unlocked.keys) {
+                    Ok(all) => all,
+                    Err(reason) => return AgentReply::Vault(Box::new(VaultResponse::error(reason))),
+                };
                 let Some(hosts) = all.get_mut(&key).filter(|hosts| hosts.contains(&host)) else {
                     return AgentReply::Vault(Box::new(VaultResponse::error("not_found")));
                 };
@@ -249,6 +272,12 @@ impl Vault {
             }
             AgentRequest::Put { key, value } => {
                 let mut next = unlocked.keys.clone();
+                // A new value starts with nowhere to go; the same one keeps its hosts.
+                if next.get(&key) != Some(&value)
+                    && let Err(reason) = forget_hosts(&mut next, &key)
+                {
+                    return AgentReply::Vault(Box::new(VaultResponse::error(reason)));
+                }
                 next.insert(key, value);
                 self.persist(next)
             }
@@ -256,6 +285,9 @@ impl Vault {
                 let mut next = unlocked.keys.clone();
                 if next.remove(&key).is_none() {
                     return AgentReply::Vault(Box::new(VaultResponse::error("not_found")));
+                }
+                if let Err(reason) = forget_hosts(&mut next, &key) {
+                    return AgentReply::Vault(Box::new(VaultResponse::error(reason)));
                 }
                 self.persist(next)
             }
@@ -508,6 +540,15 @@ mod tests {
         assert_eq!(ask(&mut h, AgentRequest::RevokeHost { key: "prod/shop/STRIPE_KEY".into(), host: "*.stripe.com".into() })["ok"], true);
         assert_eq!(ask(&mut h, send("api.stripe.com"))["error"], "not_allowed");
         assert_eq!(ask(&mut h, AgentRequest::RevokeHost { key: "prod/shop/STRIPE_KEY".into(), host: "*.stripe.com".into() })["error"], "not_found");
+        // A secret replaced or removed takes its hosts with it.
+        ask(&mut h, AgentRequest::AllowHost { key: "prod/shop/STRIPE_KEY".into(), host: "api.stripe.com".into() });
+        assert_eq!(ask(&mut h, AgentRequest::Put { key: "prod/shop/STRIPE_KEY".into(), value: "sk_live_real".into() })["ok"], true);
+        assert_eq!(ask(&mut h, send("api.stripe.com"))["value"], "sk_live_real", "the same value keeps them");
+        assert_eq!(ask(&mut h, AgentRequest::Put { key: "prod/shop/STRIPE_KEY".into(), value: "something else".into() })["ok"], true);
+        assert_eq!(ask(&mut h, send("api.stripe.com"))["error"], "not_allowed", "a new value goes nowhere yet");
+        ask(&mut h, AgentRequest::AllowHost { key: "prod/shop/STRIPE_KEY".into(), host: "api.stripe.com".into() });
+        assert_eq!(ask(&mut h, AgentRequest::Delete { key: "prod/shop/STRIPE_KEY".into() })["ok"], true);
+        assert_eq!(ask(&mut h, AgentRequest::Hosts { key: "prod/shop/STRIPE_KEY".into() })["hosts"], serde_json::json!([]));
     }
 
     #[test]

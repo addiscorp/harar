@@ -388,8 +388,13 @@ impl ApprovalRequest {
                 return Err(ApprovalError::BadRequest);
             }
         }
-        if let Action::Read { path } | Action::Write { path } = &self.action {
+        if let Action::Read { path } | Action::Write { path } | Action::Send { path, .. } = &self.action {
             if !crate::model::valid_secret_path(path) {
+                return Err(ApprovalError::BadRequest);
+            }
+        }
+        if let Action::Send { host, .. } = &self.action {
+            if !crate::model::valid_host(host) {
                 return Err(ApprovalError::BadRequest);
             }
         }
