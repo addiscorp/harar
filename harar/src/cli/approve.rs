@@ -23,7 +23,8 @@ pub struct DeviceCmd {
 enum DeviceAction {
     /// Enroll this Mac as one of your approver devices.
     Add(SocketArgs),
-    /// Revoke one of your devices (never the last that can approve a widening).
+    /// Ask to revoke one of your devices: approved on one of your devices
+    /// (never the last that can approve a widening).
     Remove {
         id: String,
         #[command(flatten)]
@@ -117,12 +118,11 @@ pub async fn device(cmd: DeviceCmd) -> Result<()> {
         // Empty input is refused here, never spent as one of the hour's tries.
         DeviceAction::Recover { code, socket } => add(socket.socket, Some(code.read("Recovery code")?)).await,
         DeviceAction::Remove { id, socket } => {
-            VaultClient::from_socket_path(&socket.socket).remove_device(&id).await?;
-            if let Some(mut file) = read_approver()? {
-                file.devices.retain(|_, enrolled| *enrolled != id);
-                write_approver(&file)?;
-            }
-            print_json(&serde_json::json!({ "ok": true }))
+            // A request one of your devices approves; this Mac's own record of
+            // its id goes once a later `harar device add` enrolls it again.
+            let pending = VaultClient::from_socket_path(&socket.socket).remove_device(&id).await?;
+            eprintln!("Approve it on one of your devices: harar approve {}", pending.request.id);
+            print_json(&serde_json::json!({ "ok": true, "waiting": pending.request.id, "description": pending.description }))
         }
     }
 }

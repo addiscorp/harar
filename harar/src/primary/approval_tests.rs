@@ -284,10 +284,13 @@ async fn an_os_account_alone_never_makes_an_approver() {
     let sami = key();
     let sami_device = first_device(&primary, "sami", &sami).await;
     let bob = key();
-    another_device(&primary, "bob", &bob, (&sami_device, &sami)).await;
-    // Someone with sami's OS account: with bob's device left, removing sami's goes through...
-    assert!(ask(&primary, "sami", PrimaryRequest::RemoveDevice { id: sami_device }).await.ok);
-    // ...but their own key, as sami's "first" device, only waits; it approves nothing.
+    let bob_device = another_device(&primary, "bob", &bob, (&sami_device, &sami)).await;
+    // Someone with sami's OS account can't remove sami's device: it only waits
+    // for one of sami's devices, which they don't have...
+    let removal = ask(&primary, "sami", PrimaryRequest::RemoveDevice { id: sami_device.clone() }).await.pending.expect("it waits");
+    assert_eq!(refused(&ask(&primary, "bob", signed(&removal, &bob_device, &bob, Decision::Approve)).await), "not_yours");
+    assert!(devices(&primary).await.iter().any(|d| d.id == sami_device && !d.revoked));
+    // ...and their own key, as another of sami's devices, only waits; it approves nothing.
     let intruder = key();
     let added = ask(&primary, "sami", PrimaryRequest::AddDevice { device: mac(&intruder) }).await;
     let pending = added.pending.expect("it waits for an approver's device");
@@ -354,10 +357,14 @@ async fn the_last_device_that_can_approve_a_widening_stays() {
     let first = key();
     let first_id = first_device(&primary, "sami", &first).await;
     assert_eq!(refused(&ask(&primary, "sami", PrimaryRequest::RemoveDevice { id: first_id.clone() }).await), "would_lock_out");
-    another_device(&primary, "sami", &key(), (&first_id, &first)).await;
-    // With two, one can go; the other then can't.
-    assert!(ask(&primary, "sami", PrimaryRequest::RemoveDevice { id: first_id }).await.ok);
+    let second = key();
+    let second_id = another_device(&primary, "sami", &second, (&first_id, &first)).await;
+    // With two, one can go, approved with the other; the other then can't.
+    let removal = ask(&primary, "sami", PrimaryRequest::RemoveDevice { id: first_id.clone() }).await.pending.expect("it waits");
+    assert!(removal.description.contains(&format!("revoke the approver device {first_id}")), "{}", removal.description);
+    assert_eq!(ask(&primary, "sami", signed(&removal, &second_id, &second, Decision::Approve)).await.decision.as_deref(), Some("approved"));
     let left = devices(&primary).await.into_iter().find(|device| !device.revoked).unwrap();
+    assert_eq!(left.id, second_id);
     assert_eq!(refused(&ask(&primary, "sami", PrimaryRequest::RemoveDevice { id: left.id }).await), "would_lock_out");
     // And a widening still waits: losing a device never means the OS user alone may widen again.
     assert!(change(&primary, "sami", site_role()).await.pending.is_some());
@@ -485,13 +492,24 @@ async fn recovery_codes_are_each_persons_own_and_guessing_runs_out() {
 async fn while_a_recovered_device_waits_its_day_the_owners_other_devices_stay() {
     let dir = tempfile::tempdir().unwrap();
     let primary = primary(dir.path()).await;
-    let (first, codes) = first_device_and_codes(&primary, "sami", &key()).await;
-    let stolen = recover(&primary, "sami", &codes[0], &key()).await.value.unwrap();
-    // Whoever holds the code can't strip the owner's device...
-    assert_eq!(refused(&ask(&primary, "sami", PrimaryRequest::RemoveDevice { id: first.clone() }).await), "recovery_cooldown");
-    // ...and the owner can revoke the recovered one at once.
-    assert!(ask(&primary, "sami", PrimaryRequest::RemoveDevice { id: stolen }).await.ok);
+    let owner = key();
+    let (first, codes) = first_device_and_codes(&primary, "sami", &owner).await;
+    let thief = key();
+    let stolen = recover(&primary, "sami", &codes[0], &thief).await.value.unwrap();
+    backdate(&primary).await;
+    // Whoever holds the code can't strip the owner's device: removing it is
+    // reserved, and the recovered device's approval doesn't count yet...
+    let strip = ask(&primary, "sami", PrimaryRequest::RemoveDevice { id: first.clone() }).await.pending.expect("it waits");
+    assert_eq!(ask(&primary, "sami", signed(&strip, &stolen, &thief, Decision::Approve)).await.decision.as_deref(), Some("pending 0/1"));
     assert!(load_devices(&*primary.keys.lock().await).iter().any(|d| d.id == first && !d.revoked));
+    // ...and the owner revokes the recovered one with their own device at once.
+    let revoke = ask(&primary, "sami", PrimaryRequest::RemoveDevice { id: stolen.clone() }).await.pending.expect("it waits");
+    assert_eq!(ask(&primary, "sami", signed(&revoke, &first, &owner, Decision::Approve)).await.decision.as_deref(), Some("approved"));
+    let all = load_devices(&*primary.keys.lock().await);
+    assert!(all.iter().any(|d| d.id == stolen && d.revoked) && all.iter().any(|d| d.id == first && !d.revoked));
+    // And the owner is told.
+    let notices = ask(&primary, "sami", PrimaryRequest::Approvals).await.notices.unwrap();
+    assert!(notices.iter().any(|n| n.text.contains(&format!("{stolen} was revoked"))), "{notices:?}");
 }
 
 #[tokio::test]
@@ -595,4 +613,21 @@ async fn a_secret_is_sent_only_to_the_hosts_a_role_names_and_the_record_says_whe
     let audit = std::fs::read_to_string(dir.path().join("audit.log")).unwrap();
     assert!(audit.contains("prod/shop/STRIPE_KEY to api.stripe.com") && audit.contains("prod/shop/STRIPE_KEY to evil.example.com"), "{audit}");
     assert!(!audit.contains("sk_live_real"));
+}
+
+#[tokio::test]
+async fn an_approved_removal_is_checked_again_and_never_locks_the_person_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let primary = primary(dir.path()).await;
+    let a = key();
+    let a_id = first_device(&primary, "sami", &a).await;
+    let b = key();
+    let b_id = another_device(&primary, "sami", &b, (&a_id, &a)).await;
+    // Both asked while two are left; each one's removal on its own is fine.
+    let drop_a = ask(&primary, "sami", PrimaryRequest::RemoveDevice { id: a_id.clone() }).await.pending.unwrap();
+    let drop_b = ask(&primary, "sami", PrimaryRequest::RemoveDevice { id: b_id.clone() }).await.pending.unwrap();
+    assert_eq!(ask(&primary, "sami", signed(&drop_b, &a_id, &a, Decision::Approve)).await.decision.as_deref(), Some("approved"));
+    // Now a is the last one: approving its own removal is used up, and it stays.
+    assert_eq!(refused(&ask(&primary, "sami", signed(&drop_a, &a_id, &a, Decision::Approve)).await), "approved_but_would_lock_out");
+    assert!(devices(&primary).await.iter().any(|d| d.id == a_id && !d.revoked));
 }

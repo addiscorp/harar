@@ -47,8 +47,10 @@ pub enum PrimaryRequest {
     /// id, owner and enrollment time; a human's first device is enrolled at
     /// once, another one waits for an approval from a device they already have.
     AddDevice { device: ApproverDevice },
-    /// Revokes one of the calling human's devices, unless it is the last one
-    /// that could approve a widening (then recovery codes are the way back).
+    /// Asks to revoke one of the calling human's devices: a reserved
+    /// `device.remove` request one of their own devices approves (never the
+    /// OS account alone), refused if it would leave no device that could
+    /// approve a widening (then recovery codes are the way back).
     RemoveDevice { id: String },
     /// Enrolls a new Mac key for the calling human with one of their
     /// recovery codes, when they have no device left (architecture, §6). The
@@ -69,6 +71,8 @@ pub enum Waiting {
     Device { device: ApproverDevice },
     /// A new set of recovery codes for `human`.
     RecoveryCodes { human: crate::model::Name },
+    /// Revoke `human`'s approver device `id`.
+    RemoveDevice { id: String, human: crate::model::Name },
 }
 
 /// SHA-256 (hex) of exactly what a waiting request would do: its
