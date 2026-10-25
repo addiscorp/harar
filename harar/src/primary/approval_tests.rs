@@ -235,8 +235,15 @@ async fn a_bad_signature_is_refused_and_kept_nowhere() {
 async fn only_a_human_the_policy_lets_approve_counts() {
     let dir = tempfile::tempdir().unwrap();
     let primary = primary(dir.path()).await;
-    // Bob is a person here, with no right to approve anything.
+    // Bob may approve device enrollments, and nothing else.
     add_bob(&primary, false).await;
+    let devices_only = Role {
+        name: name("gg.addis.role.devices"),
+        allows: vec![Permission { verb: Verb::Approve, resource: "approvals.device".into(), scopes: vec![] }],
+    };
+    assert!(change(&primary, "sami", PolicyChange::SetRole { role: devices_only }).await.ok);
+    let binding = Binding { actor: "gg.addis.human.bob".parse().unwrap(), zone: ZoneMatch::Name("gg.addis.zone.bugsy".parse().unwrap()), role: name("gg.addis.role.devices") };
+    assert!(change(&primary, "sami", PolicyChange::Bind { binding }).await.ok);
     let sami = key();
     let sami_device = first_device(&primary, "sami", &sami).await;
     let bob = key();
@@ -245,6 +252,17 @@ async fn only_a_human_the_policy_lets_approve_counts() {
     let pending = change(&primary, "sami", site_role()).await.pending.unwrap();
     assert_eq!(refused(&ask(&primary, "bob", signed(&pending, &bob_device, &bob, Decision::Approve)).await), "not_an_approver");
     assert!(!has_site_role(&primary).await);
+}
+
+#[tokio::test]
+async fn someone_who_approves_nothing_gets_no_device() {
+    let dir = tempfile::tempdir().unwrap();
+    let primary = primary(dir.path()).await;
+    add_bob(&primary, false).await;
+    first_device(&primary, "sami", &key()).await;
+    // So nobody without approval rights can fill the waiting list either.
+    assert_eq!(refused(&ask(&primary, "bob", PrimaryRequest::AddDevice { device: mac(&key()) }).await), "not_an_approver");
+    assert!(waiting(&primary).await.is_empty());
 }
 
 #[tokio::test]

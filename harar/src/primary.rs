@@ -544,6 +544,12 @@ impl Primary {
                 // person's first included, is approved with a device that is
                 // already there: an OS account alone never makes an approver.
                 if live > 0 {
+                    // A device is for approving: only someone who may approve
+                    // device enrollments asks for one, so no one else can fill
+                    // the waiting list with requests.
+                    if self.check(&policy, actor, &Action::Approve { class: DEVICE_APPROVAL_CLASS.into() }).is_err() {
+                        return (subject, refuse("not_an_approver"));
+                    }
                     return match self.wait(&mut next, actor, DEVICE_APPROVAL_CLASS, true, Waiting::Device { device }) {
                         Ok(pending) => (subject, Outcome::CommitWith(next, Box::new(PrimaryResponse { pending: Some(pending), ..PrimaryResponse::ok() }))),
                         Err(reason) => (subject, refuse(reason)),
