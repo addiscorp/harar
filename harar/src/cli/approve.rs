@@ -1,5 +1,6 @@
 //! Approver devices and approvals at a primary (architecture, section 6):
-//! `harar device add|remove`, `harar approvals`, `harar approve|deny <id>`.
+//! `harar device add|remove|recover`, `harar approvals`, `harar approve|deny
+//! <id>`, `harar recovery-codes`.
 //! On a Mac the device is a Secure Enclave key made for approving, apart from
 //! the key `harar agent` unlocks with, that signs only after Touch ID (or the
 //! login password). Its handle, useless on any other Mac, is kept with the
@@ -28,6 +29,24 @@ enum DeviceAction {
         #[command(flatten)]
         socket: SocketArgs,
     },
+    /// Enroll this Mac with one of your recovery codes, when you've lost
+    /// your devices. It asks for the code (never an argument, so it stays out
+    /// of shell history and `ps`); the Mac may deny at once, and approve after a day.
+    Recover {
+        /// Where the code comes from: a prompt that doesn't echo, by default.
+        #[command(flatten)]
+        code: crate::cli::secret_input::SecretInput,
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+}
+
+/// Ask for a new set of your recovery codes; approving it on your device
+/// shows them, and the old ones stop working.
+#[derive(Debug, Args)]
+pub struct RecoveryCodes {
+    #[command(flatten)]
+    socket: SocketArgs,
 }
 
 /// What waits for a person, and the approver devices.
@@ -94,7 +113,9 @@ fn key_for(socket: &std::path::Path) -> String {
 
 pub async fn device(cmd: DeviceCmd) -> Result<()> {
     match cmd.action {
-        DeviceAction::Add(socket) => add(socket.socket).await,
+        DeviceAction::Add(socket) => add(socket.socket, None).await,
+        // Empty input is refused here, never spent as one of the hour's tries.
+        DeviceAction::Recover { code, socket } => add(socket.socket, Some(code.read("Recovery code")?)).await,
         DeviceAction::Remove { id, socket } => {
             VaultClient::from_socket_path(&socket.socket).remove_device(&id).await?;
             if let Some(mut file) = read_approver()? {
@@ -137,8 +158,10 @@ fn device_view(public: &[u8]) -> harar_client::approvals::ApproverDevice {
     }
 }
 
+/// Enrolls this Mac's approver key: as another device, or with a recovery
+/// code when `code` is given.
 #[cfg(target_os = "macos")]
-async fn add(socket: PathBuf) -> Result<()> {
+async fn add(socket: PathBuf, code: Option<String>) -> Result<()> {
     use crate::enclave::{EnclaveKey, Presence};
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
@@ -146,7 +169,13 @@ async fn add(socket: PathBuf) -> Result<()> {
     // login password every time it signs.
     let mut file = match read_approver()? {
         Some(file) => file,
-        None => ApproverFile { handle: STANDARD.encode(EnclaveKey::create(Presence::Required)?.handle()?), devices: BTreeMap::new() },
+        None => {
+            // Kept before the primary is asked, so a refusal never leaves a
+            // key behind that nothing knows: the next try uses it.
+            let file = ApproverFile { handle: STANDARD.encode(EnclaveKey::create(Presence::Required)?.handle()?), devices: BTreeMap::new() };
+            write_approver(&file)?;
+            file
+        }
     };
     let key = EnclaveKey::from_handle(&STANDARD.decode(&file.handle)?)?;
     let public = key.public_key()?;
@@ -156,7 +185,20 @@ async fn add(socket: PathBuf) -> Result<()> {
     let device = device_view(&public);
     // To compare with what an approver is shown before they approve this key.
     let fingerprint = harar_client::approvals::device_fingerprint(&device);
-    let (enrolled, pending) = VaultClient::from_socket_path(&socket).add_device(device).await?;
+    let client = VaultClient::from_socket_path(&socket);
+    if let Some(code) = code {
+        let (id, others) = client.recover(&code, device).await?;
+        file.devices.insert(key_for(&socket), id.clone());
+        write_approver(&file)?;
+        let others: Vec<_> = others.iter().map(|d| serde_json::json!({ "id": d.id, "fingerprint": harar_client::approvals::device_fingerprint(d) })).collect();
+        eprintln!("This Mac can deny requests now and approve them after a day. Your other devices are told (harar approvals).");
+        return print_json(&serde_json::json!({ "ok": true, "device": id, "fingerprint": fingerprint, "your_other_devices": others }));
+    }
+    let added = client.add_device(device).await?;
+    let (enrolled, pending) = (added.id, added.pending);
+    if let Some(codes) = &added.recovery_codes {
+        show_codes(codes);
+    }
     let id = match (&enrolled, &pending) {
         (Some(id), _) => id.clone(),
         (None, Some(pending)) => match &pending.waiting {
@@ -179,13 +221,31 @@ async fn add(socket: PathBuf) -> Result<()> {
     }
 }
 
+/// Recovery codes go to the terminal, never to the JSON a script might log.
+#[cfg(target_os = "macos")]
+fn show_codes(codes: &[String]) {
+    eprintln!("Your recovery codes. Each works once; keep them in a password manager or on paper. They won't be shown again.");
+    for code in codes {
+        eprintln!("  {code}");
+    }
+}
+
+pub async fn recovery_codes(cmd: RecoveryCodes) -> Result<()> {
+    let pending = VaultClient::from_socket_path(&cmd.socket.socket).new_recovery_codes().await?;
+    eprintln!("Approve it on your device: harar approve {}", pending.request.id);
+    print_json(&serde_json::json!({ "ok": true, "waiting": pending.request.id, "description": pending.description }))
+}
+
 #[cfg(not(target_os = "macos"))]
-async fn add(_socket: PathBuf) -> Result<()> {
+async fn add(_socket: PathBuf, _code: Option<String>) -> Result<()> {
     Err(anyhow!("an approver key needs a Mac's Secure Enclave for now; passkeys come with the approval page"))
 }
 
 pub async fn approvals(cmd: Approvals) -> Result<()> {
-    let (pending, devices) = VaultClient::from_socket_path(&cmd.socket.socket).approvals().await?;
+    let harar_client::Approvals { pending, devices, notices, recovery_codes_left } = VaultClient::from_socket_path(&cmd.socket.socket).approvals().await?;
+    for notice in &notices {
+        eprintln!("notice: {}", notice.text);
+    }
     let waiting: Vec<_> = pending
         .iter()
         .map(|p| serde_json::json!({ "id": p.request.id, "class": p.request.class, "description": p.description, "expires_at": p.request.expires_at }))
@@ -202,7 +262,14 @@ pub async fn approvals(cmd: Approvals) -> Result<()> {
             })
         })
         .collect();
-    print_json(&serde_json::json!({ "ok": true, "waiting": waiting, "devices": devices }))
+    let notices: Vec<_> = notices.iter().map(|n| serde_json::json!({ "at": n.at, "text": n.text })).collect();
+    print_json(&serde_json::json!({
+        "ok": true,
+        "waiting": waiting,
+        "devices": devices,
+        "notices": notices,
+        "recovery_codes_left": recovery_codes_left,
+    }))
 }
 
 pub async fn approve(cmd: Approve) -> Result<()> {
@@ -226,7 +293,7 @@ async fn decide(id: String, socket: PathBuf, decision: Decision) -> Result<()> {
         .cloned()
         .ok_or_else(|| anyhow!("this Mac isn't an approver device at this primary yet: harar device add"))?;
     let client = VaultClient::from_socket_path(&socket);
-    let (pending, _) = client.approvals().await?;
+    let pending = client.approvals().await?.pending;
     let waiting = pending.into_iter().find(|p| p.request.id == id).ok_or_else(|| anyhow!("no request {id} is waiting"))?;
     // What is shown must be what is signed: the request's detail is the hash
     // of exactly what it would do, so text from anywhere else can't be
@@ -239,7 +306,10 @@ async fn decide(id: String, socket: PathBuf, decision: Decision) -> Result<()> {
     eprintln!("{}", serde_json::to_string_pretty(&waiting.waiting)?);
     let key = EnclaveKey::from_handle(&STANDARD.decode(&file.handle)?)?;
     let signature = key.sign(&waiting.request.challenge(decision, &device_id))?;
-    let result = client.submit(Approval { request_id: id, device_id, decision, proof: Proof::Signature { signature: URL_SAFE_NO_PAD.encode(signature) } }).await?;
+    let (result, codes) = client.submit(Approval { request_id: id, device_id, decision, proof: Proof::Signature { signature: URL_SAFE_NO_PAD.encode(signature) } }).await?;
+    if let Some(codes) = &codes {
+        show_codes(codes);
+    }
     print_json(&serde_json::json!({ "ok": true, "decision": result }))
 }
 

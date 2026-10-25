@@ -40,6 +40,15 @@ pub enum PrimaryRequest {
     /// Revokes one of the calling human's devices, unless it is the last one
     /// that could approve a widening (then recovery codes are the way back).
     RemoveDevice { id: String },
+    /// Enrolls a new Mac key for the calling human with one of their
+    /// recovery codes, when they have no device left (architecture, §6). The
+    /// code is used up; the device may approve reserved classes only after a
+    /// day.
+    Recover { code: String, device: ApproverDevice },
+    /// Asks for a new set of recovery codes for the calling human, replacing
+    /// the old one: a reserved `recovery.codes` change their own device
+    /// approves, and the approval returns the codes.
+    NewRecoveryCodes,
 }
 
 /// What a waiting request would do once approved.
@@ -48,6 +57,8 @@ pub enum PrimaryRequest {
 pub enum Waiting {
     Policy { change: PolicyChange },
     Device { device: ApproverDevice },
+    /// A new set of recovery codes for `human`.
+    RecoveryCodes { human: crate::model::Name },
 }
 
 /// SHA-256 (hex) of exactly what a waiting request would do: its
@@ -141,6 +152,25 @@ pub struct PrimaryResponse {
     /// For `approvals` and `add_device`: the approver devices.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub devices: Option<Vec<ApproverDevice>>,
+    /// One-time recovery codes, shown once: for a person's first device, and
+    /// for an approved new set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_codes: Option<Vec<String>>,
+    /// For `approvals`: what happened to the caller's own account lately (a
+    /// device recovered with a code, codes replaced), and how many of their
+    /// recovery codes are left.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notices: Option<Vec<Notice>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_codes_left: Option<usize>,
+}
+
+/// Something a person should know about their own account, kept a week.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Notice {
+    pub human: crate::model::Name,
+    pub at: u64,
+    pub text: String,
 }
 
 impl PrimaryResponse {

@@ -44,6 +44,7 @@ enum Command {
     Approvals(approve::Approvals),
     Approve(approve::Approve),
     Deny(approve::Deny),
+    RecoveryCodes(approve::RecoveryCodes),
     Key(key::Key),
     Version(version::Version),
 }
@@ -84,6 +85,7 @@ pub async fn run() -> anyhow::Result<()> {
         Command::Approvals(cmd) => approve::approvals(cmd).await,
         Command::Approve(cmd) => approve::approve(cmd).await,
         Command::Deny(cmd) => approve::deny(cmd).await,
+        Command::RecoveryCodes(cmd) => approve::recovery_codes(cmd).await,
         Command::Key(cmd) => key::run(cmd).await,
         Command::Version(cmd) => version::run(cmd),
     }

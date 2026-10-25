@@ -265,6 +265,16 @@ use a synced passkey: the person's choice for now.
   keep in a password manager or print. Each works once, only for its owner;
   using one enrolls a new device, and every other device is told. A new set
   replaces the old one, and making one is a reserved `recovery.*` change.
+  As built: a code needs the person's OS account too, wrong codes are capped
+  at five an hour per person, and the person is told in `harar approvals`
+  for a week, where nothing but time removes it. While a recovered device
+  waits out its day, the person's other devices can't be removed (so a
+  stolen code can't strip them), which also means someone who recovered
+  after losing a device revokes the lost one only after that day; until
+  then it still signs for whoever holds it, behind its Touch ID or password. A device in its day can
+  deny requests, so a thief can delay a person's requests for that day;
+  they can ask again. Device removal by the OS account alone, without a
+  device's signature, is still to come (signed removals).
 - **In an org, an admin can recover a member**, as in any workspace.
 - A phone approves; it never holds the vault's master key. Servers unlock
   without anyone present, so the vault's keys stay on the primary.
