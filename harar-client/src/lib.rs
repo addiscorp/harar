@@ -199,15 +199,32 @@ impl VaultClient {
     }
 
     /// A signed decision; returns `approved`, `denied` or `pending <have>/<need>`.
-    pub async fn submit(&self, approval: approvals::Approval) -> Result<String, VaultClientError> {
-        self.ask(&PrimaryRequest::Submit { approval }).await?.decision.ok_or_else(|| VaultClientError::InvalidResponse("no decision".into()))
+    /// The decision, and the new recovery codes when it approved a set of yours.
+    pub async fn submit(&self, approval: approvals::Approval) -> Result<(String, Option<Vec<String>>), VaultClientError> {
+        let response = self.ask(&PrimaryRequest::Submit { approval }).await?;
+        let decision = response.decision.ok_or_else(|| VaultClientError::InvalidResponse("no decision".into()))?;
+        Ok((decision, response.recovery_codes))
     }
 
     /// Enrolls a device: its id when enrolled at once, or the request that
-    /// waits for one of the person's other devices.
-    pub async fn add_device(&self, device: approvals::ApproverDevice) -> Result<(Option<String>, Option<primary::Pending>), VaultClientError> {
+    /// waits for one of the person's other devices; and, for a person's first
+    /// device, their recovery codes (shown once).
+    pub async fn add_device(&self, device: approvals::ApproverDevice) -> Result<AddedDevice, VaultClientError> {
         let response = self.ask(&PrimaryRequest::AddDevice { device }).await?;
-        Ok((response.value, response.pending))
+        Ok(AddedDevice { id: response.value, pending: response.pending, recovery_codes: response.recovery_codes })
+    }
+
+    /// Enrolls `device` with one of your recovery codes; its id, and your
+    /// other devices (who should be told).
+    pub async fn recover(&self, code: &str, device: approvals::ApproverDevice) -> Result<(String, Vec<approvals::ApproverDevice>), VaultClientError> {
+        let response = self.ask(&PrimaryRequest::Recover { code: code.into(), device }).await?;
+        let id = response.value.ok_or_else(|| VaultClientError::InvalidResponse("no device id".into()))?;
+        Ok((id, response.devices.unwrap_or_default()))
+    }
+
+    /// Asks for a new set of your recovery codes: the request your own device approves.
+    pub async fn new_recovery_codes(&self) -> Result<primary::Pending, VaultClientError> {
+        self.ask(&PrimaryRequest::NewRecoveryCodes).await?.pending.ok_or_else(|| VaultClientError::InvalidResponse("no request".into()))
     }
 
     pub async fn remove_device(&self, id: &str) -> Result<(), VaultClientError> {
@@ -236,4 +253,15 @@ impl VaultClient {
             Err(VaultClientError::Vault(response.error.unwrap_or_else(|| "refused".into())))
         }
     }
+}
+
+/// What `add_device` did.
+#[derive(Debug)]
+pub struct AddedDevice {
+    /// Enrolled now, with this id.
+    pub id: Option<String>,
+    /// Or waiting for an approval from a device already there.
+    pub pending: Option<primary::Pending>,
+    /// A person's first device: their recovery codes, shown once.
+    pub recovery_codes: Option<Vec<String>>,
 }

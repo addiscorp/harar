@@ -14,6 +14,7 @@ use harar_client::model::{Action, Binding, Decision, Kind, Name, Org, Permission
 use harar_client::oidc::{self, Alg, IdentityRequest};
 use harar_client::approvals::{self, Approval, ApprovalRequest, ApprovalRule, ApproverDevice, DeviceKind, Widens};
 use harar_client::primary::{Pending, PolicyChange, PolicyView, PrimaryRequest, PrimaryResponse, Waiting, waiting_detail};
+use harar_client::recovery::{StoredCode, replace_recovery_codes, use_recovery_code};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, OpenOptions};
@@ -35,6 +36,14 @@ const USERS_KEY: &str = "harar:users";
 const DEVICES_KEY: &str = "harar:devices";
 /// Requests waiting for a person.
 const WAITING_KEY: &str = "harar:approvals";
+/// Recovery codes' hashes (architecture, §6), and recent failed tries per person.
+const RECOVERY_KEY: &str = "harar:recovery";
+const RECOVERY_FAILURES_KEY: &str = "harar:recovery_failures";
+/// Failed recovery tries a person gets per hour; then none until it passes.
+const MAX_RECOVERY_FAILURES: usize = 5;
+const RECOVERY_WINDOW_SECONDS: u64 = 3600;
+/// Replacing a person's recovery codes: reserved (`recovery.*`).
+const RECOVERY_CLASS: &str = "recovery.codes";
 /// How long a request waits for a person before it lapses.
 const APPROVAL_SECONDS: u64 = 15 * 60;
 /// At most this many requests wait at once, and this many devices are enrolled.
@@ -159,11 +168,63 @@ fn store_waiting(keys: &mut HashMap<String, String>, waiting: &[Stored]) {
     keys.insert(WAITING_KEY.into(), serde_json::to_string(waiting).expect("approvals serialize"));
 }
 
-/// The same change waiting twice: the same policy change, or the same key to enroll.
+/// A device as `actor` would have it enrolled: always the caller's own (whom
+/// it approves as comes from who is asking, never from what the request
+/// says), a Mac key that asks first (a passkey's enrollment needs its own
+/// ceremony, which the approval page will run), within the cap, and not a key
+/// already enrolled. The primary sets its id, owner and times.
+fn new_device(actor: &Name, device: ApproverDevice, devices: &[ApproverDevice]) -> Result<ApproverDevice, &'static str> {
+    if actor.kind() != Kind::Human || device.kind != DeviceKind::Mac || !device.user_verification || !approvals::valid_device_key(&device) {
+        return Err("bad_device");
+    }
+    if devices.iter().filter(|other| !other.revoked).count() >= MAX_DEVICES {
+        return Err("too_many_devices");
+    }
+    if devices.iter().any(|other| !other.revoked && other.public_key.x == device.public_key.x && other.public_key.y == device.public_key.y) {
+        return Err("key_enrolled");
+    }
+    Ok(ApproverDevice {
+        id: approvals::approval_id(),
+        human: actor.clone(),
+        enrolled_at: now_epoch_seconds(),
+        credential_id: None,
+        backup_eligible: false,
+        sign_count: 0,
+        reserved_after: 0,
+        revoked: false,
+        ..device
+    })
+}
+
+fn load_recovery(keys: &HashMap<String, String>) -> Vec<StoredCode> {
+    keys.get(RECOVERY_KEY).and_then(|text| serde_json::from_str(text).ok()).unwrap_or_default()
+}
+
+fn store_recovery(keys: &mut HashMap<String, String>, codes: &[StoredCode]) {
+    keys.insert(RECOVERY_KEY.into(), serde_json::to_string(codes).expect("recovery codes serialize"));
+}
+
+/// Each person's failed recovery tries in the last hour.
+fn load_failures(keys: &HashMap<String, String>, now: u64) -> BTreeMap<String, Vec<u64>> {
+    let mut all: BTreeMap<String, Vec<u64>> = keys.get(RECOVERY_FAILURES_KEY).and_then(|text| serde_json::from_str(text).ok()).unwrap_or_default();
+    for tries in all.values_mut() {
+        tries.retain(|at| now < at + RECOVERY_WINDOW_SECONDS);
+    }
+    all.retain(|_, tries| !tries.is_empty());
+    all
+}
+
+fn store_failures(keys: &mut HashMap<String, String>, failures: &BTreeMap<String, Vec<u64>>) {
+    keys.insert(RECOVERY_FAILURES_KEY.into(), serde_json::to_string(failures).expect("failures serialize"));
+}
+
+/// The same change waiting twice: the same policy change, the same key to
+/// enroll, or new codes for the same person.
 fn same_change(a: &Waiting, b: &Waiting) -> bool {
     match (a, b) {
         (Waiting::Policy { change: a }, Waiting::Policy { change: b }) => a == b,
         (Waiting::Device { device: a }, Waiting::Device { device: b }) => a.public_key.x == b.public_key.x && a.public_key.y == b.public_key.y,
+        (Waiting::RecoveryCodes { human: a }, Waiting::RecoveryCodes { human: b }) => a == b,
         _ => false,
     }
 }
@@ -176,6 +237,7 @@ fn describe(request: &ApprovalRequest, waiting: &Waiting) -> String {
         Waiting::Device { device } => {
             format!("enroll the {:?} key {} as an approver device for {}", device.kind, approvals::device_fingerprint(device), device.human)
         }
+        Waiting::RecoveryCodes { human } => format!("replace the recovery codes of {human} (the old ones stop working)"),
     };
     let zone = request.zone.as_ref().map(Name::to_string).unwrap_or_default();
     format!("[{} on {}] {who}, at {zone}, asks to {what}", request.class, request.primary)
@@ -508,35 +570,11 @@ impl Primary {
             PrimaryRequest::Submit { approval } => self.submit(keys, &policy, &users, approval),
             PrimaryRequest::AddDevice { device } => {
                 let subject = Some(format!("{:?} key {} for {actor}", device.kind, approvals::device_fingerprint(&device)));
-                // Always the caller's own device: whom it approves as comes
-                // from who is asking, never from what the request says. Mac
-                // keys only, for now: a passkey's enrollment needs its own
-                // ceremony (attestation), which the approval page will run.
-                if actor.kind() != Kind::Human || device.kind != DeviceKind::Mac || !device.user_verification {
-                    return (subject, refuse("bad_device"));
-                }
-                if !approvals::valid_device_key(&device) {
-                    return (subject, refuse("bad_device"));
-                }
                 let mut devices = load_devices(keys);
                 let live = devices.iter().filter(|other| !other.revoked).count();
-                if live >= MAX_DEVICES {
-                    return (subject, refuse("too_many_devices"));
-                }
-                if devices.iter().any(|other| !other.revoked && other.public_key.x == device.public_key.x && other.public_key.y == device.public_key.y) {
-                    return (subject, refuse("key_enrolled"));
-                }
-                let now = now_epoch_seconds();
-                let device = ApproverDevice {
-                    id: approvals::approval_id(),
-                    human: actor.clone(),
-                    enrolled_at: now,
-                    credential_id: None,
-                    backup_eligible: false,
-                    sign_count: 0,
-                    reserved_after: 0,
-                    revoked: false,
-                    ..device
+                let device = match new_device(actor, device, &devices) {
+                    Ok(device) => device,
+                    Err(reason) => return (subject, refuse(reason)),
                 };
                 let mut next = keys.clone();
                 // Approvals start with one device, enrolled at once, of someone
@@ -561,14 +599,81 @@ impl Primary {
                     return (subject, refuse("not_an_approver"));
                 }
                 store_devices(&mut next, &devices);
-                (subject, Outcome::CommitWith(next, Box::new(PrimaryResponse { value: Some(id), devices: Some(devices), ..PrimaryResponse::ok() })))
+                // The first device's owner gets their recovery codes, once:
+                // the way back in if it is lost.
+                let mut stored = load_recovery(keys);
+                let codes = replace_recovery_codes(&mut stored, actor);
+                store_recovery(&mut next, &stored);
+                (
+                    subject,
+                    Outcome::CommitWith(
+                        next,
+                        Box::new(PrimaryResponse { value: Some(id), devices: Some(devices), recovery_codes: Some(codes), ..PrimaryResponse::ok() }),
+                    ),
+                )
+            }
+            PrimaryRequest::Recover { code, device } => {
+                let what = format!("{:?} key {} for {actor}, with a recovery code", device.kind, approvals::device_fingerprint(&device));
+                let subject = Some(what.clone());
+                let now = now_epoch_seconds();
+                let mut next = keys.clone();
+                // Tries are counted per person before the code is looked at,
+                // so guessing costs the same whether or not it is close.
+                let mut failures = load_failures(keys, now);
+                if failures.get(&actor.to_string()).is_some_and(|tries| tries.len() >= MAX_RECOVERY_FAILURES) {
+                    return (subject, refuse("too_many_attempts"));
+                }
+                let mut devices = load_devices(keys);
+                let device = match new_device(actor, device, &devices) {
+                    Ok(device) => device.enrolled_by_recovery(now),
+                    Err(reason) => return (subject, refuse(reason)),
+                };
+                let mut stored = load_recovery(keys);
+                if !use_recovery_code(&mut stored, actor, &code) {
+                    failures.entry(actor.to_string()).or_default().push(now);
+                    store_failures(&mut next, &failures);
+                    // The failed try is kept, and the caller hears no more than no.
+                    return (subject, Outcome::CommitWith(next, Box::new(PrimaryResponse::error("bad_code"))));
+                }
+                // The code is used up in the same write that enrolls the device.
+                store_recovery(&mut next, &stored);
+                failures.remove(&actor.to_string());
+                store_failures(&mut next, &failures);
+                let id = device.id.clone();
+                let others: Vec<ApproverDevice> = devices.iter().filter(|other| !other.revoked && other.human == *actor).cloned().collect();
+                devices.push(device);
+                store_devices(&mut next, &devices);
+                let left = stored.iter().filter(|code| code.human == *actor).count();
+                // Who should be told: every other device of theirs, named in the record.
+                let told: Vec<&str> = others.iter().map(|other| other.id.as_str()).collect();
+                let subject = Some(format!("{what}: {id}; {left} codes left; their other devices: [{}]", told.join(", ")));
+                (subject, Outcome::CommitWith(next, Box::new(PrimaryResponse { value: Some(id), devices: Some(others), ..PrimaryResponse::ok() })))
+            }
+            PrimaryRequest::NewRecoveryCodes => {
+                let subject = Some(format!("new recovery codes for {actor}"));
+                if actor.kind() != Kind::Human {
+                    return (subject, refuse("not_a_human"));
+                }
+                let mut next = keys.clone();
+                match self.wait(&mut next, actor, RECOVERY_CLASS, false, Waiting::RecoveryCodes { human: actor.clone() }) {
+                    Ok(pending) => (subject, Outcome::CommitWith(next, Box::new(PrimaryResponse { pending: Some(pending), ..PrimaryResponse::ok() }))),
+                    Err(reason) => (subject, refuse(reason)),
+                }
             }
             PrimaryRequest::RemoveDevice { id } => {
                 let subject = Some(format!("{id} of {actor}"));
                 let mut devices = load_devices(keys);
+                let now = now_epoch_seconds();
+                // While a device recovered with a code waits out its day, the
+                // person's other devices stay: a stolen code can't strip the
+                // owner's devices. The recovered one can always go.
+                let cooling = devices.iter().any(|device| !device.revoked && device.human == *actor && now < device.reserved_after);
                 let Some(device) = devices.iter_mut().find(|device| device.id == id && device.human == *actor && !device.revoked) else {
                     return (subject, refuse("no_such_device"));
                 };
+                if cooling && now >= device.reserved_after {
+                    return (subject, refuse("recovery_cooldown"));
+                }
                 device.revoked = true;
                 if !self.devices_can_widen(&policy, &devices) {
                     return (subject, refuse("would_lock_out"));
@@ -637,7 +742,7 @@ impl Primary {
     /// decides whether this human may approve this class (`submit`).
     fn rules(&self) -> Vec<ApprovalRule> {
         let humans = format!("{}.human.*", self.org).parse().expect("a human pattern for the org");
-        ["policy.*", "approvals.*"]
+        ["policy.*", "approvals.*", "recovery.*"]
             .into_iter()
             .map(|class| ApprovalRule { class: class.into(), approvers: Clone::clone(&humans), devices: 1 })
             .collect()
@@ -700,8 +805,20 @@ impl Primary {
             Err(err) => return (subject, refuse(err.as_str())),
         };
         let class = all[index].request.class.clone();
-        if self.check(policy, &device.human, &Action::Approve { class }).is_err() {
-            return (subject, refuse("not_an_approver"));
+        match &all[index].waiting {
+            // A person's recovery codes are theirs alone: only their own
+            // device approves a new set, whatever the policy says (and, the
+            // class being reserved, never one still in its day after a recovery).
+            Waiting::RecoveryCodes { human } => {
+                if *human != device.human {
+                    return (subject, refuse("not_yours"));
+                }
+            }
+            _ => {
+                if self.check(policy, &device.human, &Action::Approve { class }).is_err() {
+                    return (subject, refuse("not_an_approver"));
+                }
+            }
         }
         // From here the audit line names who decided, with which device.
         let who = format!("{} by {} ({})", approval.request_id, device.id, device.human);
@@ -718,6 +835,7 @@ impl Primary {
             }
         }
         let mut next = keys.clone();
+        let mut codes = None;
         let decision = match decided.outcome {
             approvals::Outcome::Pending { have, need } => format!("pending {have}/{need}"),
             approvals::Outcome::Denied => {
@@ -750,13 +868,18 @@ impl Primary {
                         device.enrolled_at = now;
                         devices.push(device);
                     }
+                    Waiting::RecoveryCodes { human } => {
+                        let mut stored = load_recovery(keys);
+                        codes = Some(replace_recovery_codes(&mut stored, &human));
+                        store_recovery(&mut next, &stored);
+                    }
                 }
                 "approved".to_string()
             }
         };
         store_waiting(&mut next, &all);
         store_devices(&mut next, &devices);
-        (Some(format!("{who}: {decision}")), Outcome::CommitWith(next, Box::new(PrimaryResponse { decision: Some(decision), ..PrimaryResponse::ok() })))
+        (Some(format!("{who}: {decision}")), Outcome::CommitWith(next, Box::new(PrimaryResponse { decision: Some(decision), recovery_codes: codes, ..PrimaryResponse::ok() })))
     }
 
     fn apply(&self, policy: &mut Policy, users: &mut BTreeMap<String, Name>, change: PolicyChange) -> Result<(), &'static str> {
@@ -867,6 +990,8 @@ fn op_name(request: &PrimaryRequest) -> &'static str {
         PrimaryRequest::Submit { .. } => "submit",
         PrimaryRequest::AddDevice { .. } => "add_device",
         PrimaryRequest::RemoveDevice { .. } => "remove_device",
+        PrimaryRequest::Recover { .. } => "recover",
+        PrimaryRequest::NewRecoveryCodes => "new_recovery_codes",
     }
 }
 

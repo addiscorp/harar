@@ -407,3 +407,110 @@ async fn only_mac_keys_that_ask_first_are_enrolled() {
     garbage.public_key.x = "AAAA".into();
     assert_eq!(refused(&ask(&primary, "sami", PrimaryRequest::AddDevice { device: garbage }).await), "bad_device");
 }
+
+/// The first device, and the recovery codes its owner is shown once.
+async fn first_device_and_codes(primary: &Primary, user: &str, key: &SigningKey) -> (String, Vec<String>) {
+    let added = ask(primary, user, PrimaryRequest::AddDevice { device: mac(key) }).await;
+    assert!(added.ok && added.pending.is_none(), "{added:?}");
+    backdate(primary).await;
+    (added.value.unwrap(), added.recovery_codes.expect("the first device comes with recovery codes"))
+}
+
+async fn recover(primary: &Primary, user: &str, code: &str, key: &SigningKey) -> PrimaryResponse {
+    ask(primary, user, PrimaryRequest::Recover { code: code.into(), device: mac(key) }).await
+}
+
+#[tokio::test]
+async fn a_first_device_comes_with_recovery_codes_kept_only_as_hashes() {
+    let dir = tempfile::tempdir().unwrap();
+    let primary = primary(dir.path()).await;
+    let (_, codes) = first_device_and_codes(&primary, "sami", &key()).await;
+    assert_eq!(codes.len(), harar_client::recovery::RECOVERY_CODES);
+    let stored = serde_json::to_string(&*primary.keys.lock().await).unwrap();
+    for code in &codes {
+        assert!(!stored.contains(code.as_str()) && !stored.contains(&code.replace('-', "")), "only hashes are kept");
+    }
+    // A second device waits for an approval, and comes with no codes.
+    let second = ask(&primary, "sami", PrimaryRequest::AddDevice { device: mac(&key()) }).await;
+    assert!(second.pending.is_some() && second.recovery_codes.is_none(), "{second:?}");
+}
+
+#[tokio::test]
+async fn a_recovery_code_enrolls_a_device_once_that_waits_a_day_for_reserved_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let primary = primary(dir.path()).await;
+    let (first, codes) = first_device_and_codes(&primary, "sami", &key()).await;
+    let lost = key();
+    assert_eq!(refused(&recover(&primary, "sami", "0000-0000-0000-0000", &lost).await), "bad_code");
+    let recovered = recover(&primary, "sami", &codes[4], &lost).await;
+    assert!(recovered.ok, "{recovered:?}");
+    let id = recovered.value.clone().unwrap();
+    // The person's other devices are named, to be told.
+    assert_eq!(recovered.devices.as_ref().unwrap().iter().map(|d| d.id.clone()).collect::<Vec<_>>(), vec![first.clone()]);
+    let now = now_epoch_seconds();
+    let device = load_devices(&*primary.keys.lock().await).into_iter().find(|d| d.id == id).unwrap();
+    assert!(device.reserved_after >= now + harar_client::approvals::RECOVERY_COOLDOWN_SECONDS - 5);
+    // Used up, with this key or any other.
+    assert_eq!(refused(&recover(&primary, "sami", &codes[4], &key()).await), "bad_code");
+    // On the record, with the other devices named.
+    let audit = std::fs::read_to_string(dir.path().join("audit.log")).unwrap();
+    assert!(audit.contains("with a recovery code") && audit.contains(&first), "{audit}");
+    // Within its day it can't approve a reserved change: not new codes, at least.
+    backdate(&primary).await;
+    let pending = ask(&primary, "sami", PrimaryRequest::NewRecoveryCodes).await.pending.expect("it waits");
+    let early = ask(&primary, "sami", signed(&pending, &id, &lost, Decision::Approve)).await;
+    // Its approval doesn't count yet: nothing is approved, no codes are handed out.
+    assert_eq!(early.decision.as_deref(), Some("pending 0/1"), "{early:?}");
+    assert!(early.recovery_codes.is_none());
+}
+
+#[tokio::test]
+async fn recovery_codes_are_each_persons_own_and_guessing_runs_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let primary = primary(dir.path()).await;
+    add_bob(&primary, false).await;
+    let (_, codes) = first_device_and_codes(&primary, "sami", &key()).await;
+    // Sami's code is no good to Bob.
+    assert_eq!(refused(&recover(&primary, "bob", &codes[0], &key()).await), "bad_code");
+    // Five wrong tries an hour, then not even a right code works.
+    for _ in 0..MAX_RECOVERY_FAILURES {
+        assert_eq!(refused(&recover(&primary, "sami", "zzzz-zzzz-zzzz-zzzz", &key()).await), "bad_code");
+    }
+    assert_eq!(refused(&recover(&primary, "sami", &codes[1], &key()).await), "too_many_attempts");
+    // The tries are kept across restarts: they are in the store.
+    assert!(primary.keys.lock().await.contains_key(RECOVERY_FAILURES_KEY));
+}
+
+#[tokio::test]
+async fn while_a_recovered_device_waits_its_day_the_owners_other_devices_stay() {
+    let dir = tempfile::tempdir().unwrap();
+    let primary = primary(dir.path()).await;
+    let (first, codes) = first_device_and_codes(&primary, "sami", &key()).await;
+    let stolen = recover(&primary, "sami", &codes[0], &key()).await.value.unwrap();
+    // Whoever holds the code can't strip the owner's device...
+    assert_eq!(refused(&ask(&primary, "sami", PrimaryRequest::RemoveDevice { id: first.clone() }).await), "recovery_cooldown");
+    // ...and the owner can revoke the recovered one at once.
+    assert!(ask(&primary, "sami", PrimaryRequest::RemoveDevice { id: stolen }).await.ok);
+    assert!(load_devices(&*primary.keys.lock().await).iter().any(|d| d.id == first && !d.revoked));
+}
+
+#[tokio::test]
+async fn a_new_set_of_codes_is_approved_by_the_persons_own_device_and_replaces_the_old() {
+    let dir = tempfile::tempdir().unwrap();
+    let primary = primary(dir.path()).await;
+    add_bob(&primary, true).await;
+    let sami = key();
+    let (sami_device, old) = first_device_and_codes(&primary, "sami", &sami).await;
+    let bob = key();
+    let bob_device = another_device(&primary, "bob", &bob, (&sami_device, &sami)).await;
+    let pending = ask(&primary, "sami", PrimaryRequest::NewRecoveryCodes).await.pending.expect("it waits");
+    assert!(pending.description.contains("recovery codes of gg.addis.human.sami"), "{}", pending.description);
+    // Another person's device, approver or not, can't decide someone's codes.
+    assert_eq!(refused(&ask(&primary, "bob", signed(&pending, &bob_device, &bob, Decision::Approve)).await), "not_yours");
+    let approved = ask(&primary, "sami", signed(&pending, &sami_device, &sami, Decision::Approve)).await;
+    assert_eq!(approved.decision.as_deref(), Some("approved"), "{approved:?}");
+    let new = approved.recovery_codes.expect("the new set, shown once");
+    assert_eq!(new.len(), harar_client::recovery::RECOVERY_CODES);
+    assert_eq!(refused(&recover(&primary, "sami", &old[0], &key()).await), "bad_code");
+    assert!(recover(&primary, "sami", &new[0], &key()).await.ok);
+}
