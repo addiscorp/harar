@@ -29,14 +29,10 @@ enum DeviceAction {
         #[command(flatten)]
         socket: SocketArgs,
     },
-    /// Enroll this Mac with one of your recovery codes, when you have no
-    /// device left. It approves reserved changes only after a day.
-    Recover {
-        /// One of the codes you were shown, as you kept it.
-        code: String,
-        #[command(flatten)]
-        socket: SocketArgs,
-    },
+    /// Enroll this Mac with one of your recovery codes, when you've lost
+    /// your devices. It asks for the code (never an argument, so it stays out
+    /// of shell history and `ps`); the Mac may deny at once, and approve after a day.
+    Recover(SocketArgs),
 }
 
 /// Ask for a new set of your recovery codes; approving it on your device
@@ -112,7 +108,12 @@ fn key_for(socket: &std::path::Path) -> String {
 pub async fn device(cmd: DeviceCmd) -> Result<()> {
     match cmd.action {
         DeviceAction::Add(socket) => add(socket.socket, None).await,
-        DeviceAction::Recover { code, socket } => add(socket.socket, Some(code)).await,
+        DeviceAction::Recover(socket) => {
+            eprint!("Recovery code: ");
+            let mut code = String::new();
+            std::io::stdin().read_line(&mut code)?;
+            add(socket.socket, Some(code.trim().to_string())).await
+        }
         DeviceAction::Remove { id, socket } => {
             VaultClient::from_socket_path(&socket.socket).remove_device(&id).await?;
             if let Some(mut file) = read_approver()? {
@@ -166,7 +167,13 @@ async fn add(socket: PathBuf, code: Option<String>) -> Result<()> {
     // login password every time it signs.
     let mut file = match read_approver()? {
         Some(file) => file,
-        None => ApproverFile { handle: STANDARD.encode(EnclaveKey::create(Presence::Required)?.handle()?), devices: BTreeMap::new() },
+        None => {
+            // Kept before the primary is asked, so a refusal never leaves a
+            // key behind that nothing knows: the next try uses it.
+            let file = ApproverFile { handle: STANDARD.encode(EnclaveKey::create(Presence::Required)?.handle()?), devices: BTreeMap::new() };
+            write_approver(&file)?;
+            file
+        }
     };
     let key = EnclaveKey::from_handle(&STANDARD.decode(&file.handle)?)?;
     let public = key.public_key()?;
@@ -182,7 +189,7 @@ async fn add(socket: PathBuf, code: Option<String>) -> Result<()> {
         file.devices.insert(key_for(&socket), id.clone());
         write_approver(&file)?;
         let others: Vec<_> = others.iter().map(|d| serde_json::json!({ "id": d.id, "fingerprint": harar_client::approvals::device_fingerprint(d) })).collect();
-        eprintln!("This Mac approves everyday changes now, and reserved ones after a day. If you didn't do this, revoke it from another device.");
+        eprintln!("This Mac can deny requests now and approve them after a day. Your other devices are told (harar approvals).");
         return print_json(&serde_json::json!({ "ok": true, "device": id, "fingerprint": fingerprint, "your_other_devices": others }));
     }
     let added = client.add_device(device).await?;
@@ -233,7 +240,10 @@ async fn add(_socket: PathBuf, _code: Option<String>) -> Result<()> {
 }
 
 pub async fn approvals(cmd: Approvals) -> Result<()> {
-    let (pending, devices) = VaultClient::from_socket_path(&cmd.socket.socket).approvals().await?;
+    let harar_client::Approvals { pending, devices, notices, recovery_codes_left } = VaultClient::from_socket_path(&cmd.socket.socket).approvals().await?;
+    for notice in &notices {
+        eprintln!("notice: {}", notice.text);
+    }
     let waiting: Vec<_> = pending
         .iter()
         .map(|p| serde_json::json!({ "id": p.request.id, "class": p.request.class, "description": p.description, "expires_at": p.request.expires_at }))
@@ -250,7 +260,14 @@ pub async fn approvals(cmd: Approvals) -> Result<()> {
             })
         })
         .collect();
-    print_json(&serde_json::json!({ "ok": true, "waiting": waiting, "devices": devices }))
+    let notices: Vec<_> = notices.iter().map(|n| serde_json::json!({ "at": n.at, "text": n.text })).collect();
+    print_json(&serde_json::json!({
+        "ok": true,
+        "waiting": waiting,
+        "devices": devices,
+        "notices": notices,
+        "recovery_codes_left": recovery_codes_left,
+    }))
 }
 
 pub async fn approve(cmd: Approve) -> Result<()> {
@@ -274,7 +291,7 @@ async fn decide(id: String, socket: PathBuf, decision: Decision) -> Result<()> {
         .cloned()
         .ok_or_else(|| anyhow!("this Mac isn't an approver device at this primary yet: harar device add"))?;
     let client = VaultClient::from_socket_path(&socket);
-    let (pending, _) = client.approvals().await?;
+    let pending = client.approvals().await?.pending;
     let waiting = pending.into_iter().find(|p| p.request.id == id).ok_or_else(|| anyhow!("no request {id} is waiting"))?;
     // What is shown must be what is signed: the request's detail is the hash
     // of exactly what it would do, so text from anywhere else can't be

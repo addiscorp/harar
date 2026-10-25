@@ -193,9 +193,14 @@ impl VaultClient {
     }
 
     /// The requests waiting for a person, and the approver devices.
-    pub async fn approvals(&self) -> Result<(Vec<primary::Pending>, Vec<approvals::ApproverDevice>), VaultClientError> {
+    pub async fn approvals(&self) -> Result<Approvals, VaultClientError> {
         let response = self.ask(&PrimaryRequest::Approvals).await?;
-        Ok((response.approvals.unwrap_or_default(), response.devices.unwrap_or_default()))
+        Ok(Approvals {
+            pending: response.approvals.unwrap_or_default(),
+            devices: response.devices.unwrap_or_default(),
+            notices: response.notices.unwrap_or_default(),
+            recovery_codes_left: response.recovery_codes_left.unwrap_or_default(),
+        })
     }
 
     /// A signed decision; returns `approved`, `denied` or `pending <have>/<need>`.
@@ -264,4 +269,14 @@ pub struct AddedDevice {
     pub pending: Option<primary::Pending>,
     /// A person's first device: their recovery codes, shown once.
     pub recovery_codes: Option<Vec<String>>,
+}
+
+/// What waits for a person, the approver devices, and what the caller should know.
+#[derive(Debug)]
+pub struct Approvals {
+    pub pending: Vec<primary::Pending>,
+    pub devices: Vec<approvals::ApproverDevice>,
+    /// About the caller's own account, newest last.
+    pub notices: Vec<primary::Notice>,
+    pub recovery_codes_left: usize,
 }

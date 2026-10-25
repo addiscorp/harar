@@ -13,7 +13,7 @@ use clap::Args;
 use harar_client::model::{Action, Binding, Decision, Kind, Name, Org, Permission, Policy, Request, Role, Verb, Zone, ZoneKind, ZoneMatch};
 use harar_client::oidc::{self, Alg, IdentityRequest};
 use harar_client::approvals::{self, Approval, ApprovalRequest, ApprovalRule, ApproverDevice, DeviceKind, Widens};
-use harar_client::primary::{Pending, PolicyChange, PolicyView, PrimaryRequest, PrimaryResponse, Waiting, waiting_detail};
+use harar_client::primary::{Notice, Pending, PolicyChange, PolicyView, PrimaryRequest, PrimaryResponse, Waiting, waiting_detail};
 use harar_client::recovery::{StoredCode, replace_recovery_codes, use_recovery_code};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -44,6 +44,11 @@ const MAX_RECOVERY_FAILURES: usize = 5;
 const RECOVERY_WINDOW_SECONDS: u64 = 3600;
 /// Replacing a person's recovery codes: reserved (`recovery.*`).
 const RECOVERY_CLASS: &str = "recovery.codes";
+/// What a person should know about their own account: kept a week, at most
+/// this many in all (the oldest go first).
+const NOTICES_KEY: &str = "harar:notices";
+const NOTICE_SECONDS: u64 = 7 * 24 * 3600;
+const MAX_NOTICES: usize = 256;
 /// How long a request waits for a person before it lapses.
 const APPROVAL_SECONDS: u64 = 15 * 60;
 /// At most this many requests wait at once, and this many devices are enrolled.
@@ -194,6 +199,23 @@ fn new_device(actor: &Name, device: ApproverDevice, devices: &[ApproverDevice]) 
         revoked: false,
         ..device
     })
+}
+
+fn load_notices(keys: &HashMap<String, String>, now: u64) -> Vec<Notice> {
+    let mut notices: Vec<Notice> = keys.get(NOTICES_KEY).and_then(|text| serde_json::from_str(text).ok()).unwrap_or_default();
+    notices.retain(|notice| now < notice.at + NOTICE_SECONDS);
+    notices
+}
+
+/// Tells `human`, the next time they look (`harar approvals`): no one can
+/// take it back, and it goes only after a week.
+fn notify(keys: &mut HashMap<String, String>, human: &Name, text: String) {
+    let now = now_epoch_seconds();
+    let mut notices = load_notices(keys, now);
+    notices.push(Notice { human: human.clone(), at: now, text });
+    let over = notices.len().saturating_sub(MAX_NOTICES);
+    notices.drain(..over);
+    keys.insert(NOTICES_KEY.into(), serde_json::to_string(&notices).expect("notices serialize"));
 }
 
 fn load_recovery(keys: &HashMap<String, String>) -> Vec<StoredCode> {
@@ -565,7 +587,18 @@ impl Primary {
                     .into_iter()
                     .map(|stored| Pending { description: describe(&stored.request, &stored.waiting), request: stored.request, waiting: stored.waiting })
                     .collect();
-                (None, reply(PrimaryResponse { approvals: Some(pending), devices: Some(load_devices(keys)), ..PrimaryResponse::ok() }))
+                let notices = load_notices(keys, now_epoch_seconds()).into_iter().filter(|notice| notice.human == *actor).collect();
+                let left = load_recovery(keys).iter().filter(|code| code.human == *actor).count();
+                (
+                    None,
+                    reply(PrimaryResponse {
+                        approvals: Some(pending),
+                        devices: Some(load_devices(keys)),
+                        notices: Some(notices),
+                        recovery_codes_left: Some(left),
+                        ..PrimaryResponse::ok()
+                    }),
+                )
             }
             PrimaryRequest::Submit { approval } => self.submit(keys, &policy, &users, approval),
             PrimaryRequest::AddDevice { device } => {
@@ -647,12 +680,26 @@ impl Primary {
                 // Who should be told: every other device of theirs, named in the record.
                 let told: Vec<&str> = others.iter().map(|other| other.id.as_str()).collect();
                 let subject = Some(format!("{what}: {id}; {left} codes left; their other devices: [{}]", told.join(", ")));
+                // Told where only time removes it, so whoever used the code
+                // can't hide it from the owner.
+                notify(
+                    &mut next,
+                    actor,
+                    format!(
+                        "a new device {id} was enrolled with one of your recovery codes ({left} left); if it wasn't you, revoke it (harar device remove {id}) and get new codes (harar recovery-codes)"
+                    ),
+                );
                 (subject, Outcome::CommitWith(next, Box::new(PrimaryResponse { value: Some(id), devices: Some(others), ..PrimaryResponse::ok() })))
             }
             PrimaryRequest::NewRecoveryCodes => {
                 let subject = Some(format!("new recovery codes for {actor}"));
                 if actor.kind() != Kind::Human {
                     return (subject, refuse("not_a_human"));
+                }
+                // Only someone with a device of their own can approve it, so
+                // no one else holds the one place it waits in.
+                if !load_devices(keys).iter().any(|device| !device.revoked && device.human == *actor) {
+                    return (subject, refuse("no_device"));
                 }
                 let mut next = keys.clone();
                 match self.wait(&mut next, actor, RECOVERY_CLASS, false, Waiting::RecoveryCodes { human: actor.clone() }) {
@@ -866,12 +913,18 @@ impl Primary {
                             return (Some(format!("{who}: approved_but_{reason}")), Outcome::CommitWith(next, Box::new(PrimaryResponse::error(format!("approved_but_{reason}")))));
                         }
                         device.enrolled_at = now;
+                        // A person's first device: their way back in, if it is lost,
+                        // is a set of codes only they see, so they ask for it themselves.
+                        if !devices.iter().any(|other| !other.revoked && other.human == device.human) {
+                            notify(&mut next, &device.human, "you have no recovery codes yet: harar recovery-codes, approved on this device".into());
+                        }
                         devices.push(device);
                     }
                     Waiting::RecoveryCodes { human } => {
                         let mut stored = load_recovery(keys);
                         codes = Some(replace_recovery_codes(&mut stored, &human));
                         store_recovery(&mut next, &stored);
+                        notify(&mut next, &human, format!("your recovery codes were replaced, approved with {}; the old ones no longer work", device.id));
                     }
                 }
                 "approved".to_string()

@@ -156,6 +156,21 @@ pub struct PrimaryResponse {
     /// for an approved new set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_codes: Option<Vec<String>>,
+    /// For `approvals`: what happened to the caller's own account lately (a
+    /// device recovered with a code, codes replaced), and how many of their
+    /// recovery codes are left.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notices: Option<Vec<Notice>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_codes_left: Option<usize>,
+}
+
+/// Something a person should know about their own account, kept a week.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Notice {
+    pub human: crate::model::Name,
+    pub at: u64,
+    pub text: String,
 }
 
 impl PrimaryResponse {

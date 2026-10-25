@@ -514,3 +514,41 @@ async fn a_new_set_of_codes_is_approved_by_the_persons_own_device_and_replaces_t
     assert_eq!(refused(&recover(&primary, "sami", &old[0], &key()).await), "bad_code");
     assert!(recover(&primary, "sami", &new[0], &key()).await.ok);
 }
+
+#[tokio::test]
+async fn the_owner_is_told_of_a_recovery_and_of_new_codes_and_nobody_else_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let primary = primary(dir.path()).await;
+    add_bob(&primary, true).await;
+    let sami = key();
+    let (sami_device, codes) = first_device_and_codes(&primary, "sami", &sami).await;
+    let seen = ask(&primary, "sami", PrimaryRequest::Approvals).await;
+    assert_eq!(seen.recovery_codes_left, Some(harar_client::recovery::RECOVERY_CODES));
+    assert_eq!(seen.notices.as_deref(), Some(&[][..]));
+    let recovered = recover(&primary, "sami", &codes[0], &key()).await.value.unwrap();
+    let seen = ask(&primary, "sami", PrimaryRequest::Approvals).await;
+    let notices = seen.notices.unwrap();
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].text.contains(&recovered) && notices[0].text.contains("recovery codes"), "{notices:?}");
+    assert_eq!(seen.recovery_codes_left, Some(harar_client::recovery::RECOVERY_CODES - 1));
+    // Bob's first device, approved by Sami: Bob is told to get codes, and
+    // sees nothing of Sami's account.
+    let bob = key();
+    another_device(&primary, "bob", &bob, (&sami_device, &sami)).await;
+    let bobs = ask(&primary, "bob", PrimaryRequest::Approvals).await;
+    let bobs_notices = bobs.notices.unwrap();
+    assert_eq!(bobs_notices.len(), 1, "{bobs_notices:?}");
+    assert!(bobs_notices[0].text.contains("no recovery codes yet"));
+    assert_eq!(bobs.recovery_codes_left, Some(0));
+}
+
+#[tokio::test]
+async fn new_codes_are_asked_for_only_by_someone_with_a_device() {
+    let dir = tempfile::tempdir().unwrap();
+    let primary = primary(dir.path()).await;
+    add_bob(&primary, false).await;
+    first_device_and_codes(&primary, "sami", &key()).await;
+    assert_eq!(refused(&ask(&primary, "bob", PrimaryRequest::NewRecoveryCodes).await), "no_device");
+    assert!(ask(&primary, "sami", PrimaryRequest::NewRecoveryCodes).await.pending.is_some());
+    assert_eq!(refused(&ask(&primary, "sami", PrimaryRequest::NewRecoveryCodes).await), "already_waiting");
+}
