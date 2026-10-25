@@ -32,7 +32,13 @@ enum DeviceAction {
     /// Enroll this Mac with one of your recovery codes, when you've lost
     /// your devices. It asks for the code (never an argument, so it stays out
     /// of shell history and `ps`); the Mac may deny at once, and approve after a day.
-    Recover(SocketArgs),
+    Recover {
+        /// Where the code comes from: a prompt that doesn't echo, by default.
+        #[command(flatten)]
+        code: crate::cli::secret_input::SecretInput,
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
 }
 
 /// Ask for a new set of your recovery codes; approving it on your device
@@ -108,12 +114,8 @@ fn key_for(socket: &std::path::Path) -> String {
 pub async fn device(cmd: DeviceCmd) -> Result<()> {
     match cmd.action {
         DeviceAction::Add(socket) => add(socket.socket, None).await,
-        DeviceAction::Recover(socket) => {
-            eprint!("Recovery code: ");
-            let mut code = String::new();
-            std::io::stdin().read_line(&mut code)?;
-            add(socket.socket, Some(code.trim().to_string())).await
-        }
+        // Empty input is refused here, never spent as one of the hour's tries.
+        DeviceAction::Recover { code, socket } => add(socket.socket, Some(code.read("Recovery code")?)).await,
         DeviceAction::Remove { id, socket } => {
             VaultClient::from_socket_path(&socket.socket).remove_device(&id).await?;
             if let Some(mut file) = read_approver()? {

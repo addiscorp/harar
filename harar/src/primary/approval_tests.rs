@@ -552,3 +552,19 @@ async fn new_codes_are_asked_for_only_by_someone_with_a_device() {
     assert!(ask(&primary, "sami", PrimaryRequest::NewRecoveryCodes).await.pending.is_some());
     assert_eq!(refused(&ask(&primary, "sami", PrimaryRequest::NewRecoveryCodes).await), "already_waiting");
 }
+
+#[tokio::test]
+async fn one_persons_notices_never_push_out_anothers() {
+    let mut keys = HashMap::new();
+    let sami = name("gg.addis.human.sami");
+    let bob = name("gg.addis.human.bob");
+    notify(&mut keys, &sami, "a recovery".into());
+    for n in 0..500 {
+        notify(&mut keys, &bob, format!("bob {n}"));
+    }
+    let notices = load_notices(&keys, now_epoch_seconds());
+    assert!(notices.iter().any(|n| n.human == sami && n.text == "a recovery"));
+    let bobs: Vec<_> = notices.iter().filter(|n| n.human == bob).collect();
+    assert_eq!(bobs.len(), MAX_NOTICES);
+    assert_eq!(bobs.last().unwrap().text, "bob 499", "the newest are kept");
+}

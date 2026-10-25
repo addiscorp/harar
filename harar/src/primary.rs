@@ -45,10 +45,11 @@ const RECOVERY_WINDOW_SECONDS: u64 = 3600;
 /// Replacing a person's recovery codes: reserved (`recovery.*`).
 const RECOVERY_CLASS: &str = "recovery.codes";
 /// What a person should know about their own account: kept a week, at most
-/// this many in all (the oldest go first).
+/// this many per person (their oldest go first), so no one's notices push out
+/// anyone else's.
 const NOTICES_KEY: &str = "harar:notices";
 const NOTICE_SECONDS: u64 = 7 * 24 * 3600;
-const MAX_NOTICES: usize = 256;
+const MAX_NOTICES: usize = 32;
 /// How long a request waits for a person before it lapses.
 const APPROVAL_SECONDS: u64 = 15 * 60;
 /// At most this many requests wait at once, and this many devices are enrolled.
@@ -213,8 +214,13 @@ fn notify(keys: &mut HashMap<String, String>, human: &Name, text: String) {
     let now = now_epoch_seconds();
     let mut notices = load_notices(keys, now);
     notices.push(Notice { human: human.clone(), at: now, text });
-    let over = notices.len().saturating_sub(MAX_NOTICES);
-    notices.drain(..over);
+    let mine = notices.iter().filter(|notice| notice.human == *human).count();
+    let mut over = mine.saturating_sub(MAX_NOTICES);
+    notices.retain(|notice| {
+        let drop = over > 0 && notice.human == *human;
+        over -= usize::from(drop);
+        !drop
+    });
     keys.insert(NOTICES_KEY.into(), serde_json::to_string(&notices).expect("notices serialize"));
 }
 
@@ -915,7 +921,7 @@ impl Primary {
                         device.enrolled_at = now;
                         // A person's first device: their way back in, if it is lost,
                         // is a set of codes only they see, so they ask for it themselves.
-                        if !devices.iter().any(|other| !other.revoked && other.human == device.human) {
+                        if !load_recovery(keys).iter().any(|code| code.human == device.human) {
                             notify(&mut next, &device.human, "you have no recovery codes yet: harar recovery-codes, approved on this device".into());
                         }
                         devices.push(device);
