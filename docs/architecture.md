@@ -65,9 +65,17 @@ binding: actor pattern × zone pattern → role
 role:    [ verb resource-pattern, … ]
 ```
 
-Verbs: `read` and `write` (secrets), `token` (identity tokens for an app and
+Verbs: `read` and `write` (secrets), `send` (a secret to the hosts named as
+its scopes, without reading it), `token` (identity tokens for an app and
 scope), `launch` (start a zone of a profile), `approve` (an approval class),
 and nothing more: an app's channels are managed by its services (section 3b).
+
+`send` is where a secret may go: `send prod/shop/STRIPE_KEY api.stripe.com`
+(a host, or `*.example.com` for any name under it, never the name itself; no
+addresses). mirab's station asks `hosts` for what to open and `send` for each
+request, so the key reaches only those hosts, and the record names the host
+each time. Adding a host is a widening, approved like any other. A per-user
+agent keeps the same list in its own vault (`harar hosts allow|revoke`).
 
 ```
 role gg.addis.role.site-runtime

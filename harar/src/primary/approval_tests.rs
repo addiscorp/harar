@@ -568,3 +568,31 @@ async fn one_persons_notices_never_push_out_anothers() {
     assert_eq!(bobs.len(), MAX_NOTICES);
     assert_eq!(bobs.last().unwrap().text, "bob 499", "the newest are kept");
 }
+
+#[tokio::test]
+async fn a_secret_is_sent_only_to_the_hosts_a_role_names_and_the_record_says_where() {
+    let dir = tempfile::tempdir().unwrap();
+    let primary = primary(dir.path()).await;
+    assert!(ask(&primary, "sami", PrimaryRequest::Put { key: "prod/shop/STRIPE_KEY".into(), value: "sk_live_real".into() }).await.ok);
+    // Bob may send it to Stripe, and never read it.
+    add_bob(&primary, false).await;
+    let role = Role {
+        name: name("gg.addis.role.stripe-out"),
+        allows: vec![Permission { verb: Verb::Send, resource: "prod/shop/STRIPE_KEY".into(), scopes: vec!["api.stripe.com".into()] }],
+    };
+    assert!(change(&primary, "sami", PolicyChange::SetRole { role }).await.ok);
+    let binding = Binding { actor: "gg.addis.human.bob".parse().unwrap(), zone: ZoneMatch::Name("gg.addis.zone.bugsy".parse().unwrap()), role: name("gg.addis.role.stripe-out") };
+    assert!(change(&primary, "sami", PolicyChange::Bind { binding }).await.ok);
+    let hosts = ask(&primary, "bob", PrimaryRequest::Hosts { key: "prod/shop/STRIPE_KEY".into() }).await;
+    assert_eq!(hosts.hosts.as_deref(), Some(&["api.stripe.com".to_string()][..]));
+    let sent = ask(&primary, "bob", PrimaryRequest::Send { key: "prod/shop/STRIPE_KEY".into(), host: "api.stripe.com".into() }).await;
+    assert_eq!(sent.value.as_deref(), Some("sk_live_real"));
+    assert_eq!(refused(&ask(&primary, "bob", PrimaryRequest::Send { key: "prod/shop/STRIPE_KEY".into(), host: "evil.example.com".into() }).await), "no_binding");
+    assert_eq!(refused(&ask(&primary, "bob", PrimaryRequest::Get { key: "prod/shop/STRIPE_KEY".into() }).await), "no_binding");
+    // The primary's own entries are never sent anywhere, and hosts here are policy.
+    assert_eq!(refused(&ask(&primary, "sami", PrimaryRequest::Send { key: "harar:policy".into(), host: "api.stripe.com".into() }).await), "reserved_key");
+    assert_eq!(refused(&ask(&primary, "sami", PrimaryRequest::AllowHost { key: "prod/shop/STRIPE_KEY".into(), host: "evil.example.com".into() }).await), "hosts_are_policy");
+    let audit = std::fs::read_to_string(dir.path().join("audit.log")).unwrap();
+    assert!(audit.contains("prod/shop/STRIPE_KEY to api.stripe.com") && audit.contains("prod/shop/STRIPE_KEY to evil.example.com"), "{audit}");
+    assert!(!audit.contains("sk_live_real"));
+}

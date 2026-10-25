@@ -112,6 +112,10 @@ enum RoleAction {
         launch: Vec<String>,
         #[arg(long)]
         approve: Vec<String>,
+        /// "SECRET HOST…": where a secret may go, e.g.
+        /// "prod/shop/STRIPE_KEY api.stripe.com" (a host may be *.example.com).
+        #[arg(long)]
+        send: Vec<String>,
     },
     Remove { name: Name },
 }
@@ -206,12 +210,17 @@ pub async fn policy(cmd: PolicyCmd) -> Result<()> {
             let decision = client.decide(actor, one_action(action)?).await?;
             return print_json(&serde_json::json!({ "decision": decision }));
         }
-        PolicyAction::Role(RoleAction::Set { name, read, write, token, launch, approve }) => {
+        PolicyAction::Role(RoleAction::Set { name, read, write, token, launch, approve, send }) => {
             let plain = |verb, resources: Vec<String>| resources.into_iter().map(move |resource| Permission { verb, resource, scopes: vec![] });
             let mut allows: Vec<Permission> = plain(Verb::Read, read).chain(plain(Verb::Write, write)).chain(plain(Verb::Launch, launch)).chain(plain(Verb::Approve, approve)).collect();
             allows.extend(token.iter().map(|value| {
                 let (resource, scopes) = audience_and_scopes(value);
                 Permission { verb: Verb::Token, resource, scopes }
+            }));
+            // The same shape: the secret, then its hosts.
+            allows.extend(send.iter().map(|value| {
+                let (resource, scopes) = audience_and_scopes(value);
+                Permission { verb: Verb::Send, resource, scopes }
             }));
             PolicyChange::SetRole { role: Role { name, allows } }
         }

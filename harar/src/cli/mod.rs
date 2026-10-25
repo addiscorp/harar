@@ -4,6 +4,7 @@ use std::path::PathBuf;
 pub mod agent;
 pub mod approve;
 pub mod get;
+pub mod hosts;
 pub mod identity;
 pub mod key;
 pub mod plugin;
@@ -36,6 +37,8 @@ enum Command {
     Plugin(plugin::Plugin),
     Ssh(ssh::Ssh),
     Get(get::Get),
+    /// Where a secret may go.
+    Hosts(hosts::Hosts),
     Put(put::Put),
     Token(identity::Token),
     Policy(identity::PolicyCmd),
@@ -78,6 +81,7 @@ pub async fn run() -> anyhow::Result<()> {
         Command::Plugin(cmd) => plugin::run(cmd).await,
         Command::Ssh(cmd) => ssh::run(cmd).await,
         Command::Get(cmd) => get::run(cmd).await,
+        Command::Hosts(cmd) => hosts::run(cmd).await,
         Command::Put(cmd) => put::run(cmd).await,
         Command::Token(cmd) => identity::token(cmd).await,
         Command::Policy(cmd) => identity::policy(cmd).await,

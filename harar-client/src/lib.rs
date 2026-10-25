@@ -232,6 +232,26 @@ impl VaultClient {
         self.ask(&PrimaryRequest::NewRecoveryCodes).await?.pending.ok_or_else(|| VaultClientError::InvalidResponse("no request".into()))
     }
 
+    /// The hosts you may send `key` to.
+    pub async fn hosts(&self, key: &str) -> Result<Vec<String>, VaultClientError> {
+        Ok(self.ask(&PrimaryRequest::Hosts { key: key.into() }).await?.hosts.unwrap_or_default())
+    }
+
+    /// Lets `key` go to `host` (a per-user agent's vault; a primary says to
+    /// use a role's `send` permission).
+    pub async fn allow_host(&self, key: &str, host: &str) -> Result<(), VaultClientError> {
+        self.ask(&PrimaryRequest::AllowHost { key: key.into(), host: host.into() }).await.map(drop)
+    }
+
+    pub async fn revoke_host(&self, key: &str, host: &str) -> Result<(), VaultClientError> {
+        self.ask(&PrimaryRequest::RevokeHost { key: key.into(), host: host.into() }).await.map(drop)
+    }
+
+    /// The value of `key`, for a request to `host` only.
+    pub async fn send(&self, key: &str, host: &str) -> Result<String, VaultClientError> {
+        self.ask(&PrimaryRequest::Send { key: key.into(), host: host.into() }).await?.value.ok_or_else(|| VaultClientError::InvalidResponse("no value".into()))
+    }
+
     pub async fn remove_device(&self, id: &str) -> Result<(), VaultClientError> {
         self.ask(&PrimaryRequest::RemoveDevice { id: id.into() }).await.map(drop)
     }
