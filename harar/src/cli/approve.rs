@@ -10,6 +10,7 @@ use anyhow::{Result, anyhow};
 use clap::{Args, Subcommand};
 use harar_client::VaultClient;
 use harar_client::approvals::Decision;
+#[cfg(target_os = "macos")]
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -74,6 +75,7 @@ pub struct Deny {
 }
 
 /// This Mac's approver key, and the device id each primary (by socket) gave it.
+#[cfg(target_os = "macos")]
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct ApproverFile {
     /// The Secure Enclave key's handle, base64.
@@ -81,11 +83,13 @@ struct ApproverFile {
     devices: BTreeMap<String, String>,
 }
 
+#[cfg(target_os = "macos")]
 fn approver_path() -> PathBuf {
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
     if cfg!(target_os = "macos") { home.join("Library/Application Support/harar/approver.json") } else { home.join(".harar/approver.json") }
 }
 
+#[cfg(target_os = "macos")]
 fn read_approver() -> Result<Option<ApproverFile>> {
     match std::fs::read_to_string(approver_path()) {
         Ok(text) => Ok(Some(serde_json::from_str(&text)?)),
@@ -94,6 +98,7 @@ fn read_approver() -> Result<Option<ApproverFile>> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn write_approver(file: &ApproverFile) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
