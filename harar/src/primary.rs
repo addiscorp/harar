@@ -13,7 +13,7 @@ use clap::Args;
 use harar_client::model::{Action, Binding, Decision, Kind, Name, Org, Permission, Policy, Request, Role, Verb, Zone, ZoneKind, ZoneMatch};
 use harar_client::oidc::{self, Alg, IdentityRequest};
 use harar_client::approvals::{self, Approval, ApprovalRequest, ApprovalRule, ApproverDevice, DeviceKind, Widens};
-use harar_client::primary::{Pending, PolicyChange, PolicyView, PrimaryRequest, PrimaryResponse, Waiting};
+use harar_client::primary::{Pending, PolicyChange, PolicyView, PrimaryRequest, PrimaryResponse, Waiting, waiting_detail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, OpenOptions};
@@ -40,6 +40,8 @@ const APPROVAL_SECONDS: u64 = 15 * 60;
 /// At most this many requests wait at once, and this many devices are enrolled.
 const MAX_WAITING: usize = 32;
 const MAX_DEVICES: usize = 16;
+/// At most this many requests wait for one asker, so no one fills the list.
+const MAX_WAITING_PER_ASKER: usize = 4;
 /// Tokens last this long unless asked for less.
 const DEFAULT_TOKEN_SECONDS: u64 = 300;
 
@@ -157,12 +159,23 @@ fn store_waiting(keys: &mut HashMap<String, String>, waiting: &[Stored]) {
     keys.insert(WAITING_KEY.into(), serde_json::to_string(waiting).expect("approvals serialize"));
 }
 
+/// The same change waiting twice: the same policy change, or the same key to enroll.
+fn same_change(a: &Waiting, b: &Waiting) -> bool {
+    match (a, b) {
+        (Waiting::Policy { change: a }, Waiting::Policy { change: b }) => a == b,
+        (Waiting::Device { device: a }, Waiting::Device { device: b }) => a.public_key.x == b.public_key.x && a.public_key.y == b.public_key.y,
+        _ => false,
+    }
+}
+
 /// One line for the person deciding: who asks, from where, for exactly what.
 fn describe(request: &ApprovalRequest, waiting: &Waiting) -> String {
     let who = request.act_for.as_ref().unwrap_or(&request.actor);
     let what = match waiting {
         Waiting::Policy { change } => format!("change the policy: {}", serde_json::to_string(change).unwrap_or_default()),
-        Waiting::Device { device } => format!("enroll another approver device for {}", device.human),
+        Waiting::Device { device } => {
+            format!("enroll the {:?} key {} as an approver device for {}", device.kind, approvals::device_fingerprint(device), device.human)
+        }
     };
     let zone = request.zone.as_ref().map(Name::to_string).unwrap_or_default();
     format!("[{} on {}] {who}, at {zone}, asks to {what}", request.class, request.primary)
@@ -494,11 +507,11 @@ impl Primary {
             }
             PrimaryRequest::Submit { approval } => self.submit(keys, &policy, &users, approval),
             PrimaryRequest::AddDevice { device } => {
-                let subject = Some(format!("{:?} for {actor}", device.kind));
-                // Mac keys only, for now: a passkey's enrollment needs its own
-                // ceremony (attestation), which the approval page will run.
+                let subject = Some(format!("{:?} key {} for {actor}", device.kind, approvals::device_fingerprint(&device)));
                 // Always the caller's own device: whom it approves as comes
-                // from who is asking, never from what the request says.
+                // from who is asking, never from what the request says. Mac
+                // keys only, for now: a passkey's enrollment needs its own
+                // ceremony (attestation), which the approval page will run.
                 if actor.kind() != Kind::Human || device.kind != DeviceKind::Mac || !device.user_verification {
                     return (subject, refuse("bad_device"));
                 }
@@ -506,8 +519,12 @@ impl Primary {
                     return (subject, refuse("bad_device"));
                 }
                 let mut devices = load_devices(keys);
-                if devices.len() >= MAX_DEVICES {
+                let live = devices.iter().filter(|other| !other.revoked).count();
+                if live >= MAX_DEVICES {
                     return (subject, refuse("too_many_devices"));
+                }
+                if devices.iter().any(|other| !other.revoked && other.public_key.x == device.public_key.x && other.public_key.y == device.public_key.y) {
+                    return (subject, refuse("key_enrolled"));
                 }
                 let now = now_epoch_seconds();
                 let device = ApproverDevice {
@@ -522,9 +539,11 @@ impl Primary {
                     ..device
                 };
                 let mut next = keys.clone();
-                // A person's first device is theirs to enroll; another one is
-                // approved with a device they already have.
-                if devices.iter().any(|other| !other.revoked && other.human == *actor) {
+                // Approvals start with one device, enrolled at once, of someone
+                // who can approve a widening. After that every device, a
+                // person's first included, is approved with a device that is
+                // already there: an OS account alone never makes an approver.
+                if live > 0 {
                     return match self.wait(&mut next, actor, DEVICE_APPROVAL_CLASS, true, Waiting::Device { device }) {
                         Ok(pending) => (subject, Outcome::CommitWith(next, Box::new(PrimaryResponse { pending: Some(pending), ..PrimaryResponse::ok() }))),
                         Err(reason) => (subject, refuse(reason)),
@@ -532,11 +551,14 @@ impl Primary {
                 }
                 let id = device.id.clone();
                 devices.push(device);
+                if !self.devices_can_widen(&policy, &devices) {
+                    return (subject, refuse("not_an_approver"));
+                }
                 store_devices(&mut next, &devices);
                 (subject, Outcome::CommitWith(next, Box::new(PrimaryResponse { value: Some(id), devices: Some(devices), ..PrimaryResponse::ok() })))
             }
             PrimaryRequest::RemoveDevice { id } => {
-                let subject = Some(id.clone());
+                let subject = Some(format!("{id} of {actor}"));
                 let mut devices = load_devices(keys);
                 let Some(device) = devices.iter_mut().find(|device| device.id == id && device.human == *actor && !device.revoked) else {
                     return (subject, refuse("no_such_device"));
@@ -624,6 +646,12 @@ impl Primary {
         if all.len() >= MAX_WAITING {
             return Err("too_many_waiting");
         }
+        if all.iter().filter(|stored| stored.request.act_for.as_ref() == Some(actor)).count() >= MAX_WAITING_PER_ASKER {
+            return Err("too_many_waiting");
+        }
+        if all.iter().any(|stored| same_change(&stored.waiting, &waiting)) {
+            return Err("already_waiting");
+        }
         let request = ApprovalRequest {
             id: approvals::approval_id(),
             primary: self.issuer.url().to_string(),
@@ -640,6 +668,7 @@ impl Primary {
             grants_approval: grants,
             created_at: now,
             expires_at: now + APPROVAL_SECONDS,
+            detail: Some(waiting_detail(&waiting)),
         };
         all.push(Stored { request: request.clone(), waiting: waiting.clone(), approvals: Vec::new() });
         store_waiting(keys, &all);
@@ -668,6 +697,8 @@ impl Primary {
         if self.check(policy, &device.human, &Action::Approve { class }).is_err() {
             return (subject, refuse("not_an_approver"));
         }
+        // From here the audit line names who decided, with which device.
+        let who = format!("{} by {} ({})", approval.request_id, device.id, device.human);
         let entry = &mut all[index];
         entry.approvals.retain(|other| other.device_id != approval.device_id);
         entry.approvals.push(approval);
@@ -697,10 +728,19 @@ impl Primary {
                         Err(reason) => {
                             store_waiting(&mut next, &all);
                             store_devices(&mut next, &devices);
-                            return (subject, Outcome::CommitWith(next, Box::new(PrimaryResponse::error(format!("approved_but_{reason}")))));
+                            return (Some(format!("{who}: approved_but_{reason}")), Outcome::CommitWith(next, Box::new(PrimaryResponse::error(format!("approved_but_{reason}")))));
                         }
                     },
                     Waiting::Device { mut device } => {
+                        // The cap and the key, again, as they are now.
+                        let live = devices.iter().filter(|other| !other.revoked).count();
+                        let enrolled = devices.iter().any(|other| !other.revoked && other.public_key.x == device.public_key.x && other.public_key.y == device.public_key.y);
+                        if live >= MAX_DEVICES || enrolled {
+                            store_waiting(&mut next, &all);
+                            store_devices(&mut next, &devices);
+                            let reason = if enrolled { "key_enrolled" } else { "too_many_devices" };
+                            return (Some(format!("{who}: approved_but_{reason}")), Outcome::CommitWith(next, Box::new(PrimaryResponse::error(format!("approved_but_{reason}")))));
+                        }
                         device.enrolled_at = now;
                         devices.push(device);
                     }
@@ -710,7 +750,7 @@ impl Primary {
         };
         store_waiting(&mut next, &all);
         store_devices(&mut next, &devices);
-        (subject, Outcome::CommitWith(next, Box::new(PrimaryResponse { decision: Some(decision), ..PrimaryResponse::ok() })))
+        (Some(format!("{who}: {decision}")), Outcome::CommitWith(next, Box::new(PrimaryResponse { decision: Some(decision), ..PrimaryResponse::ok() })))
     }
 
     fn apply(&self, policy: &mut Policy, users: &mut BTreeMap<String, Name>, change: PolicyChange) -> Result<(), &'static str> {

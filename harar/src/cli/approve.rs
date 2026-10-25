@@ -8,7 +8,7 @@ use crate::cli::{SocketArgs, print_json};
 use anyhow::{Result, anyhow};
 use clap::{Args, Subcommand};
 use harar_client::VaultClient;
-use harar_client::approvals::{Approval, Decision, Proof};
+use harar_client::approvals::Decision;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -62,14 +62,8 @@ struct ApproverFile {
 }
 
 fn approver_path() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"));
-    if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/harar/approver.json")
-    } else {
-        home.join(".harar/approver.json")
-    }
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
+    if cfg!(target_os = "macos") { home.join("Library/Application Support/harar/approver.json") } else { home.join(".harar/approver.json") }
 }
 
 fn read_approver() -> Result<Option<ApproverFile>> {
@@ -86,18 +80,14 @@ fn write_approver(file: &ApproverFile) -> Result<()> {
     let path = approver_path();
     std::fs::create_dir_all(path.parent().expect("a parent directory"))?;
     let part = path.with_extension("json.part");
-    let mut out = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&part)?;
+    let mut out = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&part)?;
     out.write_all(serde_json::to_string_pretty(file)?.as_bytes())?;
     out.sync_all()?;
     std::fs::rename(part, path)?;
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn key_for(socket: &std::path::Path) -> String {
     socket.to_string_lossy().into_owned()
 }
@@ -106,9 +96,7 @@ pub async fn device(cmd: DeviceCmd) -> Result<()> {
     match cmd.action {
         DeviceAction::Add(socket) => add(socket.socket).await,
         DeviceAction::Remove { id, socket } => {
-            VaultClient::from_socket_path(&socket.socket)
-                .remove_device(&id)
-                .await?;
+            VaultClient::from_socket_path(&socket.socket).remove_device(&id).await?;
             if let Some(mut file) = read_approver()? {
                 file.devices.retain(|_, enrolled| *enrolled != id);
                 write_approver(&file)?;
@@ -118,32 +106,16 @@ pub async fn device(cmd: DeviceCmd) -> Result<()> {
     }
 }
 
+/// The device `harar device add` sends for a 65-byte uncompressed P-256 key:
+/// a Mac key that asks first. The primary sets its id, owner and times.
 #[cfg(target_os = "macos")]
-async fn add(socket: PathBuf) -> Result<()> {
-    use crate::enclave::{EnclaveKey, Presence};
+fn device_view(public: &[u8]) -> harar_client::approvals::ApproverDevice {
     use base64::Engine;
-    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use harar_client::approvals::{ApproverDevice, DeviceKind};
-    // One approver key per Mac user, made once; it asks for Touch ID or the
-    // login password every time it signs.
-    let mut file = match read_approver()? {
-        Some(file) => file,
-        None => ApproverFile {
-            handle: STANDARD.encode(EnclaveKey::create(Presence::Required)?.handle()?),
-            devices: BTreeMap::new(),
-        },
-    };
-    let key = EnclaveKey::from_handle(&STANDARD.decode(&file.handle)?)?;
-    let public = key.public_key()?;
-    if public.len() != 65 || public[0] != 4 {
-        return Err(anyhow!(
-            "the Secure Enclave key isn't an uncompressed P-256 key"
-        ));
-    }
-    let device = ApproverDevice {
-        // The primary sets the id, the owner (the caller) and the times.
+    ApproverDevice {
         id: String::new(),
-        human: "x.x.human.x".parse()?,
+        human: "x.x.human.x".parse().expect("a stand-in name"),
         kind: DeviceKind::Mac,
         public_key: harar_client::Jwk {
             kty: "EC".into(),
@@ -162,10 +134,29 @@ async fn add(socket: PathBuf) -> Result<()> {
         sign_count: 0,
         reserved_after: 0,
         revoked: false,
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn add(socket: PathBuf) -> Result<()> {
+    use crate::enclave::{EnclaveKey, Presence};
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    // One approver key per Mac user, made once; it asks for Touch ID or the
+    // login password every time it signs.
+    let mut file = match read_approver()? {
+        Some(file) => file,
+        None => ApproverFile { handle: STANDARD.encode(EnclaveKey::create(Presence::Required)?.handle()?), devices: BTreeMap::new() },
     };
-    let (enrolled, pending) = VaultClient::from_socket_path(&socket)
-        .add_device(device)
-        .await?;
+    let key = EnclaveKey::from_handle(&STANDARD.decode(&file.handle)?)?;
+    let public = key.public_key()?;
+    if public.len() != 65 || public[0] != 4 {
+        return Err(anyhow!("the Secure Enclave key isn't an uncompressed P-256 key"));
+    }
+    let device = device_view(&public);
+    // To compare with what an approver is shown before they approve this key.
+    let fingerprint = harar_client::approvals::device_fingerprint(&device);
+    let (enrolled, pending) = VaultClient::from_socket_path(&socket).add_device(device).await?;
     let id = match (&enrolled, &pending) {
         (Some(id), _) => id.clone(),
         (None, Some(pending)) => match &pending.waiting {
@@ -177,10 +168,11 @@ async fn add(socket: PathBuf) -> Result<()> {
     file.devices.insert(key_for(&socket), id.clone());
     write_approver(&file)?;
     match pending {
-        None => print_json(&serde_json::json!({ "ok": true, "device": id })),
+        None => print_json(&serde_json::json!({ "ok": true, "device": id, "fingerprint": fingerprint })),
         Some(pending) => print_json(&serde_json::json!({
             "ok": true,
             "device": id,
+            "fingerprint": fingerprint,
             "waiting": pending.request.id,
             "description": pending.description,
         })),
@@ -189,22 +181,26 @@ async fn add(socket: PathBuf) -> Result<()> {
 
 #[cfg(not(target_os = "macos"))]
 async fn add(_socket: PathBuf) -> Result<()> {
-    Err(anyhow!(
-        "an approver key needs a Mac's Secure Enclave for now; passkeys come with the approval page"
-    ))
+    Err(anyhow!("an approver key needs a Mac's Secure Enclave for now; passkeys come with the approval page"))
 }
 
 pub async fn approvals(cmd: Approvals) -> Result<()> {
-    let (pending, devices) = VaultClient::from_socket_path(&cmd.socket.socket)
-        .approvals()
-        .await?;
+    let (pending, devices) = VaultClient::from_socket_path(&cmd.socket.socket).approvals().await?;
     let waiting: Vec<_> = pending
         .iter()
         .map(|p| serde_json::json!({ "id": p.request.id, "class": p.request.class, "description": p.description, "expires_at": p.request.expires_at }))
         .collect();
     let devices: Vec<_> = devices
         .iter()
-        .map(|d| serde_json::json!({ "id": d.id, "human": d.human.to_string(), "kind": d.kind, "revoked": d.revoked }))
+        .map(|d| {
+            serde_json::json!({
+                "id": d.id,
+                "human": d.human.to_string(),
+                "kind": d.kind,
+                "fingerprint": harar_client::approvals::device_fingerprint(d),
+                "revoked": d.revoked,
+            })
+        })
         .collect();
     print_json(&serde_json::json!({ "ok": true, "waiting": waiting, "devices": devices }))
 }
@@ -222,41 +218,32 @@ async fn decide(id: String, socket: PathBuf, decision: Decision) -> Result<()> {
     use crate::enclave::EnclaveKey;
     use base64::Engine;
     use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-    let file = read_approver()?
-        .ok_or_else(|| anyhow!("this Mac has no approver key yet: harar device add"))?;
+    use harar_client::approvals::{Approval, Proof};
+    let file = read_approver()?.ok_or_else(|| anyhow!("this Mac has no approver key yet: harar device add"))?;
     let device_id = file
         .devices
         .get(&key_for(&socket))
         .cloned()
-        .ok_or_else(|| {
-            anyhow!("this Mac isn't an approver device at this primary yet: harar device add")
-        })?;
+        .ok_or_else(|| anyhow!("this Mac isn't an approver device at this primary yet: harar device add"))?;
     let client = VaultClient::from_socket_path(&socket);
     let (pending, _) = client.approvals().await?;
-    let waiting = pending
-        .into_iter()
-        .find(|p| p.request.id == id)
-        .ok_or_else(|| anyhow!("no request {id} is waiting"))?;
+    let waiting = pending.into_iter().find(|p| p.request.id == id).ok_or_else(|| anyhow!("no request {id} is waiting"))?;
+    // What is shown must be what is signed: the request's detail is the hash
+    // of exactly what it would do, so text from anywhere else can't be
+    // passed off as this request.
+    if waiting.request.detail.as_deref() != Some(harar_client::primary::waiting_detail(&waiting.waiting).as_str()) {
+        return Err(anyhow!("request {id} doesn't match what it would do; not signing"));
+    }
     // What the person is deciding, before Touch ID asks.
     eprintln!("{}", waiting.description);
+    eprintln!("{}", serde_json::to_string_pretty(&waiting.waiting)?);
     let key = EnclaveKey::from_handle(&STANDARD.decode(&file.handle)?)?;
     let signature = key.sign(&waiting.request.challenge(decision, &device_id))?;
-    let result = client
-        .submit(Approval {
-            request_id: id,
-            device_id,
-            decision,
-            proof: Proof::Signature {
-                signature: URL_SAFE_NO_PAD.encode(signature),
-            },
-        })
-        .await?;
+    let result = client.submit(Approval { request_id: id, device_id, decision, proof: Proof::Signature { signature: URL_SAFE_NO_PAD.encode(signature) } }).await?;
     print_json(&serde_json::json!({ "ok": true, "decision": result }))
 }
 
 #[cfg(not(target_os = "macos"))]
 async fn decide(_id: String, _socket: PathBuf, _decision: Decision) -> Result<()> {
-    Err(anyhow!(
-        "approving needs a Mac's Secure Enclave for now; passkeys come with the approval page"
-    ))
+    Err(anyhow!("approving needs a Mac's Secure Enclave for now; passkeys come with the approval page"))
 }

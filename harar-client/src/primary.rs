@@ -50,6 +50,15 @@ pub enum Waiting {
     Device { device: ApproverDevice },
 }
 
+/// SHA-256 (hex) of exactly what a waiting request would do: its
+/// `ApprovalRequest::detail`, signed with it. The primary sets it; a device
+/// recomputes it from what it shows the person before signing.
+pub fn waiting_detail(waiting: &Waiting) -> String {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(waiting).expect("a waiting change serializes");
+    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// A request waiting for a person, as the primary shows it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pending {
