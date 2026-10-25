@@ -164,6 +164,14 @@ impl ApproverDevice {
     }
 }
 
+/// A fresh request id: 128 random bits, lowercase hex (`ApprovalRequest::id`'s shape).
+pub fn approval_id() -> String {
+    use rand_core::RngCore;
+    let mut bytes = [0u8; 16];
+    rand_core::OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// The primary deciding: its issuer URL, which every request must name, the
 /// site its passkeys belong to, and how many of a person's devices a reserved
 /// class needs. All from its own config, never from a request or a device.
@@ -216,6 +224,12 @@ pub struct ApprovalRequest {
     pub grants_approval: bool,
     pub created_at: u64,
     pub expires_at: u64,
+    /// SHA-256 (hex) of exactly what the request would do, when the primary
+    /// keeps that apart from these fields (a policy change, a device to
+    /// enroll). Signed with the rest, so an approval for one change never
+    /// counts for another, and a device can check what it is shown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 fn field(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -305,6 +319,12 @@ impl ApprovalRequest {
         out.push(u8::from(self.grants_approval));
         out.extend_from_slice(&self.created_at.to_be_bytes());
         out.extend_from_slice(&self.expires_at.to_be_bytes());
+        // Only when there is one, so requests without a detail keep the
+        // bytes other implementations already match (the pinned test).
+        if let Some(detail) = &self.detail {
+            out.push(1);
+            field(&mut out, detail.as_bytes());
+        }
         out.push(match decision {
             Decision::Approve => 1,
             Decision::Deny => 0,
@@ -527,6 +547,19 @@ impl ApprovalError {
 
 fn decode(value: &str) -> Result<Vec<u8>, ApprovalError> {
     B64URL.decode(value).map_err(|_| ApprovalError::BadProof)
+}
+
+/// A short, stable name for a device's key, for a person to compare: the
+/// first 16 hex digits of SHA-256 over its public point, in groups of four.
+pub fn device_fingerprint(device: &ApproverDevice) -> String {
+    let point = format!("{}.{}", device.public_key.x, device.public_key.y.as_deref().unwrap_or_default());
+    let hex: String = Sha256::digest(point.as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect();
+    hex.as_bytes().chunks(4).map(|chunk| std::str::from_utf8(chunk).expect("hex")).collect::<Vec<_>>().join("-")
+}
+
+/// Whether a device's public key is one an approval can be checked against (P-256).
+pub fn valid_device_key(device: &ApproverDevice) -> bool {
+    verifying_key(device).is_ok()
 }
 
 fn verifying_key(device: &ApproverDevice) -> Result<VerifyingKey, ApprovalError> {
@@ -804,6 +837,7 @@ mod tests {
 
     fn request(class: &str) -> ApprovalRequest {
         ApprovalRequest {
+            detail: None,
             id: "ap_01jbx7q4m2k9z8w3v5t6h8n2".into(),
             primary: "https://account.addis.gg".into(),
             org: "gg.addis".parse().unwrap(),

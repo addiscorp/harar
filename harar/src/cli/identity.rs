@@ -227,8 +227,16 @@ pub async fn policy(cmd: PolicyCmd) -> Result<()> {
         PolicyAction::User(UserAction::Map { user, actor }) => PolicyChange::MapUser { user, actor },
         PolicyAction::User(UserAction::Unmap { user }) => PolicyChange::UnmapUser { user },
     };
-    client.policy_change(&change).await?;
-    print_json(&serde_json::json!({ "ok": true }))
+    match client.policy_change(&change).await? {
+        None => print_json(&serde_json::json!({ "ok": true })),
+        // A widening waits for a person: `harar approve <id>` on their Mac.
+        Some(pending) => print_json(&serde_json::json!({
+            "ok": true,
+            "waiting": pending.request.id,
+            "description": pending.description,
+            "expires_at": pending.request.expires_at,
+        })),
+    }
 }
 
 pub(crate) fn parse_duration(value: &str) -> Result<u64> {

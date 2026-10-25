@@ -2,6 +2,7 @@
 //! hears back. Secret reads and writes use the same `get`/`put`/`list`/
 //! `delete` shape as the per-user agent, so one client speaks to both.
 
+use crate::approvals::{Approval, ApprovalRequest, ApproverDevice};
 use crate::model::{Action, Binding, Name, Policy, Profile, Role, Zone};
 use crate::oidc::{IdentityClaims, TokenAsk};
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,44 @@ pub enum PrimaryRequest {
         actor: Option<Name>,
         action: Action,
     },
+    /// The requests waiting for a person, and the approver devices.
+    Approvals,
+    /// A person's decision on a waiting request, signed by one of their devices.
+    Submit { approval: Approval },
+    /// Enrolls an approver device for the calling human. The primary sets its
+    /// id, owner and enrollment time; a human's first device is enrolled at
+    /// once, another one waits for an approval from a device they already have.
+    AddDevice { device: ApproverDevice },
+    /// Revokes one of the calling human's devices, unless it is the last one
+    /// that could approve a widening (then recovery codes are the way back).
+    RemoveDevice { id: String },
+}
+
+/// What a waiting request would do once approved.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "waiting", rename_all = "snake_case")]
+pub enum Waiting {
+    Policy { change: PolicyChange },
+    Device { device: ApproverDevice },
+}
+
+/// SHA-256 (hex) of exactly what a waiting request would do: its
+/// `ApprovalRequest::detail`, signed with it. The primary sets it; a device
+/// recomputes it from what it shows the person before signing.
+pub fn waiting_detail(waiting: &Waiting) -> String {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(waiting).expect("a waiting change serializes");
+    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A request waiting for a person, as the primary shows it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pending {
+    /// What a device signs over (`ApprovalRequest::challenge`).
+    pub request: ApprovalRequest,
+    pub waiting: Waiting,
+    /// One line for a person: who asks, from where, for exactly what.
+    pub description: String,
 }
 
 /// One change to the policy. Narrowing changes apply at once; widening ones
@@ -93,6 +132,15 @@ pub struct PrimaryResponse {
     pub decision: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// A change that now waits for a person instead of applying.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<Pending>,
+    /// For `approvals`: what waits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approvals: Option<Vec<Pending>>,
+    /// For `approvals` and `add_device`: the approver devices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub devices: Option<Vec<ApproverDevice>>,
 }
 
 impl PrimaryResponse {

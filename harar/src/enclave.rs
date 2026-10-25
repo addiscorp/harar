@@ -157,6 +157,15 @@ impl EnclaveKey {
             .map_err(|err| anyhow!("seal to Secure Enclave key: {err}"))
     }
 
+    /// ECDSA P-256 over SHA-256 of `message`, DER: what an approver device
+    /// signs (`ApprovalRequest::challenge`). Asks for presence first when the
+    /// key was created with `Presence::Required`.
+    pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
+        self.key
+            .create_signature(Algorithm::ECDSASignatureMessageX962SHA256, message)
+            .map_err(|err| enclave_error("sign with Secure Enclave key", err))
+    }
+
     /// Asks for presence first when the key was created with `Presence::Required`.
     pub fn open(&self, sealed: &[u8]) -> Result<zeroize::Zeroizing<Vec<u8>>> {
         self.key
@@ -188,6 +197,23 @@ pub(crate) mod tests {
             return None;
         }
         Some(EnclaveKey::create(Presence::NotRequired).expect("this Mac has no usable Secure Enclave; set HARAR_TEST_NO_ENCLAVE=1 only on runners without one"))
+    }
+
+    /// What `harar approve` signs, the primary must accept: ECDSA P-256 over
+    /// SHA-256 of the challenge, DER, checked against the device's public key
+    /// the way `approvals::verify_approval` checks a Mac.
+    #[test]
+    fn an_enclave_signature_verifies_as_a_mac_approval() {
+        use p256::ecdsa::signature::Verifier;
+        let (Some(key), Some(other)) = (test_key(), test_key()) else { return };
+        let challenge = [7u8; 32];
+        let der = key.sign(&challenge).unwrap();
+        let verifying = p256::ecdsa::VerifyingKey::from_sec1_bytes(&key.public_key().unwrap()).unwrap();
+        let signature = p256::ecdsa::Signature::from_der(&der).unwrap();
+        assert!(verifying.verify(&challenge, &signature).is_ok());
+        assert!(verifying.verify(&[8u8; 32], &signature).is_err());
+        let theirs = p256::ecdsa::VerifyingKey::from_sec1_bytes(&other.public_key().unwrap()).unwrap();
+        assert!(theirs.verify(&challenge, &signature).is_err());
     }
 
     #[test]

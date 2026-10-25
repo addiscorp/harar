@@ -186,8 +186,32 @@ impl VaultClient {
         self.ask(&PrimaryRequest::PolicyShow).await?.policy.ok_or_else(|| VaultClientError::InvalidResponse("no policy".into()))
     }
 
-    pub async fn policy_change(&self, change: &PolicyChange) -> Result<(), VaultClientError> {
-        self.ask(&PrimaryRequest::PolicyChange { change: change.clone() }).await.map(drop)
+    /// Applies the change, or, once approver devices exist and it widens,
+    /// returns the request now waiting for a person.
+    pub async fn policy_change(&self, change: &PolicyChange) -> Result<Option<primary::Pending>, VaultClientError> {
+        self.ask(&PrimaryRequest::PolicyChange { change: change.clone() }).await.map(|response| response.pending)
+    }
+
+    /// The requests waiting for a person, and the approver devices.
+    pub async fn approvals(&self) -> Result<(Vec<primary::Pending>, Vec<approvals::ApproverDevice>), VaultClientError> {
+        let response = self.ask(&PrimaryRequest::Approvals).await?;
+        Ok((response.approvals.unwrap_or_default(), response.devices.unwrap_or_default()))
+    }
+
+    /// A signed decision; returns `approved`, `denied` or `pending <have>/<need>`.
+    pub async fn submit(&self, approval: approvals::Approval) -> Result<String, VaultClientError> {
+        self.ask(&PrimaryRequest::Submit { approval }).await?.decision.ok_or_else(|| VaultClientError::InvalidResponse("no decision".into()))
+    }
+
+    /// Enrolls a device: its id when enrolled at once, or the request that
+    /// waits for one of the person's other devices.
+    pub async fn add_device(&self, device: approvals::ApproverDevice) -> Result<(Option<String>, Option<primary::Pending>), VaultClientError> {
+        let response = self.ask(&PrimaryRequest::AddDevice { device }).await?;
+        Ok((response.value, response.pending))
+    }
+
+    pub async fn remove_device(&self, id: &str) -> Result<(), VaultClientError> {
+        self.ask(&PrimaryRequest::RemoveDevice { id: id.into() }).await.map(drop)
     }
 
     /// What `actor` (default: you) would be allowed, without doing it.
