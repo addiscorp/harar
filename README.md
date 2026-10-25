@@ -15,6 +15,16 @@ key is sealed to the Secure Enclave) and Linux. It works without an account.
 > **Status: early and not yet audited.** Don't keep anything in it you can't
 > rotate.
 
+## Install
+
+```sh
+curl -fsSL https://harar.addis.gg/install.sh | sh
+```
+
+It installs `harar` into `~/.harar/bin`, checked against the SHA-256 in the
+release's manifest, with no sudo. Builds: macOS (Apple silicon and Intel) and
+Linux x86_64. `sh -s -- --canary` installs the newest build of `main`.
+
 ## Build
 
 ```sh
