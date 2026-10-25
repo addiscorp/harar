@@ -366,7 +366,7 @@ impl Primary {
     /// Every decision the primary makes: its own entries are never secrets,
     /// then the policy decides, in this machine's zone, via its broker.
     fn check(&self, policy: &Policy, actor: &Name, action: &Action) -> Result<Name, &'static str> {
-        if let Action::Read { path } | Action::Write { path } = action
+        if let Action::Read { path } | Action::Write { path } | Action::Send { path, .. } = action
             && reserved(path)
         {
             return Err("reserved_key");
@@ -504,6 +504,28 @@ impl Primary {
                 next.insert(key.clone(), value);
                 (Some(key), Outcome::Commit(next))
             }
+            PrimaryRequest::Hosts { key } => {
+                if reserved(&key) {
+                    return (Some(key), refuse("reserved_key"));
+                }
+                let hosts = policy.send_hosts(actor, &self.zone, Some(&self.broker), &key, now_epoch_seconds());
+                (Some(key), reply(PrimaryResponse { hosts: Some(hosts), ..PrimaryResponse::ok() }))
+            }
+            PrimaryRequest::Send { key, host } => {
+                // The record says where it went, not just that it was read.
+                let subject = Some(format!("{key} to {host}"));
+                if let Err(reason) = self.check(&policy, actor, &Action::Send { path: key.clone(), host }) {
+                    return (subject, refuse(reason));
+                }
+                let response = match keys.get(&key) {
+                    Some(value) => PrimaryResponse { value: Some(value.clone()), ..PrimaryResponse::ok() },
+                    None => PrimaryResponse::error("not_found"),
+                };
+                (subject, reply(response))
+            }
+            // Where a secret goes is policy here: a role's `send` permission,
+            // changed (and approved) like any other.
+            PrimaryRequest::AllowHost { key, .. } | PrimaryRequest::RevokeHost { key, .. } => (Some(key), refuse("hosts_are_policy")),
             PrimaryRequest::Delete { key } => {
                 if let Err(reason) = self.check(&policy, actor, &Action::Write { path: key.clone() }) {
                     return (Some(key), refuse(reason));
@@ -1037,6 +1059,10 @@ impl Primary {
 fn op_name(request: &PrimaryRequest) -> &'static str {
     match request {
         PrimaryRequest::Get { .. } => "get",
+        PrimaryRequest::Hosts { .. } => "hosts",
+        PrimaryRequest::Send { .. } => "send",
+        PrimaryRequest::AllowHost { .. } => "allow_host",
+        PrimaryRequest::RevokeHost { .. } => "revoke_host",
         PrimaryRequest::Put { .. } => "put",
         PrimaryRequest::Delete { .. } => "delete",
         PrimaryRequest::List => "list",

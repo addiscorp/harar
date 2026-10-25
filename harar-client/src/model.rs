@@ -355,11 +355,14 @@ pub enum Verb {
     Token,
     Launch,
     Approve,
+    /// A secret goes to these hosts (its `scopes`), never read by the sender:
+    /// what lets mirab's station put a key into a request for that host.
+    Send,
 }
 
-/// One thing a role allows. `resource` is a secret path pattern (read/write),
-/// an audience pattern (token, with `scopes`), a profile name (launch), or an
-/// approval class pattern (approve).
+/// One thing a role allows. `resource` is a secret path pattern (read/write,
+/// and send with hosts as `scopes`), an audience pattern (token, with
+/// `scopes`), a profile name (launch), or an approval class pattern (approve).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Permission {
     pub verb: Verb,
@@ -380,7 +383,38 @@ impl Permission {
             }
             Action::Launch { profile } => self.verb == Verb::Launch && self.resource == profile.to_string(),
             Action::Approve { class } => self.verb == Verb::Approve && text_matches(&self.resource, class),
+            Action::Send { path, host } => {
+                self.verb == Verb::Send && text_matches(&self.resource, path) && self.scopes.iter().any(|pattern| host_matches(pattern, host))
+            }
         }
+    }
+}
+
+/// A host a secret may go to: a lowercase DNS name of two labels or more, not
+/// an address. As a pattern it may start `*.`, for any name under it (never
+/// the name itself).
+pub fn valid_host(host: &str) -> bool {
+    let labels: Vec<&str> = host.split('.').collect();
+    let label = |l: &&str| {
+        !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    };
+    // The last label has a letter, and isn't hex (`0x7f`): nothing a resolver
+    // reads as an address.
+    let last = labels.last().unwrap();
+    let not_an_address = last.bytes().any(|b| b.is_ascii_lowercase()) && !last.starts_with("0x");
+    host.len() <= 253 && labels.len() >= 2 && labels.iter().all(label) && not_an_address
+}
+
+pub fn valid_host_pattern(pattern: &str) -> bool {
+    valid_host(pattern.strip_prefix("*.").unwrap_or(pattern))
+}
+
+/// `api.stripe.com` is only itself; `*.stripe.com` is any name under
+/// stripe.com, not stripe.com.
+pub fn host_matches(pattern: &str, host: &str) -> bool {
+    match pattern.strip_prefix("*.") {
+        Some(domain) => host.strip_suffix(domain).is_some_and(|sub| sub.len() > 1 && sub.ends_with('.')),
+        None => pattern == host,
     }
 }
 
@@ -477,8 +511,14 @@ impl TryFrom<PolicyData> for Policy {
             }
             // A pattern is a scope, `*`, or a scope prefix ending in `*`.
             let pattern = |scope: &str| scope == "*" || valid_scope(scope.strip_suffix('*').unwrap_or(scope));
-            if let Some(bad) = role.allows.iter().flat_map(|permission| &permission.scopes).find(|scope| !pattern(scope)) {
+            if let Some(bad) = role.allows.iter().filter(|p| p.verb != Verb::Send).flat_map(|permission| &permission.scopes).find(|scope| !pattern(scope)) {
                 return Err(PolicyError(format!("role {} has a scope that isn't one: {bad:?}", role.name)));
+            }
+            // A send names its hosts, at least one, each a host or `*.` one.
+            for permission in role.allows.iter().filter(|p| p.verb == Verb::Send) {
+                if permission.scopes.is_empty() || !permission.scopes.iter().all(|host| valid_host_pattern(host)) {
+                    return Err(PolicyError(format!("role {} sends {} to something that isn't a host", role.name, permission.resource)));
+                }
             }
         }
         for profile in &data.profiles {
@@ -536,6 +576,8 @@ pub enum Action {
     Token { audience: String, scopes: Vec<String> },
     Launch { profile: Name },
     Approve { class: String },
+    /// Send the secret at `path` to `host`, without reading it.
+    Send { path: String, host: String },
 }
 
 /// A secret path is `/`-separated segments, none empty, `.` or `..`, so a
@@ -585,6 +627,8 @@ pub enum Denied {
     WrongBroker,
     BadPath,
     BadScope,
+    /// A send to something that isn't a host (an address, a bare name).
+    BadHost,
     NoBinding,
     OutsideSession,
     /// App users only get tokens, whatever a binding says.
@@ -601,6 +645,7 @@ impl Denied {
             Denied::WrongBroker => "wrong_broker",
             Denied::BadPath => "bad_path",
             Denied::BadScope => "bad_scope",
+            Denied::BadHost => "bad_host",
             Denied::NoBinding => "no_binding",
             Denied::OutsideSession => "outside_session",
             Denied::UsersOnlyGetTokens => "users_only_get_tokens",
@@ -688,9 +733,14 @@ impl Policy {
         if request.actor.kind() == Kind::User && !matches!(request.action, Action::Token { .. }) {
             return Decision::Deny(Denied::UsersOnlyGetTokens);
         }
-        if let Action::Read { path } | Action::Write { path } = request.action {
+        if let Action::Read { path } | Action::Write { path } | Action::Send { path, .. } = request.action {
             if !valid_secret_path(path) {
                 return Decision::Deny(Denied::BadPath);
+            }
+        }
+        if let Action::Send { host, .. } = request.action {
+            if !valid_host(host) {
+                return Decision::Deny(Denied::BadHost);
             }
         }
         if let Action::Token { scopes, .. } = request.action {
@@ -722,6 +772,31 @@ impl Policy {
             }
         }
         Decision::Allow { by_role: role.name.clone() }
+    }
+
+    /// Every host pattern `actor`, in `zone` (through `via`), may send the
+    /// secret at `path` to, sorted: what a station opens for that secret.
+    /// Each one still goes through `decide` when the secret is sent.
+    pub fn send_hosts(&self, actor: &Name, zone: &Name, via: Option<&Name>, path: &str, now: u64) -> Vec<String> {
+        let probe = Action::Read { path: path.into() };
+        // The same gates `decide` applies before any binding is looked at.
+        let gate = Request { actor, zone, via, action: &probe, session: None };
+        if !matches!(self.decide(&gate, now), Decision::Allow { .. } | Decision::Deny(Denied::NoBinding)) {
+            return Vec::new();
+        }
+        let Some(zone) = self.zones.get(zone) else { return Vec::new() };
+        let mut hosts: Vec<String> = self
+            .bindings
+            .iter()
+            .filter(|binding| binding.actor.matches(actor) && binding.zone.matches(zone))
+            .filter_map(|binding| self.role(&binding.role))
+            .flat_map(|role| &role.allows)
+            .filter(|permission| permission.verb == Verb::Send && text_matches(&permission.resource, path))
+            .flat_map(|permission| permission.scopes.iter().cloned())
+            .collect();
+        hosts.sort();
+        hosts.dedup();
+        hosts
     }
 
     /// Registers a zone a broker started: a VM, container, sandbox or run,
@@ -855,6 +930,64 @@ mod tests {
         // Vouched for by the zone's own broker, as a real request would be.
         let via = policy.zone(&zone).and_then(|zone| zone.broker.clone());
         policy.decide(&Request { actor: &name(actor), zone: &zone, via: via.as_ref(), action, session: None }, NOW)
+    }
+
+    #[test]
+    fn a_host_is_a_dns_name_and_a_pattern_covers_only_what_is_under_it() {
+        for good in ["api.stripe.com", "a.b", "x-1.example.co", "*.stripe.com"] {
+            assert!(valid_host_pattern(good), "{good}");
+        }
+        for bad in ["localhost", "10.0.0.1", "127.0x1", "a.0x7f", "a.123", "API.stripe.com", "*.com.", "a..b", "-a.b", "*", "*.", "stripe.com:443", "a.b/c", "**.b.c"] {
+            assert!(!valid_host_pattern(bad), "{bad}");
+        }
+        assert!(!valid_host("*.stripe.com"), "a host sent to is never a pattern");
+        assert!(host_matches("api.stripe.com", "api.stripe.com"));
+        assert!(!host_matches("api.stripe.com", "evil-api.stripe.com"));
+        assert!(host_matches("*.stripe.com", "files.stripe.com"));
+        assert!(host_matches("*.stripe.com", "a.b.stripe.com"));
+        assert!(!host_matches("*.stripe.com", "stripe.com"), "not the apex");
+        assert!(!host_matches("*.stripe.com", "evilstripe.com"));
+    }
+
+    #[test]
+    fn send_is_its_own_permission_and_names_where_a_secret_goes() {
+        let mut policy = addis();
+        policy.roles.push(Role {
+            name: name("gg.addis.role.stripe-out"),
+            allows: vec![Permission { verb: Verb::Send, resource: "prod/shop/STRIPE_KEY".into(), scopes: vec!["api.stripe.com".into(), "*.stripe.com".into()] }],
+        });
+        policy.bindings.push(Binding {
+            actor: pattern("gg.addis.service.site"),
+            zone: ZoneMatch::Name(pattern("gg.addis.zone.demon")),
+            role: name("gg.addis.role.stripe-out"),
+        });
+        let send = |host: &str| Action::Send { path: "prod/shop/STRIPE_KEY".into(), host: host.into() };
+        let site = "gg.addis.service.site";
+        let demon = "gg.addis.zone.demon";
+        assert!(matches!(decide(&policy, site, demon, &send("api.stripe.com")), Decision::Allow { .. }));
+        assert!(matches!(decide(&policy, site, demon, &send("files.stripe.com")), Decision::Allow { .. }));
+        assert_eq!(decide(&policy, site, demon, &send("evil.example.com")), denied(Denied::NoBinding));
+        assert_eq!(decide(&policy, site, demon, &send("10.0.0.1")), denied(Denied::BadHost));
+        // Sending is not reading, and reading is not sending.
+        assert_eq!(decide(&policy, site, demon, &read("prod/shop/STRIPE_KEY")), denied(Denied::NoBinding));
+        let readable = Action::Send { path: "prod/site/KEY".into(), host: "api.stripe.com".into() };
+        assert_eq!(decide(&policy, site, demon, &readable), denied(Denied::NoBinding));
+        // What a station opens for it, and nothing for anyone else.
+        let zone = name(demon);
+        let broker = name("gg.addis.broker.demon");
+        assert_eq!(policy.send_hosts(&name(site), &zone, Some(&broker), "prod/shop/STRIPE_KEY", NOW), vec!["*.stripe.com", "api.stripe.com"]);
+        assert!(policy.send_hosts(&name("gg.addis.agent.ops"), &zone, Some(&broker), "prod/shop/STRIPE_KEY", NOW).is_empty());
+        assert!(policy.send_hosts(&name(site), &zone, Some(&name("gg.addis.broker.other")), "prod/shop/STRIPE_KEY", NOW).is_empty(), "the zone's own broker only");
+    }
+
+    #[test]
+    fn a_policy_that_sends_to_something_that_isnt_a_host_doesnt_load() {
+        for hosts in [vec![], vec!["10.0.0.1".to_string()], vec!["localhost".to_string()], vec!["*".to_string()]] {
+            let mut policy = Policy::new("gg.addis".parse().unwrap());
+            policy.roles.push(Role { name: name("gg.addis.role.out"), allows: vec![Permission { verb: Verb::Send, resource: "prod/*".into(), scopes: hosts.clone() }] });
+            let text = serde_json::to_string(&policy).unwrap();
+            assert!(serde_json::from_str::<Policy>(&text).is_err(), "{hosts:?}");
+        }
     }
 
     fn denied(reason: Denied) -> Decision {

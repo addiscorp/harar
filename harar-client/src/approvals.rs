@@ -278,6 +278,11 @@ fn encode_action(out: &mut Vec<u8>, action: &Action) {
             out.push(5);
             field(out, class.as_bytes());
         }
+        Action::Send { path, host } => {
+            out.push(6);
+            field(out, path.as_bytes());
+            field(out, host.as_bytes());
+        }
     }
 }
 
@@ -343,6 +348,7 @@ impl ApprovalRequest {
             }
             Action::Launch { profile } => format!("start a {profile} zone"),
             Action::Approve { class } => format!("approve \"{class}\" requests"),
+            Action::Send { path, host } => format!("send the secret \"{path}\" to {host}"),
         };
         let mut text = format!("[{} {} on {}] {} wants to {what}", self.class, self.org, self.primary, self.actor);
         if let Some(act_for) = &self.act_for {
@@ -382,8 +388,13 @@ impl ApprovalRequest {
                 return Err(ApprovalError::BadRequest);
             }
         }
-        if let Action::Read { path } | Action::Write { path } = &self.action {
+        if let Action::Read { path } | Action::Write { path } | Action::Send { path, .. } = &self.action {
             if !crate::model::valid_secret_path(path) {
+                return Err(ApprovalError::BadRequest);
+            }
+        }
+        if let Action::Send { host, .. } = &self.action {
+            if !crate::model::valid_host(host) {
                 return Err(ApprovalError::BadRequest);
             }
         }
@@ -415,6 +426,7 @@ impl ApprovalRequest {
             Action::Token { audience, scopes } => std::iter::once(audience.as_str()).chain(scopes.iter().map(String::as_str)).collect(),
             Action::Approve { class } => vec![class],
             Action::Launch { .. } => vec![],
+            Action::Send { path, host } => vec![path, host],
         };
         if !texts.iter().all(|text| plain(text)) {
             return Err(ApprovalError::BadRequest);

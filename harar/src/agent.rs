@@ -35,6 +35,42 @@ pub(crate) enum AgentRequest {
     Status,
     Unlock,
     Lock,
+    /// Where `key` may go (`harar hosts allow`), as the primary answers it.
+    Hosts { key: String },
+    /// The value of `key`, for a request to `host` only.
+    Send { key: String, host: String },
+    #[serde(rename = "allow_host")]
+    AllowHost { key: String, host: String },
+    #[serde(rename = "revoke_host")]
+    RevokeHost { key: String, host: String },
+}
+
+/// The vault keeps for itself, out of reach of get, put, delete and list:
+/// each secret's hosts.
+const RESERVED_PREFIX: &str = "harar:";
+const HOSTS_KEY: &str = "harar:hosts";
+
+fn reserved(key: &str) -> bool {
+    key.starts_with(RESERVED_PREFIX)
+}
+
+/// Each secret, and the host patterns it may go to. A list that doesn't read
+/// is an error, never an empty list a change would write over.
+fn hosts_of(keys: &HashMap<String, String>) -> Result<std::collections::BTreeMap<String, Vec<String>>, &'static str> {
+    match keys.get(HOSTS_KEY) {
+        None => Ok(Default::default()),
+        Some(text) => serde_json::from_str(text).map_err(|_| "hosts_unreadable"),
+    }
+}
+
+/// `next` without `key`'s hosts: a secret removed or replaced goes nowhere
+/// until the owner says again, so a new value never inherits an old one's hosts.
+fn forget_hosts(next: &mut HashMap<String, String>, key: &str) -> Result<(), &'static str> {
+    let mut all = hosts_of(next)?;
+    if all.remove(key).is_some() {
+        next.insert(HOSTS_KEY.into(), serde_json::to_string(&all).expect("hosts serialize"));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -176,17 +212,72 @@ impl Vault {
         let unlocked = self.unlocked.as_mut().expect("admit unlocked the vault");
         let response = match request {
             AgentRequest::Unlock => VaultResponse::ok(),
+            AgentRequest::Get { key } | AgentRequest::Put { key, .. } | AgentRequest::Delete { key } if reserved(&key) => {
+                VaultResponse::error("reserved_key")
+            }
             AgentRequest::Get { key } => match unlocked.keys.get(&key) {
                 Some(value) => VaultResponse { value: Some(value.clone()), ..VaultResponse::ok() },
                 None => VaultResponse::error("not_found"),
             },
+            AgentRequest::Hosts { key } => match hosts_of(&unlocked.keys) {
+                Ok(mut all) => VaultResponse { hosts: Some(all.remove(&key).unwrap_or_default()), ..VaultResponse::ok() },
+                Err(reason) => VaultResponse::error(reason),
+            },
+            AgentRequest::Send { key, host } => {
+                let allowed = harar_client::model::valid_host(&host)
+                    && hosts_of(&unlocked.keys).is_ok_and(|all| all.get(&key).is_some_and(|hosts| hosts.iter().any(|pattern| harar_client::model::host_matches(pattern, &host))));
+                match unlocked.keys.get(&key) {
+                    _ if !allowed || reserved(&key) => VaultResponse::error("not_allowed"),
+                    Some(value) => VaultResponse { value: Some(value.clone()), ..VaultResponse::ok() },
+                    None => VaultResponse::error("not_found"),
+                }
+            }
+            AgentRequest::AllowHost { key, host } => {
+                if reserved(&key) || !harar_client::model::valid_secret_path(&key) || !harar_client::model::valid_host_pattern(&host) {
+                    return AgentReply::Vault(Box::new(VaultResponse::error("bad_host")));
+                }
+                let mut all = match hosts_of(&unlocked.keys) {
+                    Ok(all) => all,
+                    Err(reason) => return AgentReply::Vault(Box::new(VaultResponse::error(reason))),
+                };
+                let hosts = all.entry(key).or_default();
+                if !hosts.contains(&host) {
+                    hosts.push(host);
+                    hosts.sort();
+                }
+                let mut next = unlocked.keys.clone();
+                next.insert(HOSTS_KEY.into(), serde_json::to_string(&all).expect("hosts serialize"));
+                self.persist(next)
+            }
+            AgentRequest::RevokeHost { key, host } => {
+                let mut all = match hosts_of(&unlocked.keys) {
+                    Ok(all) => all,
+                    Err(reason) => return AgentReply::Vault(Box::new(VaultResponse::error(reason))),
+                };
+                let Some(hosts) = all.get_mut(&key).filter(|hosts| hosts.contains(&host)) else {
+                    return AgentReply::Vault(Box::new(VaultResponse::error("not_found")));
+                };
+                hosts.retain(|other| other != &host);
+                if hosts.is_empty() {
+                    all.remove(&key);
+                }
+                let mut next = unlocked.keys.clone();
+                next.insert(HOSTS_KEY.into(), serde_json::to_string(&all).expect("hosts serialize"));
+                self.persist(next)
+            }
             AgentRequest::List => {
-                let mut keys: Vec<String> = unlocked.keys.keys().cloned().collect();
+                let mut keys: Vec<String> = unlocked.keys.keys().filter(|key| !reserved(key)).cloned().collect();
                 keys.sort();
                 VaultResponse { keys: Some(keys), ..VaultResponse::ok() }
             }
             AgentRequest::Put { key, value } => {
                 let mut next = unlocked.keys.clone();
+                // A new value starts with nowhere to go; the same one keeps its hosts.
+                if next.get(&key) != Some(&value)
+                    && let Err(reason) = forget_hosts(&mut next, &key)
+                {
+                    return AgentReply::Vault(Box::new(VaultResponse::error(reason)));
+                }
                 next.insert(key, value);
                 self.persist(next)
             }
@@ -194,6 +285,9 @@ impl Vault {
                 let mut next = unlocked.keys.clone();
                 if next.remove(&key).is_none() {
                     return AgentReply::Vault(Box::new(VaultResponse::error("not_found")));
+                }
+                if let Err(reason) = forget_hosts(&mut next, &key) {
+                    return AgentReply::Vault(Box::new(VaultResponse::error(reason)));
                 }
                 self.persist(next)
             }
@@ -422,6 +516,39 @@ mod tests {
     fn reply(h: &mut Harness, session: i32, request: AgentRequest, at: Duration) -> serde_json::Value {
         let reply = h.vault.handle(&peer(OWNER), session, request, h.start + at);
         serde_json::to_value(reply).unwrap()
+    }
+
+    #[test]
+    fn a_secret_goes_only_to_the_hosts_the_owner_allowed_and_the_list_is_out_of_reach() {
+        let mut h = harness(true);
+        let t = Duration::ZERO;
+        put(&mut h, 10, "prod/shop/STRIPE_KEY", "sk_live_real", t);
+        let ask = |h: &mut Harness, request| reply(h, 10, request, Duration::from_secs(1));
+        let send = |host: &str| AgentRequest::Send { key: "prod/shop/STRIPE_KEY".into(), host: host.into() };
+        assert_eq!(ask(&mut h, send("api.stripe.com"))["error"], "not_allowed", "nowhere until the owner says");
+        assert_eq!(ask(&mut h, AgentRequest::AllowHost { key: "prod/shop/STRIPE_KEY".into(), host: "*.stripe.com".into() })["ok"], true);
+        assert_eq!(ask(&mut h, AgentRequest::AllowHost { key: "prod/shop/STRIPE_KEY".into(), host: "10.0.0.1".into() })["error"], "bad_host");
+        assert_eq!(ask(&mut h, AgentRequest::Hosts { key: "prod/shop/STRIPE_KEY".into() })["hosts"], serde_json::json!(["*.stripe.com"]));
+        assert_eq!(ask(&mut h, send("api.stripe.com"))["value"], "sk_live_real");
+        assert_eq!(ask(&mut h, send("stripe.com"))["error"], "not_allowed", "not the apex");
+        assert_eq!(ask(&mut h, send("evil.example.com"))["error"], "not_allowed");
+        // The list itself can't be read, rewritten, removed or listed.
+        assert_eq!(ask(&mut h, AgentRequest::Get { key: HOSTS_KEY.into() })["error"], "reserved_key");
+        assert_eq!(ask(&mut h, AgentRequest::Put { key: HOSTS_KEY.into(), value: "{}".into() })["error"], "reserved_key");
+        assert_eq!(ask(&mut h, AgentRequest::Delete { key: HOSTS_KEY.into() })["error"], "reserved_key");
+        assert_eq!(ask(&mut h, AgentRequest::List)["keys"], serde_json::json!(["prod/shop/STRIPE_KEY"]));
+        assert_eq!(ask(&mut h, AgentRequest::RevokeHost { key: "prod/shop/STRIPE_KEY".into(), host: "*.stripe.com".into() })["ok"], true);
+        assert_eq!(ask(&mut h, send("api.stripe.com"))["error"], "not_allowed");
+        assert_eq!(ask(&mut h, AgentRequest::RevokeHost { key: "prod/shop/STRIPE_KEY".into(), host: "*.stripe.com".into() })["error"], "not_found");
+        // A secret replaced or removed takes its hosts with it.
+        ask(&mut h, AgentRequest::AllowHost { key: "prod/shop/STRIPE_KEY".into(), host: "api.stripe.com".into() });
+        assert_eq!(ask(&mut h, AgentRequest::Put { key: "prod/shop/STRIPE_KEY".into(), value: "sk_live_real".into() })["ok"], true);
+        assert_eq!(ask(&mut h, send("api.stripe.com"))["value"], "sk_live_real", "the same value keeps them");
+        assert_eq!(ask(&mut h, AgentRequest::Put { key: "prod/shop/STRIPE_KEY".into(), value: "something else".into() })["ok"], true);
+        assert_eq!(ask(&mut h, send("api.stripe.com"))["error"], "not_allowed", "a new value goes nowhere yet");
+        ask(&mut h, AgentRequest::AllowHost { key: "prod/shop/STRIPE_KEY".into(), host: "api.stripe.com".into() });
+        assert_eq!(ask(&mut h, AgentRequest::Delete { key: "prod/shop/STRIPE_KEY".into() })["ok"], true);
+        assert_eq!(ask(&mut h, AgentRequest::Hosts { key: "prod/shop/STRIPE_KEY".into() })["hosts"], serde_json::json!([]));
     }
 
     #[test]

@@ -16,6 +16,16 @@ pub enum PrimaryRequest {
     Delete { key: String },
     /// The secret paths the caller may read.
     List,
+    /// The hosts the caller may send `key` to (patterns, `*.` for any name
+    /// under one): what a station opens for that secret.
+    Hosts { key: String },
+    /// The value of `key`, to put into a request for `host` only: allowed by
+    /// a `send` permission, without `read`, and recorded with the host.
+    Send { key: String, host: String },
+    /// The per-user agent's own list of where a secret may go. A primary
+    /// refuses them: there, a host is a role's `send` permission.
+    AllowHost { key: String, host: String },
+    RevokeHost { key: String, host: String },
     /// An identity token for the calling actor.
     Token(TokenAsk),
     Health,
@@ -132,6 +142,9 @@ pub struct PrimaryResponse {
     pub value: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keys: Option<Vec<String>>,
+    /// For `hosts`: where the secret may go.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosts: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
