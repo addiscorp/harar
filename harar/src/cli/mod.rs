@@ -16,7 +16,7 @@ pub mod version;
 const DEFAULT_SOCKET_PATH: &str = "/run/harar.sock";
 
 #[derive(Debug, Parser)]
-#[command(name = "harar", about = "Harar vault and token administration")]
+#[command(name = "harar", version, about = "Harar vault and token administration")]
 pub struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -103,6 +103,13 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn harar_dash_dash_version_says_what_harar_version_says() {
+        let err = Cli::try_parse_from(["harar", "--version"]).expect_err("--version prints and stops");
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert_eq!(err.to_string().trim(), format!("harar {}", env!("CARGO_PKG_VERSION")));
+    }
 
     #[test]
     fn socket_arg_defaults_to_daemon_socket_without_flag() {
