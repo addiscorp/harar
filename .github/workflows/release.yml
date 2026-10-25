@@ -1,0 +1,287 @@
+# SCCACHE IS REQUIRED FOR ALL RUST COMPILATION.
+#
+# Builds and publishes CANARY releases only (the dsc model). tag-canary.yml
+# names the build and dispatches this against its tag. It never creates a
+# stable vX.Y.Z tag or touches latest.json: that is promote.yml, run by a
+# person against a canary this workflow already published.
+#
+# R2 layout (harar-releases, served at https://harar.addis.gg), the
+# deka shape: directories are the version with no "v".
+#   <version>/harar-<platform>   one binary per platform
+#   <version>/release.json        version, commit, channel, sha256 per platform
+#   canary.json                   the newest canary's release.json
+#   latest.json                   the newest stable's (promote.yml)
+#   install.sh                    the installer, from this repo
+# The installer (harar.addis.gg/install.sh) reads exactly these.
+name: Release (canary)
+
+on:
+  workflow_dispatch: {}
+  # A canary tag pushed with a real user token builds too. Plain vX.Y.Z tags
+  # are excluded; promote.yml makes those.
+  push:
+    tags:
+      - 'v*-canary-*'
+
+permissions:
+  contents: read
+
+env:
+  R2_BUCKET_RELEASES: harar-releases
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  resolve:
+    name: Resolve the canary
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      base_version: ${{ steps.resolve.outputs.base_version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: The ref is a canary of this commit and this version
+        id: resolve
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::${TAG} is a stable tag. Stable releases come from promote.yml."
+            exit 1
+          fi
+          if [[ ! "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)-canary-([0-9a-f]{7})$ ]]; then
+            echo "::error::${TAG} is not a canary ref. Expected vX.Y.Z-canary-<7-char sha>."
+            exit 1
+          fi
+          BASE_VERSION="${BASH_REMATCH[1]}"
+          SHA7="${BASH_REMATCH[2]}"
+          TREE_VERSION="$(scripts/version.sh)"
+          if [ "$BASE_VERSION" != "$TREE_VERSION" ]; then
+            echo "::error::${TAG} names ${BASE_VERSION} but the workspace at this commit is ${TREE_VERSION}."
+            exit 1
+          fi
+          if [ "$SHA7" != "$(git rev-parse --short=7 HEAD)" ]; then
+            echo "::error::${TAG} names commit ${SHA7} but this ref is $(git rev-parse --short=7 HEAD)."
+            exit 1
+          fi
+          {
+            echo "tag=${TAG}"
+            echo "version=${TAG#v}"
+            echo "base_version=${BASE_VERSION}"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.platform }})
+    needs: [resolve]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04's glibc (2.35), so the binary runs on older Linux too.
+          - platform: linux-x64
+            runner: ubuntu-22.04
+            sccache_bucket: harar-sccache-linux-x64
+          - platform: darwin-x64
+            runner: macos-15-intel
+            sccache_bucket: harar-sccache-darwin-x64
+          - platform: darwin-arm64
+            runner: macos-14
+            sccache_bucket: harar-sccache-darwin-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    environment: release
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_BUCKET: ${{ matrix.sccache_bucket }}
+      SCCACHE_REGION: auto
+      SCCACHE_S3_USE_SSL: "true"
+      SCCACHE_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      - name: sccache is required, on R2
+        run: |
+          if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ] || [ -z "$SCCACHE_ENDPOINT" ]; then
+            echo "::error::The R2 keys are missing (release environment). SCCACHE IS REQUIRED FOR ALL RUST COMPILATION."
+            exit 1
+          fi
+          # R2_ENDPOINT keeps its https:// for the AWS CLI; sccache wants the
+          # bare host and adds the scheme itself (SCCACHE_S3_USE_SSL).
+          export SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT#https://}"
+          echo "SCCACHE_ENDPOINT=$SCCACHE_ENDPOINT" >> "$GITHUB_ENV"
+          sccache --start-server
+          sccache --show-stats | tee sccache-stats.txt
+          grep -q "$SCCACHE_BUCKET" sccache-stats.txt || { echo "::error::sccache is not using the R2 bucket $SCCACHE_BUCKET"; exit 1; }
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      # One binary; TLS is rustls and macOS's keychain is the system's, so a
+      # release needs no system packages.
+      - name: Build harar
+        run: cargo build --locked --release -p harar --bin harar
+      - name: Prepare the binary
+        run: |
+          mkdir -p dist
+          cp target/release/harar "dist/harar-${{ matrix.platform }}"
+          chmod 755 "dist/harar-${{ matrix.platform }}"
+      - run: sccache --show-stats
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: harar-${{ matrix.platform }}
+          path: dist/harar-${{ matrix.platform }}
+          retention-days: 1
+
+  smoke:
+    name: Smoke (${{ matrix.platform }})
+    needs: [resolve, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-24.04
+          - platform: darwin-x64
+            runner: macos-15-intel
+          - platform: darwin-arm64
+            runner: macos-14
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: harar-${{ matrix.platform }}
+          path: dist
+      - name: It runs and says its version
+        run: |
+          set -euo pipefail
+          BIN="$PWD/dist/harar-${{ matrix.platform }}"
+          chmod 755 "$BIN"
+          OUT="$("$BIN" version)"
+          if [ "$OUT" != "harar ${{ needs.resolve.outputs.base_version }}" ]; then
+            echo "::error::harar version says '${OUT}', expected 'harar ${{ needs.resolve.outputs.base_version }}'"
+            exit 1
+          fi
+          # It knows its commands (help runs the whole CLI definition).
+          "$BIN" --help | grep -q 'serve'
+          echo "harar ${{ needs.resolve.outputs.base_version }} runs on ${{ matrix.platform }}"
+      # libc's family plus zlib, which every glibc Linux has in its base
+      # system (bare ubuntu:24.04 included, where CI runs harar).
+      - name: Linux needs nothing but libc and zlib
+        if: matrix.platform == 'linux-x64'
+        run: |
+          set -euo pipefail
+          ldd "dist/harar-linux-x64" | tee ldd.txt
+          if grep -v -E 'linux-vdso|ld-linux|lib(c|m|dl|rt|pthread|gcc_s|util|z)\.so' ldd.txt | grep -q '=>'; then
+            echo "::error::harar-linux-x64 links a library a bare Linux may not have (see above)"
+            exit 1
+          fi
+
+  publish:
+    name: Publish to R2
+    needs: [resolve, smoke]
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    env:
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: artifacts
+          pattern: harar-*
+      - name: Lay out the release and its manifest
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.resolve.outputs.version }}"
+          mkdir -p "release/${VERSION}"
+          for platform in linux-x64 darwin-x64 darwin-arm64; do
+            cp "artifacts/harar-${platform}/harar-${platform}" "release/${VERSION}/"
+            chmod 755 "release/${VERSION}/harar-${platform}"
+          done
+          python3 - "release/${VERSION}" <<'PY'
+          import hashlib, json, os, subprocess, sys
+          from datetime import datetime, timezone
+          out = sys.argv[1]
+          def sha(name):
+              return hashlib.sha256(open(os.path.join(out, name), "rb").read()).hexdigest()
+          manifest = {
+              "name": "harar",
+              "version": os.environ["VERSION"],
+              "tag": os.environ["TAG"],
+              "commit": os.environ["GITHUB_SHA"],
+              "channel": "canary",
+              "base_version": os.environ["BASE_VERSION"],
+              "promoted_from": None,
+              "published_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "binaries": {
+                  p: {"name": f"harar-{p}", "sha256": sha(f"harar-{p}")}
+                  for p in ("linux-x64", "darwin-x64", "darwin-arm64")
+              },
+          }
+          with open(os.path.join(out, "release.json"), "w") as f:
+              json.dump(manifest, f, indent=2)
+              f.write("\n")
+          PY
+          cat "release/${VERSION}/release.json"
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          BASE_VERSION: ${{ needs.resolve.outputs.base_version }}
+      - name: Release keys are present
+        run: |
+          if [ -z "${R2_ENDPOINT:-}" ] || [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+            echo "::error::publishing needs R2_ENDPOINT, R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY in the release environment."
+            exit 1
+          fi
+      - name: Upload the versioned release
+        run: |
+          VERSION="${{ needs.resolve.outputs.version }}"
+          aws s3 sync "release/${VERSION}/" "s3://${R2_BUCKET_RELEASES}/${VERSION}/" --endpoint-url="${R2_ENDPOINT}"
+      - name: Publish the installer
+        run: |
+          aws s3 cp install.sh "s3://${R2_BUCKET_RELEASES}/install.sh" --endpoint-url="${R2_ENDPOINT}" \
+            --content-type "text/x-shellscript; charset=utf-8" --cache-control "no-cache"
+      - name: Read it back from harar.addis.gg
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.resolve.outputs.version }}"
+          curl -fsSL "https://harar.addis.gg/${VERSION}/release.json" -o served.json
+          cmp served.json "release/${VERSION}/release.json"
+          for platform in linux-x64 darwin-x64 darwin-arm64; do
+            want="$(python3 -c "import json; print(json.load(open('served.json'))['binaries']['${platform}']['sha256'])")"
+            got="$(curl -fsSL "https://harar.addis.gg/${VERSION}/harar-${platform}" | sha256sum | cut -d' ' -f1)"
+            [ "$want" = "$got" ] || { echo "::error::harar-${platform} served from R2 does not match its sha256"; exit 1; }
+          done
+          echo "every binary at https://harar.addis.gg/${VERSION}/ matches release.json"
+      - name: Point canary.json at it
+        run: |
+          VERSION="${{ needs.resolve.outputs.version }}"
+          aws s3 cp "release/${VERSION}/release.json" "s3://${R2_BUCKET_RELEASES}/canary.json" \
+            --endpoint-url="${R2_ENDPOINT}" --cache-control "no-cache"
+      - name: GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.resolve.outputs.version }}"
+          TAG="${{ needs.resolve.outputs.tag }}"
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$TAG" release/${VERSION}/* --repo "${{ github.repository }}" --clobber
+          else
+            gh release create "$TAG" release/${VERSION}/* --repo "${{ github.repository }}" \
+              --title "harar ${VERSION} (canary)" --prerelease \
+              --notes "Canary build of ${GITHUB_SHA}. Install it: curl -fsSL https://harar.addis.gg/install.sh | sh -s -- --canary"
+          fi
+      - name: Summary
+        run: |
+          VERSION="${{ needs.resolve.outputs.version }}"
+          {
+            echo "### harar ${VERSION} (canary)"
+            echo "- https://harar.addis.gg/${VERSION}/release.json"
+            echo "- canary.json now points here; latest.json was not touched (promote.yml)"
+          } >> "$GITHUB_STEP_SUMMARY"
