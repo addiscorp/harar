@@ -12,7 +12,9 @@ use anyhow::{Context, Result, anyhow};
 use clap::Args;
 use harar_client::model::{Action, Binding, Decision, Kind, Name, Org, Permission, Policy, Request, Role, Verb, Zone, ZoneKind, ZoneMatch};
 use harar_client::oidc::{self, Alg, IdentityRequest};
-use harar_client::primary::{PolicyChange, PolicyView, PrimaryRequest, PrimaryResponse};
+use harar_client::approvals::{self, Approval, ApprovalRequest, ApprovalRule, ApproverDevice, DeviceKind, Widens};
+use harar_client::primary::{Pending, PolicyChange, PolicyView, PrimaryRequest, PrimaryResponse, Waiting};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -29,6 +31,15 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const RESERVED_PREFIX: &str = "harar:";
 const POLICY_KEY: &str = "harar:policy";
 const USERS_KEY: &str = "harar:users";
+/// Approver devices (architecture, section 6).
+const DEVICES_KEY: &str = "harar:devices";
+/// Requests waiting for a person.
+const WAITING_KEY: &str = "harar:approvals";
+/// How long a request waits for a person before it lapses.
+const APPROVAL_SECONDS: u64 = 15 * 60;
+/// At most this many requests wait at once, and this many devices are enrolled.
+const MAX_WAITING: usize = 32;
+const MAX_DEVICES: usize = 16;
 /// Tokens last this long unless asked for less.
 const DEFAULT_TOKEN_SECONDS: u64 = 300;
 
@@ -111,10 +122,50 @@ pub(crate) struct Primary {
 /// rest were left out.
 const UNKNOWN_LINES_PER_MINUTE: u32 = 5;
 
-/// What answering a request comes to: a reply, or a new key map to save.
+/// What answering a request comes to: a reply, or a new key map to save
+/// (and, once it is saved, what to answer).
 enum Outcome {
     Reply(Box<PrimaryResponse>),
     Commit(HashMap<String, String>),
+    CommitWith(HashMap<String, String>, Box<PrimaryResponse>),
+}
+
+/// A request waiting for a person, with what it would do and the approvals so
+/// far (each verified when it arrived, at most one per device).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Stored {
+    request: ApprovalRequest,
+    waiting: Waiting,
+    approvals: Vec<Approval>,
+}
+
+fn load_devices(keys: &HashMap<String, String>) -> Vec<ApproverDevice> {
+    keys.get(DEVICES_KEY).and_then(|text| serde_json::from_str(text).ok()).unwrap_or_default()
+}
+
+fn store_devices(keys: &mut HashMap<String, String>, devices: &[ApproverDevice]) {
+    keys.insert(DEVICES_KEY.into(), serde_json::to_string(devices).expect("devices serialize"));
+}
+
+/// The requests still waiting: lapsed ones are dropped as they are read.
+fn load_waiting(keys: &HashMap<String, String>, now: u64) -> Vec<Stored> {
+    let all: Vec<Stored> = keys.get(WAITING_KEY).and_then(|text| serde_json::from_str(text).ok()).unwrap_or_default();
+    all.into_iter().filter(|stored| stored.request.expires_at > now).collect()
+}
+
+fn store_waiting(keys: &mut HashMap<String, String>, waiting: &[Stored]) {
+    keys.insert(WAITING_KEY.into(), serde_json::to_string(waiting).expect("approvals serialize"));
+}
+
+/// One line for the person deciding: who asks, from where, for exactly what.
+fn describe(request: &ApprovalRequest, waiting: &Waiting) -> String {
+    let who = request.act_for.as_ref().unwrap_or(&request.actor);
+    let what = match waiting {
+        Waiting::Policy { change } => format!("change the policy: {}", serde_json::to_string(change).unwrap_or_default()),
+        Waiting::Device { device } => format!("enroll another approver device for {}", device.human),
+    };
+    let zone = request.zone.as_ref().map(Name::to_string).unwrap_or_default();
+    format!("[{} on {}] {who}, at {zone}, asks to {what}", request.class, request.primary)
 }
 
 /// The store's master key comes from the vault's own master key, so whatever
@@ -146,6 +197,8 @@ fn store_policy(keys: &mut HashMap<String, String>, policy: &Policy, users: &BTr
 
 /// Approving that makes a change give someone approver rights.
 const GRANT_APPROVAL_CLASS: &str = "approvals.grant";
+/// Enrolling another approver device for someone who has one.
+const DEVICE_APPROVAL_CLASS: &str = "approvals.device";
 
 /// Who may approve what, as comparable lines: every binding to a role with
 /// an approve permission, and every OS user whose actor such a binding
@@ -282,18 +335,21 @@ impl Primary {
             }
         };
         let (subject, outcome) = self.answer(&keys, policy, users, &actor, request);
-        let committed = matches!(outcome, Outcome::Commit(_));
+        let committed = !matches!(outcome, Outcome::Reply(_));
         let response = match outcome {
             Outcome::Reply(response) => *response,
             // A change is written to the audit log before it is made, and
             // not made if it can't be.
-            Outcome::Commit(next) => match self.audit(peer, Some(&actor), op, subject.as_deref(), "pending") {
-                Ok(()) => self.commit(&mut keys, next).await,
-                Err(err) => {
-                    eprintln!("harar: {err:#}; refusing the change");
-                    return PrimaryResponse::error("audit_failed");
-                }
-            },
+            Outcome::Commit(next) | Outcome::CommitWith(next, _) if self.audit(peer, Some(&actor), op, subject.as_deref(), "pending").is_err() => {
+                drop(next);
+                eprintln!("harar: the audit log can't be written; refusing the change");
+                return PrimaryResponse::error("audit_failed");
+            }
+            Outcome::Commit(next) => self.commit(&mut keys, next).await,
+            Outcome::CommitWith(next, answer) => {
+                let saved = self.commit(&mut keys, next).await;
+                if saved.ok { *answer } else { saved }
+            }
         };
         let result = if response.ok { "ok" } else { response.error.as_deref().unwrap_or("error") };
         if let Err(err) = self.audit(peer, Some(&actor), op, subject.as_deref(), result) {
@@ -322,7 +378,7 @@ impl Primary {
         }
     }
 
-    fn answer(&self, keys: &HashMap<String, String>, policy: Policy, mut users: BTreeMap<String, Name>, actor: &Name, request: PrimaryRequest) -> (Option<String>, Outcome) {
+    fn answer(&self, keys: &HashMap<String, String>, policy: Policy, users: BTreeMap<String, Name>, actor: &Name, request: PrimaryRequest) -> (Option<String>, Outcome) {
         let reply = |response| Outcome::Reply(Box::new(response));
         let refuse = |reason: &str| Outcome::Reply(Box::new(PrimaryResponse::error(reason)));
         match request {
@@ -408,35 +464,253 @@ impl Primary {
             PrimaryRequest::PolicyChange { change } => {
                 let class = if change.narrows() { "policy.narrow" } else { "policy.widen" };
                 let subject = Some(format!("{class} {}", serde_json::to_string(&change).unwrap_or_default()));
-                if let Err(reason) = self.check(&policy, actor, &Action::Approve { class: class.into() }) {
-                    return (subject, refuse(reason));
-                }
-                let before = approver_reach(&policy, &users);
-                let mut next_policy = policy.clone();
-                if let Err(reason) = self.apply(&mut next_policy, &mut users, change) {
-                    return (subject, refuse(reason));
-                }
-                // Load it back the way a restart would, so a change that
-                // leaves a policy that can't load is refused now.
-                let next_policy: Policy = match serde_json::to_string(&next_policy).ok().and_then(|text| serde_json::from_str(&text).ok()) {
-                    Some(policy) => policy,
-                    None => return (subject, refuse("policy_invalid")),
+                let (next_policy, next_users, grants) = match self.proposed(keys, &policy, &users, actor, &change) {
+                    Ok(proposed) => proposed,
+                    Err(reason) => return (subject, refuse(reason)),
                 };
-                // Giving anyone approver rights they didn't have is its own,
-                // stronger class (architecture, section 6).
-                if !approver_reach(&next_policy, &users).is_subset(&before)
-                    && let Err(reason) = self.check(&policy, actor, &Action::Approve { class: GRANT_APPROVAL_CLASS.into() })
-                {
-                    return (subject, refuse(reason));
+                let mut next = keys.clone();
+                // Taking away applies at once. Once anyone has an approver
+                // device, a widening waits for a person to approve it with one:
+                // being logged in as an OS user is no longer enough.
+                if !change.narrows() && load_devices(keys).iter().any(|device| !device.revoked) {
+                    let class = if grants { GRANT_APPROVAL_CLASS } else { class };
+                    return match self.wait(&mut next, actor, class, grants, Waiting::Policy { change }) {
+                        Ok(pending) => (subject, Outcome::CommitWith(next, Box::new(PrimaryResponse { pending: Some(pending), ..PrimaryResponse::ok() }))),
+                        Err(reason) => (subject, refuse(reason)),
+                    };
                 }
-                if !self.someone_can_change_policy(&next_policy, &users) {
+                store_policy(&mut next, &next_policy, &next_users);
+                (subject, Outcome::Commit(next))
+            }
+            PrimaryRequest::Approvals => {
+                if let Err(reason) = self.check(&policy, actor, &Action::Approve { class: "policy.show".into() }) {
+                    return (None, refuse(reason));
+                }
+                let pending = load_waiting(keys, now_epoch_seconds())
+                    .into_iter()
+                    .map(|stored| Pending { description: describe(&stored.request, &stored.waiting), request: stored.request, waiting: stored.waiting })
+                    .collect();
+                (None, reply(PrimaryResponse { approvals: Some(pending), devices: Some(load_devices(keys)), ..PrimaryResponse::ok() }))
+            }
+            PrimaryRequest::Submit { approval } => self.submit(keys, &policy, &users, approval),
+            PrimaryRequest::AddDevice { device } => {
+                let subject = Some(format!("{:?} for {actor}", device.kind));
+                // Mac keys only, for now: a passkey's enrollment needs its own
+                // ceremony (attestation), which the approval page will run.
+                // Always the caller's own device: whom it approves as comes
+                // from who is asking, never from what the request says.
+                if actor.kind() != Kind::Human || device.kind != DeviceKind::Mac || !device.user_verification {
+                    return (subject, refuse("bad_device"));
+                }
+                if !approvals::valid_device_key(&device) {
+                    return (subject, refuse("bad_device"));
+                }
+                let mut devices = load_devices(keys);
+                if devices.len() >= MAX_DEVICES {
+                    return (subject, refuse("too_many_devices"));
+                }
+                let now = now_epoch_seconds();
+                let device = ApproverDevice {
+                    id: approvals::approval_id(),
+                    human: actor.clone(),
+                    enrolled_at: now,
+                    credential_id: None,
+                    backup_eligible: false,
+                    sign_count: 0,
+                    reserved_after: 0,
+                    revoked: false,
+                    ..device
+                };
+                let mut next = keys.clone();
+                // A person's first device is theirs to enroll; another one is
+                // approved with a device they already have.
+                if devices.iter().any(|other| !other.revoked && other.human == *actor) {
+                    return match self.wait(&mut next, actor, DEVICE_APPROVAL_CLASS, true, Waiting::Device { device }) {
+                        Ok(pending) => (subject, Outcome::CommitWith(next, Box::new(PrimaryResponse { pending: Some(pending), ..PrimaryResponse::ok() }))),
+                        Err(reason) => (subject, refuse(reason)),
+                    };
+                }
+                let id = device.id.clone();
+                devices.push(device);
+                store_devices(&mut next, &devices);
+                (subject, Outcome::CommitWith(next, Box::new(PrimaryResponse { value: Some(id), devices: Some(devices), ..PrimaryResponse::ok() })))
+            }
+            PrimaryRequest::RemoveDevice { id } => {
+                let subject = Some(id.clone());
+                let mut devices = load_devices(keys);
+                let Some(device) = devices.iter_mut().find(|device| device.id == id && device.human == *actor && !device.revoked) else {
+                    return (subject, refuse("no_such_device"));
+                };
+                device.revoked = true;
+                if !self.devices_can_widen(&policy, &devices) {
                     return (subject, refuse("would_lock_out"));
                 }
                 let mut next = keys.clone();
-                store_policy(&mut next, &next_policy, &users);
+                store_devices(&mut next, &devices);
                 (subject, Outcome::Commit(next))
             }
         }
+    }
+
+    /// The policy after `change`, as a restart would load it, if `actor` may
+    /// make it: the class it needs, approver rights it hands out (a stronger
+    /// class), and never a policy nobody could change again. Checked when the
+    /// change is asked for and again, against the policy then, when it is approved.
+    fn proposed(
+        &self,
+        keys: &HashMap<String, String>,
+        policy: &Policy,
+        users: &BTreeMap<String, Name>,
+        actor: &Name,
+        change: &PolicyChange,
+    ) -> Result<(Policy, BTreeMap<String, Name>, bool), &'static str> {
+        let class = if change.narrows() { "policy.narrow" } else { "policy.widen" };
+        self.check(policy, actor, &Action::Approve { class: class.into() })?;
+        let before = approver_reach(policy, users);
+        let mut next_policy = policy.clone();
+        let mut next_users = users.clone();
+        self.apply(&mut next_policy, &mut next_users, change.clone())?;
+        // Load it back the way a restart would, so a change that leaves a
+        // policy that can't load is refused now.
+        let next_policy: Policy =
+            serde_json::to_string(&next_policy).ok().and_then(|text| serde_json::from_str(&text).ok()).ok_or("policy_invalid")?;
+        // Giving anyone approver rights they didn't have is its own, stronger
+        // class (architecture, section 6).
+        let grants = !approver_reach(&next_policy, &next_users).is_subset(&before);
+        if grants {
+            self.check(policy, actor, &Action::Approve { class: GRANT_APPROVAL_CLASS.into() })?;
+        }
+        if !self.someone_can_change_policy(&next_policy, &next_users) {
+            return Err("would_lock_out");
+        }
+        // Once there are approver devices, one must still be able to approve a widening.
+        let devices = load_devices(keys);
+        if devices.iter().any(|device| !device.revoked) && !self.devices_can_widen(&next_policy, &devices) {
+            return Err("would_lock_out");
+        }
+        Ok((next_policy, next_users, grants))
+    }
+
+    /// Whether a device that isn't revoked belongs to someone who may approve a widening.
+    fn devices_can_widen(&self, policy: &Policy, devices: &[ApproverDevice]) -> bool {
+        let widen = Action::Approve { class: "policy.widen".into() };
+        devices.iter().any(|device| !device.revoked && self.check(policy, &device.human, &widen).is_ok())
+    }
+
+    /// Who decides here, as the approval rules see it: its issuer, the site
+    /// its passkeys belong to, one device per approval to start.
+    fn rp(&self) -> approvals::Primary {
+        let issuer = self.issuer.url().to_string();
+        let rp_id = issuer.trim_start_matches("https://").split(['/', ':']).next().unwrap_or_default().to_string();
+        approvals::Primary { issuer, rp_id, reserved_devices: 1 }
+    }
+
+    /// Any human of this org may approve, one device each; the policy then
+    /// decides whether this human may approve this class (`submit`).
+    fn rules(&self) -> Vec<ApprovalRule> {
+        let humans = format!("{}.human.*", self.org).parse().expect("a human pattern for the org");
+        ["policy.*", "approvals.*"]
+            .into_iter()
+            .map(|class| ApprovalRule { class: class.into(), approvers: Clone::clone(&humans), devices: 1 })
+            .collect()
+    }
+
+    /// Records a request for a person: the machine's broker asks on behalf of
+    /// the OS user's actor (so that actor's own device can approve it), for
+    /// exactly `waiting`, for `APPROVAL_SECONDS`.
+    fn wait(&self, keys: &mut HashMap<String, String>, actor: &Name, class: &str, grants: bool, waiting: Waiting) -> Result<Pending, &'static str> {
+        let now = now_epoch_seconds();
+        let mut all = load_waiting(keys, now);
+        if all.len() >= MAX_WAITING {
+            return Err("too_many_waiting");
+        }
+        let request = ApprovalRequest {
+            id: approvals::approval_id(),
+            primary: self.issuer.url().to_string(),
+            org: self.org.clone(),
+            class: class.into(),
+            actor: self.broker.clone(),
+            act_for: Some(actor.clone()),
+            chain: Vec::new(),
+            zone: Some(self.zone.clone()),
+            action: Action::Approve { class: class.into() },
+            // What the change reaches isn't bounded here, so only a person
+            // ever approves it, never a coordinator.
+            affects: Widens::Unbounded,
+            grants_approval: grants,
+            created_at: now,
+            expires_at: now + APPROVAL_SECONDS,
+        };
+        all.push(Stored { request: request.clone(), waiting: waiting.clone(), approvals: Vec::new() });
+        store_waiting(keys, &all);
+        Ok(Pending { description: describe(&request, &waiting), request, waiting })
+    }
+
+    /// A person's decision. The proof is checked before anything is kept;
+    /// only a human the policy lets approve the class counts; an approved
+    /// change is checked again against the policy as it is now, and a request
+    /// is acted on once.
+    fn submit(&self, keys: &HashMap<String, String>, policy: &Policy, users: &BTreeMap<String, Name>, approval: Approval) -> (Option<String>, Outcome) {
+        let refuse = |reason: &str| Outcome::Reply(Box::new(PrimaryResponse::error(reason)));
+        let subject = Some(approval.request_id.clone());
+        let now = now_epoch_seconds();
+        let mut all = load_waiting(keys, now);
+        let Some(index) = all.iter().position(|stored| stored.request.id == approval.request_id) else {
+            return (subject, refuse("no_such_request"));
+        };
+        let mut devices = load_devices(keys);
+        let rp = self.rp();
+        let device = match approvals::verify_approval(&all[index].request, &approval, &devices, &rp) {
+            Ok((device, _)) => device.clone(),
+            Err(err) => return (subject, refuse(err.as_str())),
+        };
+        let class = all[index].request.class.clone();
+        if self.check(policy, &device.human, &Action::Approve { class }).is_err() {
+            return (subject, refuse("not_an_approver"));
+        }
+        let entry = &mut all[index];
+        entry.approvals.retain(|other| other.device_id != approval.device_id);
+        entry.approvals.push(approval);
+        let decided = match approvals::decide(&entry.request, &entry.approvals, &devices, &self.rules(), &rp, now) {
+            Ok(decided) => decided,
+            Err(err) => return (subject, refuse(err.as_str())),
+        };
+        for (id, count) in decided.sign_counts {
+            if let Some(device) = devices.iter_mut().find(|device| device.id == id) {
+                device.sign_count = count;
+            }
+        }
+        let mut next = keys.clone();
+        let decision = match decided.outcome {
+            approvals::Outcome::Pending { have, need } => format!("pending {have}/{need}"),
+            approvals::Outcome::Denied => {
+                all.remove(index);
+                "denied".to_string()
+            }
+            approvals::Outcome::Approved => {
+                let stored = all.remove(index);
+                let asker = stored.request.act_for.clone().unwrap_or(stored.request.actor.clone());
+                match stored.waiting {
+                    Waiting::Policy { change } => match self.proposed(keys, policy, users, &asker, &change) {
+                        Ok((next_policy, next_users, _)) => store_policy(&mut next, &next_policy, &next_users),
+                        // Approved, but no longer possible: it is used up, and says why.
+                        Err(reason) => {
+                            store_waiting(&mut next, &all);
+                            store_devices(&mut next, &devices);
+                            return (subject, Outcome::CommitWith(next, Box::new(PrimaryResponse::error(format!("approved_but_{reason}")))));
+                        }
+                    },
+                    Waiting::Device { mut device } => {
+                        device.enrolled_at = now;
+                        devices.push(device);
+                    }
+                }
+                "approved".to_string()
+            }
+        };
+        store_waiting(&mut next, &all);
+        store_devices(&mut next, &devices);
+        (subject, Outcome::CommitWith(next, Box::new(PrimaryResponse { decision: Some(decision), ..PrimaryResponse::ok() })))
     }
 
     fn apply(&self, policy: &mut Policy, users: &mut BTreeMap<String, Name>, change: PolicyChange) -> Result<(), &'static str> {
@@ -543,6 +817,10 @@ fn op_name(request: &PrimaryRequest) -> &'static str {
         PrimaryRequest::PolicyShow => "policy_show",
         PrimaryRequest::PolicyChange { .. } => "policy_change",
         PrimaryRequest::Decide { .. } => "decide",
+        PrimaryRequest::Approvals => "approvals",
+        PrimaryRequest::Submit { .. } => "submit",
+        PrimaryRequest::AddDevice { .. } => "add_device",
+        PrimaryRequest::RemoveDevice { .. } => "remove_device",
     }
 }
 
@@ -983,3 +1261,5 @@ async fn write_http_json(stream: &mut (impl AsyncWrite + Unpin), status: u16, bo
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod approval_tests;

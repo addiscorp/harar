@@ -164,6 +164,14 @@ impl ApproverDevice {
     }
 }
 
+/// A fresh request id: 128 random bits, lowercase hex (`ApprovalRequest::id`'s shape).
+pub fn approval_id() -> String {
+    use rand_core::RngCore;
+    let mut bytes = [0u8; 16];
+    rand_core::OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// The primary deciding: its issuer URL, which every request must name, the
 /// site its passkeys belong to, and how many of a person's devices a reserved
 /// class needs. All from its own config, never from a request or a device.
@@ -527,6 +535,11 @@ impl ApprovalError {
 
 fn decode(value: &str) -> Result<Vec<u8>, ApprovalError> {
     B64URL.decode(value).map_err(|_| ApprovalError::BadProof)
+}
+
+/// Whether a device's public key is one an approval can be checked against (P-256).
+pub fn valid_device_key(device: &ApproverDevice) -> bool {
+    verifying_key(device).is_ok()
 }
 
 fn verifying_key(device: &ApproverDevice) -> Result<VerifyingKey, ApprovalError> {

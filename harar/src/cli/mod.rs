@@ -2,6 +2,7 @@ use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 pub mod agent;
+pub mod approve;
 pub mod get;
 pub mod identity;
 pub mod key;
@@ -38,6 +39,11 @@ enum Command {
     Put(put::Put),
     Token(identity::Token),
     Policy(identity::PolicyCmd),
+    /// Your approver devices at a primary.
+    Device(approve::DeviceCmd),
+    Approvals(approve::Approvals),
+    Approve(approve::Approve),
+    Deny(approve::Deny),
     Key(key::Key),
     Version(version::Version),
 }
@@ -74,6 +80,10 @@ pub async fn run() -> anyhow::Result<()> {
         Command::Put(cmd) => put::run(cmd).await,
         Command::Token(cmd) => identity::token(cmd).await,
         Command::Policy(cmd) => identity::policy(cmd).await,
+        Command::Device(cmd) => approve::device(cmd).await,
+        Command::Approvals(cmd) => approve::approvals(cmd).await,
+        Command::Approve(cmd) => approve::approve(cmd).await,
+        Command::Deny(cmd) => approve::deny(cmd).await,
         Command::Key(cmd) => key::run(cmd).await,
         Command::Version(cmd) => version::run(cmd),
     }
