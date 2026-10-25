@@ -752,8 +752,15 @@ impl Primary {
                 // Signed by one of their own devices: the OS account alone
                 // never removes one, and the class is reserved, so a device
                 // still in its day after a recovery can't either.
+                // Asked already (by them, or by someone with their OS account):
+                // the same request, to approve, not an error.
+                let waiting = Waiting::RemoveDevice { id, human: actor.clone() };
+                if let Some(stored) = load_waiting(keys, now_epoch_seconds()).into_iter().find(|stored| same_change(&stored.waiting, &waiting)) {
+                    let pending = Pending { description: describe(&stored.request, &stored.waiting), request: stored.request, waiting: stored.waiting };
+                    return (subject, reply(PrimaryResponse { pending: Some(pending), ..PrimaryResponse::ok() }));
+                }
                 let mut next = keys.clone();
-                match self.wait(&mut next, actor, DEVICE_REMOVAL_CLASS, false, Waiting::RemoveDevice { id, human: actor.clone() }) {
+                match self.wait(&mut next, actor, DEVICE_REMOVAL_CLASS, false, waiting) {
                     Ok(pending) => (subject, Outcome::CommitWith(next, Box::new(PrimaryResponse { pending: Some(pending), ..PrimaryResponse::ok() }))),
                     Err(reason) => (subject, refuse(reason)),
                 }
@@ -833,7 +840,11 @@ impl Primary {
         if all.len() >= MAX_WAITING {
             return Err("too_many_waiting");
         }
-        if all.iter().filter(|stored| stored.request.act_for.as_ref() == Some(actor)).count() >= MAX_WAITING_PER_ASKER {
+        // Removals don't count: each device waits once at most, so they're
+        // bounded by the person's devices, and filling the quota with them
+        // can't keep the owner from asking for anything else.
+        let counted = |stored: &&Stored| stored.request.act_for.as_ref() == Some(actor) && !matches!(stored.waiting, Waiting::RemoveDevice { .. });
+        if !matches!(waiting, Waiting::RemoveDevice { .. }) && all.iter().filter(counted).count() >= MAX_WAITING_PER_ASKER {
             return Err("too_many_waiting");
         }
         if all.iter().any(|stored| same_change(&stored.waiting, &waiting)) {
@@ -880,6 +891,11 @@ impl Primary {
             Ok((device, _)) => device.clone(),
             Err(err) => return (subject, refuse(err.as_str())),
         };
+        // A device still in its day after a recovery may deny other requests,
+        // but never a removal: the owner can always revoke it, whoever holds it.
+        if matches!(all[index].waiting, Waiting::RemoveDevice { .. }) && approval.decision == approvals::Decision::Deny && now < device.reserved_after {
+            return (subject, refuse("recovery_cooldown"));
+        }
         let class = all[index].request.class.clone();
         match &all[index].waiting {
             // A person's recovery codes are theirs alone: only their own

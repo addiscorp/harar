@@ -631,3 +631,29 @@ async fn an_approved_removal_is_checked_again_and_never_locks_the_person_out() {
     assert_eq!(refused(&ask(&primary, "sami", signed(&drop_a, &a_id, &a, Decision::Approve)).await), "approved_but_would_lock_out");
     assert!(devices(&primary).await.iter().any(|d| d.id == a_id && !d.revoked));
 }
+
+#[tokio::test]
+async fn a_recovered_device_cant_deny_its_own_removal_and_removals_never_crowd_out_other_asks() {
+    let dir = tempfile::tempdir().unwrap();
+    let primary = primary(dir.path()).await;
+    let owner = key();
+    let (first, codes) = first_device_and_codes(&primary, "sami", &owner).await;
+    let thief = key();
+    let stolen = recover(&primary, "sami", &codes[0], &thief).await.value.unwrap();
+    backdate(&primary).await;
+    let revoke = ask(&primary, "sami", PrimaryRequest::RemoveDevice { id: stolen.clone() }).await.pending.expect("it waits");
+    // The thief sees it waiting, and can't make it go away.
+    assert_eq!(refused(&ask(&primary, "sami", signed(&revoke, &stolen, &thief, Decision::Deny)).await), "recovery_cooldown");
+    // Asked again: the same request, not an error.
+    let again = ask(&primary, "sami", PrimaryRequest::RemoveDevice { id: stolen.clone() }).await.pending.expect("the same request");
+    assert_eq!(again.request.id, revoke.request.id);
+    // A removal waiting doesn't use up the person's other asks.
+    let strip = ask(&primary, "sami", PrimaryRequest::RemoveDevice { id: first.clone() }).await;
+    assert!(strip.pending.is_some());
+    for n in 0..MAX_WAITING_PER_ASKER {
+        let role = Role { name: name(&format!("gg.addis.role.r{n}")), allows: vec![Permission { verb: Verb::Read, resource: format!("r{n}/*"), scopes: vec![] }] };
+        assert!(change(&primary, "sami", PolicyChange::SetRole { role }).await.pending.is_some(), "ask {n}");
+    }
+    assert_eq!(ask(&primary, "sami", signed(&revoke, &first, &owner, Decision::Approve)).await.decision.as_deref(), Some("approved"));
+    assert!(load_devices(&*primary.keys.lock().await).iter().any(|d| d.id == stolen && d.revoked));
+}
