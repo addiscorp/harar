@@ -10,6 +10,7 @@ use anyhow::{Result, anyhow};
 use clap::{Args, Subcommand};
 use harar_client::VaultClient;
 use harar_client::approvals::Decision;
+#[cfg(target_os = "macos")]
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -23,7 +24,8 @@ pub struct DeviceCmd {
 enum DeviceAction {
     /// Enroll this Mac as one of your approver devices.
     Add(SocketArgs),
-    /// Revoke one of your devices (never the last that can approve a widening).
+    /// Ask to revoke one of your devices: approved on one of your devices
+    /// (never the last that can approve a widening).
     Remove {
         id: String,
         #[command(flatten)]
@@ -73,6 +75,7 @@ pub struct Deny {
 }
 
 /// This Mac's approver key, and the device id each primary (by socket) gave it.
+#[cfg(target_os = "macos")]
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct ApproverFile {
     /// The Secure Enclave key's handle, base64.
@@ -80,11 +83,13 @@ struct ApproverFile {
     devices: BTreeMap<String, String>,
 }
 
+#[cfg(target_os = "macos")]
 fn approver_path() -> PathBuf {
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
     if cfg!(target_os = "macos") { home.join("Library/Application Support/harar/approver.json") } else { home.join(".harar/approver.json") }
 }
 
+#[cfg(target_os = "macos")]
 fn read_approver() -> Result<Option<ApproverFile>> {
     match std::fs::read_to_string(approver_path()) {
         Ok(text) => Ok(Some(serde_json::from_str(&text)?)),
@@ -93,6 +98,7 @@ fn read_approver() -> Result<Option<ApproverFile>> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn write_approver(file: &ApproverFile) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -117,12 +123,11 @@ pub async fn device(cmd: DeviceCmd) -> Result<()> {
         // Empty input is refused here, never spent as one of the hour's tries.
         DeviceAction::Recover { code, socket } => add(socket.socket, Some(code.read("Recovery code")?)).await,
         DeviceAction::Remove { id, socket } => {
-            VaultClient::from_socket_path(&socket.socket).remove_device(&id).await?;
-            if let Some(mut file) = read_approver()? {
-                file.devices.retain(|_, enrolled| *enrolled != id);
-                write_approver(&file)?;
-            }
-            print_json(&serde_json::json!({ "ok": true }))
+            // A request one of your devices approves; this Mac's own record of
+            // its id goes once a later `harar device add` enrolls it again.
+            let pending = VaultClient::from_socket_path(&socket.socket).remove_device(&id).await?;
+            eprintln!("Approve it on one of your devices: harar approve {}", pending.request.id);
+            print_json(&serde_json::json!({ "ok": true, "waiting": pending.request.id, "description": pending.description }))
         }
     }
 }

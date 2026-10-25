@@ -252,8 +252,9 @@ impl VaultClient {
         self.ask(&PrimaryRequest::Send { key: key.into(), host: host.into() }).await?.value.ok_or_else(|| VaultClientError::InvalidResponse("no value".into()))
     }
 
-    pub async fn remove_device(&self, id: &str) -> Result<(), VaultClientError> {
-        self.ask(&PrimaryRequest::RemoveDevice { id: id.into() }).await.map(drop)
+    /// The request one of your other devices approves to revoke `id`.
+    pub async fn remove_device(&self, id: &str) -> Result<primary::Pending, VaultClientError> {
+        self.ask(&PrimaryRequest::RemoveDevice { id: id.into() }).await?.pending.ok_or_else(|| VaultClientError::InvalidResponse("no request".into()))
     }
 
     /// What `actor` (default: you) would be allowed, without doing it.

@@ -42,6 +42,8 @@ const RECOVERY_FAILURES_KEY: &str = "harar:recovery_failures";
 /// Failed recovery tries a person gets per hour; then none until it passes.
 const MAX_RECOVERY_FAILURES: usize = 5;
 const RECOVERY_WINDOW_SECONDS: u64 = 3600;
+/// Revoking a person's approver device: reserved (`device.*`).
+const DEVICE_REMOVAL_CLASS: &str = "device.remove";
 /// Replacing a person's recovery codes: reserved (`recovery.*`).
 const RECOVERY_CLASS: &str = "recovery.codes";
 /// What a person should know about their own account: kept a week, at most
@@ -253,6 +255,7 @@ fn same_change(a: &Waiting, b: &Waiting) -> bool {
         (Waiting::Policy { change: a }, Waiting::Policy { change: b }) => a == b,
         (Waiting::Device { device: a }, Waiting::Device { device: b }) => a.public_key.x == b.public_key.x && a.public_key.y == b.public_key.y,
         (Waiting::RecoveryCodes { human: a }, Waiting::RecoveryCodes { human: b }) => a == b,
+        (Waiting::RemoveDevice { id: a, .. }, Waiting::RemoveDevice { id: b, .. }) => a == b,
         _ => false,
     }
 }
@@ -266,6 +269,7 @@ fn describe(request: &ApprovalRequest, waiting: &Waiting) -> String {
             format!("enroll the {:?} key {} as an approver device for {}", device.kind, approvals::device_fingerprint(device), device.human)
         }
         Waiting::RecoveryCodes { human } => format!("replace the recovery codes of {human} (the old ones stop working)"),
+        Waiting::RemoveDevice { id, human } => format!("revoke the approver device {id} of {human}"),
     };
     let zone = request.zone.as_ref().map(Name::to_string).unwrap_or_default();
     format!("[{} on {}] {who}, at {zone}, asks to {what}", request.class, request.primary)
@@ -738,24 +742,28 @@ impl Primary {
             PrimaryRequest::RemoveDevice { id } => {
                 let subject = Some(format!("{id} of {actor}"));
                 let mut devices = load_devices(keys);
-                let now = now_epoch_seconds();
-                // While a device recovered with a code waits out its day, the
-                // person's other devices stay: a stolen code can't strip the
-                // owner's devices. The recovered one can always go.
-                let cooling = devices.iter().any(|device| !device.revoked && device.human == *actor && now < device.reserved_after);
                 let Some(device) = devices.iter_mut().find(|device| device.id == id && device.human == *actor && !device.revoked) else {
                     return (subject, refuse("no_such_device"));
                 };
-                if cooling && now >= device.reserved_after {
-                    return (subject, refuse("recovery_cooldown"));
-                }
                 device.revoked = true;
                 if !self.devices_can_widen(&policy, &devices) {
                     return (subject, refuse("would_lock_out"));
                 }
+                // Signed by one of their own devices: the OS account alone
+                // never removes one, and the class is reserved, so a device
+                // still in its day after a recovery can't either.
+                // Asked already (by them, or by someone with their OS account):
+                // the same request, to approve, not an error.
+                let waiting = Waiting::RemoveDevice { id, human: actor.clone() };
+                if let Some(stored) = load_waiting(keys, now_epoch_seconds()).into_iter().find(|stored| same_change(&stored.waiting, &waiting)) {
+                    let pending = Pending { description: describe(&stored.request, &stored.waiting), request: stored.request, waiting: stored.waiting };
+                    return (subject, reply(PrimaryResponse { pending: Some(pending), ..PrimaryResponse::ok() }));
+                }
                 let mut next = keys.clone();
-                store_devices(&mut next, &devices);
-                (subject, Outcome::Commit(next))
+                match self.wait(&mut next, actor, DEVICE_REMOVAL_CLASS, false, waiting) {
+                    Ok(pending) => (subject, Outcome::CommitWith(next, Box::new(PrimaryResponse { pending: Some(pending), ..PrimaryResponse::ok() }))),
+                    Err(reason) => (subject, refuse(reason)),
+                }
             }
         }
     }
@@ -817,7 +825,7 @@ impl Primary {
     /// decides whether this human may approve this class (`submit`).
     fn rules(&self) -> Vec<ApprovalRule> {
         let humans = format!("{}.human.*", self.org).parse().expect("a human pattern for the org");
-        ["policy.*", "approvals.*", "recovery.*"]
+        ["policy.*", "approvals.*", "recovery.*", "device.*"]
             .into_iter()
             .map(|class| ApprovalRule { class: class.into(), approvers: Clone::clone(&humans), devices: 1 })
             .collect()
@@ -832,7 +840,11 @@ impl Primary {
         if all.len() >= MAX_WAITING {
             return Err("too_many_waiting");
         }
-        if all.iter().filter(|stored| stored.request.act_for.as_ref() == Some(actor)).count() >= MAX_WAITING_PER_ASKER {
+        // Removals don't count: each device waits once at most, so they're
+        // bounded by the person's devices, and filling the quota with them
+        // can't keep the owner from asking for anything else.
+        let counted = |stored: &&Stored| stored.request.act_for.as_ref() == Some(actor) && !matches!(stored.waiting, Waiting::RemoveDevice { .. });
+        if !matches!(waiting, Waiting::RemoveDevice { .. }) && all.iter().filter(counted).count() >= MAX_WAITING_PER_ASKER {
             return Err("too_many_waiting");
         }
         if all.iter().any(|stored| same_change(&stored.waiting, &waiting)) {
@@ -879,12 +891,17 @@ impl Primary {
             Ok((device, _)) => device.clone(),
             Err(err) => return (subject, refuse(err.as_str())),
         };
+        // A device still in its day after a recovery may deny other requests,
+        // but never a removal: the owner can always revoke it, whoever holds it.
+        if matches!(all[index].waiting, Waiting::RemoveDevice { .. }) && approval.decision == approvals::Decision::Deny && now < device.reserved_after {
+            return (subject, refuse("recovery_cooldown"));
+        }
         let class = all[index].request.class.clone();
         match &all[index].waiting {
             // A person's recovery codes are theirs alone: only their own
             // device approves a new set, whatever the policy says (and, the
             // class being reserved, never one still in its day after a recovery).
-            Waiting::RecoveryCodes { human } => {
+            Waiting::RecoveryCodes { human } | Waiting::RemoveDevice { human, .. } => {
                 if *human != device.human {
                     return (subject, refuse("not_yours"));
                 }
@@ -947,6 +964,25 @@ impl Primary {
                             notify(&mut next, &device.human, "you have no recovery codes yet: harar recovery-codes, approved on this device".into());
                         }
                         devices.push(device);
+                    }
+                    Waiting::RemoveDevice { id, human } => {
+                        // As things are now: still theirs and live, and not the
+                        // last one that could approve a widening.
+                        let mut after = devices.clone();
+                        let reason = match after.iter_mut().find(|d| d.id == id && d.human == human && !d.revoked) {
+                            None => Some("no_such_device"),
+                            Some(target) => {
+                                target.revoked = true;
+                                (!self.devices_can_widen(policy, &after)).then_some("would_lock_out")
+                            }
+                        };
+                        if let Some(reason) = reason {
+                            store_waiting(&mut next, &all);
+                            store_devices(&mut next, &devices);
+                            return (Some(format!("{who}: approved_but_{reason}")), Outcome::CommitWith(next, Box::new(PrimaryResponse::error(format!("approved_but_{reason}")))));
+                        }
+                        devices = after;
+                        notify(&mut next, &human, format!("your approver device {id} was revoked, approved with {}", device.id));
                     }
                     Waiting::RecoveryCodes { human } => {
                         let mut stored = load_recovery(keys);
