@@ -16,6 +16,23 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The npm package `harar` (import { vault } from 'harar'): its tests on
+  # Node and on Bun, and what it would publish.
+  js:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: js
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@v2
+      - run: npm test
+      - run: bun test test/
+      - run: npm pack --dry-run
+
   linux:
     runs-on: ubuntu-24.04
     # Compilation is cached in R2. public-ci holds only the key for this

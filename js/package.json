@@ -1,0 +1,19 @@
+{
+  "name": "harar",
+  "version": "0.1.0",
+  "description": "harar's client: import { vault } from 'harar'. Where each secret may go, and the secret itself for one host only.",
+  "license": "Apache-2.0",
+  "homepage": "https://harar.addis.org",
+  "repository": { "type": "git", "url": "git+https://github.com/addiscorp/harar.git", "directory": "js" },
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": { "types": "./index.d.ts", "default": "./index.js" }
+  },
+  "files": ["index.js", "index.d.ts", "README.md", "LICENSE"],
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "engines": { "node": ">=20" }
+}

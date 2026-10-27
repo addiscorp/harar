@@ -1,2 +1,4 @@
 /.target/
 /.tmp/
+/js/.tmp/
+/js/node_modules/
