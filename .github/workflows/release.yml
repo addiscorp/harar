@@ -5,14 +5,14 @@
 # stable vX.Y.Z tag or touches latest.json: that is promote.yml, run by a
 # person against a canary this workflow already published.
 #
-# R2 layout (harar-releases, served at https://harar.addis.gg), the
+# R2 layout (harar-releases, served at https://harar-releases.addis.gg), the
 # deka shape: directories are the version with no "v".
 #   <version>/harar-<platform>   one binary per platform
 #   <version>/release.json        version, commit, channel, sha256 per platform
 #   canary.json                   the newest canary's release.json
 #   latest.json                   the newest stable's (promote.yml)
 #   install.sh                    the installer, from this repo
-# The installer (harar.addis.gg/install.sh) reads exactly these.
+# The installer (harar-releases.addis.gg/install.sh) reads exactly these.
 name: Release (canary)
 
 on:
@@ -246,18 +246,18 @@ jobs:
         run: |
           aws s3 cp install.sh "s3://${R2_BUCKET_RELEASES}/install.sh" --endpoint-url="${R2_ENDPOINT}" \
             --content-type "text/x-shellscript; charset=utf-8" --cache-control "no-cache"
-      - name: Read it back from harar.addis.gg
+      - name: Read it back from harar-releases.addis.gg
         run: |
           set -euo pipefail
           VERSION="${{ needs.resolve.outputs.version }}"
-          curl -fsSL "https://harar.addis.gg/${VERSION}/release.json" -o served.json
+          curl -fsSL "https://harar-releases.addis.gg/${VERSION}/release.json" -o served.json
           cmp served.json "release/${VERSION}/release.json"
           for platform in linux-x64 darwin-x64 darwin-arm64; do
             want="$(python3 -c "import json; print(json.load(open('served.json'))['binaries']['${platform}']['sha256'])")"
-            got="$(curl -fsSL "https://harar.addis.gg/${VERSION}/harar-${platform}" | sha256sum | cut -d' ' -f1)"
+            got="$(curl -fsSL "https://harar-releases.addis.gg/${VERSION}/harar-${platform}" | sha256sum | cut -d' ' -f1)"
             [ "$want" = "$got" ] || { echo "::error::harar-${platform} served from R2 does not match its sha256"; exit 1; }
           done
-          echo "every binary at https://harar.addis.gg/${VERSION}/ matches release.json"
+          echo "every binary at https://harar-releases.addis.gg/${VERSION}/ matches release.json"
       - name: Point canary.json at it
         run: |
           VERSION="${{ needs.resolve.outputs.version }}"
@@ -275,13 +275,13 @@ jobs:
           else
             gh release create "$TAG" release/${VERSION}/* --repo "${{ github.repository }}" \
               --title "harar ${VERSION} (canary)" --prerelease \
-              --notes "Canary build of ${GITHUB_SHA}. Install it: curl -fsSL https://harar.addis.gg/install.sh | sh -s -- --canary"
+              --notes "Canary build of ${GITHUB_SHA}. Install it: curl -fsSL https://harar-releases.addis.gg/install.sh | sh -s -- --canary"
           fi
       - name: Summary
         run: |
           VERSION="${{ needs.resolve.outputs.version }}"
           {
             echo "### harar ${VERSION} (canary)"
-            echo "- https://harar.addis.gg/${VERSION}/release.json"
+            echo "- https://harar-releases.addis.gg/${VERSION}/release.json"
             echo "- canary.json now points here; latest.json was not touched (promote.yml)"
           } >> "$GITHUB_STEP_SUMMARY"

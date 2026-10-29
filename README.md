@@ -18,7 +18,7 @@ key is sealed to the Secure Enclave) and Linux. It works without an account.
 ## Install
 
 ```sh
-curl -fsSL https://harar.addis.gg/install.sh | sh
+curl -fsSL https://harar-releases.addis.gg/install.sh | sh
 ```
 
 It installs `harar` into `~/.harar/bin`, checked against the SHA-256 in the
