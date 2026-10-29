@@ -1,8 +1,8 @@
 #!/bin/sh
 # harar installer.
 #
-#   curl -fsSL https://harar.addis.gg/install.sh | sh
-#   curl -fsSL https://harar.addis.gg/install.sh | sh -s -- --canary
+#   curl -fsSL https://harar-releases.addis.gg/install.sh | sh
+#   curl -fsSL https://harar-releases.addis.gg/install.sh | sh -s -- --canary
 #
 # Installs harar into ~/.harar/bin.
 # Options: --stable / --canary, --version X.Y.Z, --install-dir PATH,
@@ -16,7 +16,7 @@ set -eu
 
 # Releases live in R2 (harar-releases), served at this domain. Kept as a
 # constant so repointing it is a one-line change.
-BASE_URL="https://harar.addis.gg"
+BASE_URL="https://harar-releases.addis.gg"
 INSTALL_DIR="${HOME}/.harar"
 HARAR_VERSION=""
 NO_MODIFY_PATH=0
@@ -124,7 +124,7 @@ main() {
       die "Windows is not supported." \
           "Run this inside WSL (Windows Subsystem for Linux) instead:" \
           "  wsl --install" \
-          "  curl -fsSL https://harar.addis.gg/install.sh | sh"
+          "  curl -fsSL https://harar-releases.addis.gg/install.sh | sh"
       ;;
     *)
       die "${os} is not supported." \
@@ -194,7 +194,7 @@ main() {
         fetch "${BASE_URL}/latest.json" "${tmp}/release.json" || die \
           "No stable release of harar yet (${BASE_URL}/latest.json not found)." \
           "Install the newest canary build instead:" \
-          "  curl -fsSL https://harar.addis.gg/install.sh | sh -s -- --canary"
+          "  curl -fsSL https://harar-releases.addis.gg/install.sh | sh -s -- --canary"
         ;;
     esac
     HARAR_VERSION=$(json_string "${tmp}/release.json" version)

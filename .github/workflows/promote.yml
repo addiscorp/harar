@@ -110,12 +110,12 @@ jobs:
           git tag -a "v${V}" "${{ steps.validate.outputs.commit }}" -m "harar ${V} (promoted from ${{ steps.validate.outputs.canary }})"
           git push origin "v${V}"
           gh release create "v${V}" stable/${V}/* --repo "${{ github.repository }}" --title "harar ${V}" \
-            --notes "Promoted from ${{ steps.validate.outputs.canary }}, the same bytes. Install: curl -fsSL https://harar.addis.gg/install.sh | sh"
+            --notes "Promoted from ${{ steps.validate.outputs.canary }}, the same bytes. Install: curl -fsSL https://harar-releases.addis.gg/install.sh | sh"
       - name: Summary
         run: |
           V="${{ steps.validate.outputs.v }}"
           {
             echo "### harar ${V} is stable"
-            echo "- https://harar.addis.gg/${V}/release.json (from ${{ steps.validate.outputs.canary }})"
+            echo "- https://harar-releases.addis.gg/${V}/release.json (from ${{ steps.validate.outputs.canary }})"
             echo "- latest.json points here"
           } >> "$GITHUB_STEP_SUMMARY"
