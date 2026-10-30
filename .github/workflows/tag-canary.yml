@@ -1,4 +1,5 @@
-# Every push to main becomes a canary build (the dsc model).
+# Nightly canary (APS 9): once a night, main becomes a canary build if it
+# changed since the last one. Actions → Tag canary → Run workflow makes one now.
 #
 #   1. TAG = v<workspace version>-canary-<7-char sha> (scripts/version.sh).
 #   2. Push TAG as an annotated tag. A push made with GITHUB_TOKEN starts no
@@ -11,8 +12,9 @@
 name: Tag canary
 
 on:
-  push:
-    branches: [main]
+  schedule:
+    - cron: '0 9 * * *' # 09:00 UTC, 03:00 in Alberta (APS 9: canaries are nightly)
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -39,7 +41,7 @@ jobs:
           fi
           TAG="v${V}-canary-$(git rev-parse --short=7 HEAD)"
           if git rev-parse "$TAG" >/dev/null 2>&1; then
-            echo "canary tag ${TAG} already exists (re-run or duplicate push); nothing to do"
+            echo "canary tag ${TAG} already exists (main hasn't changed since); nothing to do"
             exit 0
           fi
           git config user.name "github-actions[bot]"
