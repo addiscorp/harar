@@ -34,7 +34,7 @@ jobs:
       - run: npm pack --dry-run
 
   linux:
-    runs-on: mirab-linux-arm64
+    runs-on: ubuntu-24.04  # needs Docker; mirab VMs gain it with the full kernel
     # Compilation is cached in R2. public-ci holds only the key for this
     # repo's sccache buckets (the dsc model); publishing keys are in release.
     environment: public-ci
