@@ -1,0 +1,94 @@
+# Publish the Ruby client (ruby/, `Harar.vault`) to RubyGems as `harar` from
+# a stable release. Promote dispatches this after it tags vX.Y.Z; Actions →
+# Publish to RubyGems → Run workflow retries a version by hand. Canaries never
+# publish here: RubyGems versions are permanent (APS 9). The harar binary
+# ships from harar-releases, never from a registry (APS 13).
+#
+# RubyGems trusted publishing (OIDC): RubyGems trusts this workflow by its
+# filename (`rubygems.yml`) in the `release` environment. There is no
+# RubyGems token anywhere. Renaming this file breaks that trust.
+name: Publish to RubyGems
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Stable version to publish (X.Y.Z, tagged vX.Y.Z)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish harar to RubyGems
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: read
+      id-token: write # OIDC: trusted publishing
+    env:
+      V: ${{ inputs.version }}
+    steps:
+      - name: The version is a stable release
+        run: |
+          if [[ ! "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'$V' is not a stable version (X.Y.Z). Canaries never publish to RubyGems."
+            exit 1
+          fi
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: v${{ inputs.version }}
+      - uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1.338.0
+        with:
+          ruby-version: "3.4"
+      - name: The client is harar at this release's version
+        run: scripts/check-clients.sh && [ "$(scripts/version.sh)" = "$V" ]
+      - name: Test
+        working-directory: ruby
+        run: ruby -Ilib test/vault_test.rb
+      # Dated by the release commit, so a rerun builds the bytes already served.
+      - name: Build
+        working-directory: ruby
+        run: SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" gem build harar.gemspec --output "harar-${V}.gem"
+      - name: Already published?
+        id: existing
+        run: |
+          set -euo pipefail
+          code="$(curl -sS -o /dev/null -w '%{http_code}' "https://rubygems.org/api/v2/rubygems/harar/versions/${V}.json")"
+          echo "published=$([ "$code" = 200 ] && echo yes || echo no)" >> "$GITHUB_OUTPUT"
+          [ "$code" = 200 ] && echo "harar ${V} is already on RubyGems; checking its bytes only."
+          true
+      - name: Configure RubyGems credentials
+        if: steps.existing.outputs.published == 'no'
+        uses: rubygems/configure-rubygems-credentials@dc5a8d8553e6ee01fc26761a49e99e733d17954a # v2.1.0
+      - name: Publish
+        if: steps.existing.outputs.published == 'no'
+        working-directory: ruby
+        run: gem push "harar-${V}.gem"
+      # Success is RubyGems serving these bytes, not a green step: the .gem it
+      # serves must be the one this job built.
+      - name: RubyGems serves this release
+        run: |
+          set -euo pipefail
+          want="$(sha256sum "ruby/harar-${V}.gem" | cut -d' ' -f1)"
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -fsSL -o served.gem "https://rubygems.org/gems/harar-${V}.gem"; then
+              got="$(sha256sum served.gem | cut -d' ' -f1)"
+              if [ "$got" = "$want" ]; then
+                echo "RubyGems serves harar ${V} (sha256 ${got})"
+                {
+                  echo "### harar ${V} is on RubyGems"
+                  echo "- https://rubygems.org/gems/harar/versions/${V}"
+                  echo "- sha256 ${got}, the bytes this job built"
+                } >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+              echo "::error::RubyGems serves harar ${V} with sha256 ${got}, but this release builds ${want}."
+              exit 1
+            fi
+            sleep 15
+          done
+          echo "::error::RubyGems does not serve harar ${V} after 150 s."
+          exit 1

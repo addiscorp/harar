@@ -33,8 +33,14 @@ local socket; the clients hold no secrets.
 - **Rust:** the [`harar`](client/README.md) crate, `harar = "0.2"`, `use harar::VaultClient`.
 - **JavaScript and TypeScript:** the [`harar`](js/README.md) npm package,
   `import { vault } from 'harar'`.
+- **Python:** the [`harar`](python/README.md) PyPI package, `pip install harar`,
+  `from harar import vault`.
+- **Ruby:** the [`harar`](ruby/README.md) gem, `gem install harar`,
+  `Harar.vault(socket: ...)`.
+- **PHP:** the [`addis/harar`](php/README.md) Composer package,
+  `composer require addis/harar`, `Harar\vault(socket: ...)`.
 
-Both publish from a stable release, at its version.
+All of them publish from a stable release, at its version.
 
 ## Build
 

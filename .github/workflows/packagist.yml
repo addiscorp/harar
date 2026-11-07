@@ -1,0 +1,63 @@
+# The PHP client (php/, `Harar\vault()`) on Packagist as `addis/harar`.
+# Packagist publishes nothing from here: it reads composer.json at the repo
+# root and takes each vX.Y.Z tag as a version, told by GitHub's Packagist
+# hook when Promote pushes the tag. This checks Packagist then serves the
+# release at the tagged commit. Canary tags (vX.Y.Z-canary-<sha>) are not
+# versions Composer accepts, so Packagist skips them (APS 9).
+#
+# No token: the package was submitted once on packagist.org from
+# github.com/addiscorp/harar, with the GitHub hook connected.
+name: Packagist
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Stable version to check (X.Y.Z, tagged vX.Y.Z)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Packagist serves addis/harar
+    runs-on: ubuntu-24.04
+    env:
+      V: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: v${{ inputs.version }}
+      - name: Packagist serves this release at the tagged commit
+        run: |
+          set -euo pipefail
+          want="$(git rev-parse HEAD)"
+          # Packagist's hook usually lands in a minute; give it ten.
+          for _ in $(seq 1 40); do
+            if curl -fsSL -o served.json "https://repo.packagist.org/p2/addis/harar.json"; then
+              got="$(python3 - served.json "$V" <<'PY'
+          import json, sys
+          versions = json.load(open(sys.argv[1]))["packages"]["addis/harar"]
+          print(next((v["source"]["reference"] for v in versions if v["version_normalized"] == sys.argv[2] + ".0"), ""))
+          PY
+              )"
+              if [ "$got" = "$want" ]; then
+                echo "Packagist serves addis/harar ${V} at ${got}"
+                {
+                  echo "### addis/harar ${V} is on Packagist"
+                  echo "- https://packagist.org/packages/addis/harar#v${V}"
+                  echo "- at ${got}, the tagged commit"
+                } >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+              if [ -n "$got" ]; then
+                echo "::error::Packagist serves addis/harar ${V} at ${got}, but v${V} is ${want}."
+                exit 1
+              fi
+            fi
+            sleep 15
+          done
+          echo "::error::Packagist does not serve addis/harar ${V} after 10 minutes. Needs Sami: submit github.com/addiscorp/harar on packagist.org (vendor addis) and connect the GitHub hook."
+          exit 1

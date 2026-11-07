@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "harar"
+# harar's release version (scripts/version.sh); scripts/check-clients.sh holds it there.
+version = "0.2.0"
+description = "harar's client: from harar import vault. Where each secret may go, and the secret itself for one host only."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.9"
+dependencies = []
+
+[project.urls]
+Homepage = "https://harar.addis.gg"
+Source = "https://github.com/addiscorp/harar"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/harar"]
