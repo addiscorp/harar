@@ -89,7 +89,8 @@ jobs:
       - run: php php/tests/vault_test.php
       # What a user's Composer autoloads: Harar\vault and Harar\Vault, from the root composer.json.
       - run: composer dump-autoload
-      - run: php -r 'require "vendor/autoload.php"; exit(Harar\vault(socket: "/run/harar.sock") instanceof Harar\Vault ? 0 : 1);'
+      - run: |
+          php -r 'require "vendor/autoload.php"; exit(Harar\vault(socket: "/run/harar.sock") instanceof Harar\Vault ? 0 : 1);'
 
   linux:
     runs-on: ubuntu-24.04
