@@ -4,7 +4,7 @@
 use super::*;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use harar_client::approvals::{Decision, Proof};
+use harar::approvals::{Decision, Proof};
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
 use p256::elliptic_curve::rand_core::OsRng;
@@ -27,7 +27,7 @@ async fn primary(dir: &Path) -> Primary {
         broker: name("gg.addis.broker.bugsy"),
         keys: Mutex::new(HashMap::new()),
         storage: Storage::File { path: dir.join("keys.age"), recipient: identity.to_public() },
-        issuer: oidc::Issuer::new("https://account.addis.gg", oidc::generate_es256_key(), harar_client::generate_signing_key()),
+        issuer: oidc::Issuer::new("https://account.addis.gg", oidc::generate_es256_key(), harar::generate_signing_key()),
         audit_log: dir.join("audit.log"),
         user_exists: |user| !user.starts_with("ghost"),
         unknown_lines: Default::default(),
@@ -65,7 +65,7 @@ fn mac(key: &SigningKey) -> ApproverDevice {
         id: String::new(),
         human: name("x.x.human.nobody"),
         kind: DeviceKind::Mac,
-        public_key: harar_client::Jwk {
+        public_key: harar::Jwk {
             kty: "EC".into(),
             kid: String::new(),
             crv: "P-256".into(),
@@ -294,7 +294,7 @@ async fn an_os_account_alone_never_makes_an_approver() {
     let intruder = key();
     let added = ask(&primary, "sami", PrimaryRequest::AddDevice { device: mac(&intruder) }).await;
     let pending = added.pending.expect("it waits for an approver's device");
-    assert!(pending.description.contains(&harar_client::approvals::device_fingerprint(&mac(&intruder))), "{}", pending.description);
+    assert!(pending.description.contains(&harar::approvals::device_fingerprint(&mac(&intruder))), "{}", pending.description);
     let id = match &pending.waiting {
         Waiting::Device { device } => device.id.clone(),
         other => panic!("{other:?}"),
@@ -432,7 +432,7 @@ async fn a_first_device_comes_with_recovery_codes_kept_only_as_hashes() {
     let dir = tempfile::tempdir().unwrap();
     let primary = primary(dir.path()).await;
     let (_, codes) = first_device_and_codes(&primary, "sami", &key()).await;
-    assert_eq!(codes.len(), harar_client::recovery::RECOVERY_CODES);
+    assert_eq!(codes.len(), harar::recovery::RECOVERY_CODES);
     let stored = serde_json::to_string(&*primary.keys.lock().await).unwrap();
     for code in &codes {
         assert!(!stored.contains(code.as_str()) && !stored.contains(&code.replace('-', "")), "only hashes are kept");
@@ -456,7 +456,7 @@ async fn a_recovery_code_enrolls_a_device_once_that_waits_a_day_for_reserved_cha
     assert_eq!(recovered.devices.as_ref().unwrap().iter().map(|d| d.id.clone()).collect::<Vec<_>>(), vec![first.clone()]);
     let now = now_epoch_seconds();
     let device = load_devices(&*primary.keys.lock().await).into_iter().find(|d| d.id == id).unwrap();
-    assert!(device.reserved_after >= now + harar_client::approvals::RECOVERY_COOLDOWN_SECONDS - 5);
+    assert!(device.reserved_after >= now + harar::approvals::RECOVERY_COOLDOWN_SECONDS - 5);
     // Used up, with this key or any other.
     assert_eq!(refused(&recover(&primary, "sami", &codes[4], &key()).await), "bad_code");
     // On the record, with the other devices named.
@@ -528,7 +528,7 @@ async fn a_new_set_of_codes_is_approved_by_the_persons_own_device_and_replaces_t
     let approved = ask(&primary, "sami", signed(&pending, &sami_device, &sami, Decision::Approve)).await;
     assert_eq!(approved.decision.as_deref(), Some("approved"), "{approved:?}");
     let new = approved.recovery_codes.expect("the new set, shown once");
-    assert_eq!(new.len(), harar_client::recovery::RECOVERY_CODES);
+    assert_eq!(new.len(), harar::recovery::RECOVERY_CODES);
     assert_eq!(refused(&recover(&primary, "sami", &old[0], &key()).await), "bad_code");
     assert!(recover(&primary, "sami", &new[0], &key()).await.ok);
 }
@@ -541,14 +541,14 @@ async fn the_owner_is_told_of_a_recovery_and_of_new_codes_and_nobody_else_is() {
     let sami = key();
     let (sami_device, codes) = first_device_and_codes(&primary, "sami", &sami).await;
     let seen = ask(&primary, "sami", PrimaryRequest::Approvals).await;
-    assert_eq!(seen.recovery_codes_left, Some(harar_client::recovery::RECOVERY_CODES));
+    assert_eq!(seen.recovery_codes_left, Some(harar::recovery::RECOVERY_CODES));
     assert_eq!(seen.notices.as_deref(), Some(&[][..]));
     let recovered = recover(&primary, "sami", &codes[0], &key()).await.value.unwrap();
     let seen = ask(&primary, "sami", PrimaryRequest::Approvals).await;
     let notices = seen.notices.unwrap();
     assert_eq!(notices.len(), 1);
     assert!(notices[0].text.contains(&recovered) && notices[0].text.contains("recovery codes"), "{notices:?}");
-    assert_eq!(seen.recovery_codes_left, Some(harar_client::recovery::RECOVERY_CODES - 1));
+    assert_eq!(seen.recovery_codes_left, Some(harar::recovery::RECOVERY_CODES - 1));
     // Bob's first device, approved by Sami: Bob is told to get codes, and
     // sees nothing of Sami's account.
     let bob = key();

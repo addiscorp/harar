@@ -1,5 +1,5 @@
 use super::*;
-use harar_client::oidc::TokenAsk;
+use harar::oidc::TokenAsk;
 
 const ORG: &str = "gg.addis";
 
@@ -35,7 +35,7 @@ async fn with_identity(dir: &Path, identity: &age::x25519::Identity) -> Primary 
         broker: name("gg.addis.broker.bugsy"),
         keys: Mutex::new(keys),
         storage: Storage::File { path, recipient: identity.to_public() },
-        issuer: oidc::Issuer::new("https://account.addis.gg", oidc::generate_es256_key(), harar_client::generate_signing_key()),
+        issuer: oidc::Issuer::new("https://account.addis.gg", oidc::generate_es256_key(), harar::generate_signing_key()),
         audit_log: dir.join("audit.log"),
         // Every user exists here except the ghosts.
         user_exists: |user| !user.starts_with("ghost"),

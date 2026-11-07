@@ -1,6 +1,8 @@
 //! The harar client: identity tokens and how to check them (`oidc`), the
 //! identity model (`model`), approvals and recovery, and a client for a
 //! harar primary or the per-user agent over its local socket.
+//!
+#![doc = include_str!("../README.md")]
 
 use std::fmt;
 use std::path::{Path, PathBuf};

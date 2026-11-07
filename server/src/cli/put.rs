@@ -2,7 +2,7 @@ use crate::cli::secret_input::SecretInput;
 use crate::cli::{SocketArgs, print_json};
 use anyhow::Result;
 use clap::Args;
-use harar_client::VaultClient;
+use harar::VaultClient;
 
 #[derive(Debug, Args)]
 pub struct Put {

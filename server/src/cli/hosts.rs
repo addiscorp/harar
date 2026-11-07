@@ -5,7 +5,7 @@
 use crate::cli::{SocketArgs, print_json};
 use anyhow::Result;
 use clap::{Args, Subcommand};
-use harar_client::VaultClient;
+use harar::VaultClient;
 
 #[derive(Debug, Args)]
 pub struct Hosts {

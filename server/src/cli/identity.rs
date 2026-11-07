@@ -4,10 +4,10 @@
 use crate::cli::{SocketArgs, print_json};
 use anyhow::{Result, anyhow};
 use clap::{Args, Subcommand};
-use harar_client::VaultClient;
-use harar_client::model::{Action, Binding, Name, NamePattern, Permission, Profile, Role, Verb, Zone, ZoneKind, ZoneMatch};
-use harar_client::oidc::{Alg, TokenAsk};
-use harar_client::primary::PolicyChange;
+use harar::VaultClient;
+use harar::model::{Action, Binding, Name, NamePattern, Permission, Profile, Role, Verb, Zone, ZoneKind, ZoneMatch};
+use harar::oidc::{Alg, TokenAsk};
+use harar::primary::PolicyChange;
 
 /// Get an identity token for this process's actor.
 ///

@@ -8,8 +8,8 @@
 use crate::cli::{SocketArgs, print_json};
 use anyhow::{Result, anyhow};
 use clap::{Args, Subcommand};
-use harar_client::VaultClient;
-use harar_client::approvals::Decision;
+use harar::VaultClient;
+use harar::approvals::Decision;
 #[cfg(target_os = "macos")]
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -135,15 +135,15 @@ pub async fn device(cmd: DeviceCmd) -> Result<()> {
 /// The device `harar device add` sends for a 65-byte uncompressed P-256 key:
 /// a Mac key that asks first. The primary sets its id, owner and times.
 #[cfg(target_os = "macos")]
-fn device_view(public: &[u8]) -> harar_client::approvals::ApproverDevice {
+fn device_view(public: &[u8]) -> harar::approvals::ApproverDevice {
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use harar_client::approvals::{ApproverDevice, DeviceKind};
+    use harar::approvals::{ApproverDevice, DeviceKind};
     ApproverDevice {
         id: String::new(),
         human: "x.x.human.x".parse().expect("a stand-in name"),
         kind: DeviceKind::Mac,
-        public_key: harar_client::Jwk {
+        public_key: harar::Jwk {
             kty: "EC".into(),
             kid: String::new(),
             crv: "P-256".into(),
@@ -189,13 +189,13 @@ async fn add(socket: PathBuf, code: Option<String>) -> Result<()> {
     }
     let device = device_view(&public);
     // To compare with what an approver is shown before they approve this key.
-    let fingerprint = harar_client::approvals::device_fingerprint(&device);
+    let fingerprint = harar::approvals::device_fingerprint(&device);
     let client = VaultClient::from_socket_path(&socket);
     if let Some(code) = code {
         let (id, others) = client.recover(&code, device).await?;
         file.devices.insert(key_for(&socket), id.clone());
         write_approver(&file)?;
-        let others: Vec<_> = others.iter().map(|d| serde_json::json!({ "id": d.id, "fingerprint": harar_client::approvals::device_fingerprint(d) })).collect();
+        let others: Vec<_> = others.iter().map(|d| serde_json::json!({ "id": d.id, "fingerprint": harar::approvals::device_fingerprint(d) })).collect();
         eprintln!("This Mac can deny requests now and approve them after a day. Your other devices are told (harar approvals).");
         return print_json(&serde_json::json!({ "ok": true, "device": id, "fingerprint": fingerprint, "your_other_devices": others }));
     }
@@ -207,7 +207,7 @@ async fn add(socket: PathBuf, code: Option<String>) -> Result<()> {
     let id = match (&enrolled, &pending) {
         (Some(id), _) => id.clone(),
         (None, Some(pending)) => match &pending.waiting {
-            harar_client::primary::Waiting::Device { device } => device.id.clone(),
+            harar::primary::Waiting::Device { device } => device.id.clone(),
             _ => return Err(anyhow!("the primary answered with an unexpected request")),
         },
         (None, None) => return Err(anyhow!("the primary enrolled nothing")),
@@ -247,7 +247,7 @@ async fn add(_socket: PathBuf, _code: Option<String>) -> Result<()> {
 }
 
 pub async fn approvals(cmd: Approvals) -> Result<()> {
-    let harar_client::Approvals { pending, devices, notices, recovery_codes_left } = VaultClient::from_socket_path(&cmd.socket.socket).approvals().await?;
+    let harar::Approvals { pending, devices, notices, recovery_codes_left } = VaultClient::from_socket_path(&cmd.socket.socket).approvals().await?;
     for notice in &notices {
         eprintln!("notice: {}", notice.text);
     }
@@ -262,7 +262,7 @@ pub async fn approvals(cmd: Approvals) -> Result<()> {
                 "id": d.id,
                 "human": d.human.to_string(),
                 "kind": d.kind,
-                "fingerprint": harar_client::approvals::device_fingerprint(d),
+                "fingerprint": harar::approvals::device_fingerprint(d),
                 "revoked": d.revoked,
             })
         })
@@ -290,7 +290,7 @@ async fn decide(id: String, socket: PathBuf, decision: Decision) -> Result<()> {
     use crate::enclave::EnclaveKey;
     use base64::Engine;
     use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-    use harar_client::approvals::{Approval, Proof};
+    use harar::approvals::{Approval, Proof};
     let file = read_approver()?.ok_or_else(|| anyhow!("this Mac has no approver key yet: harar device add"))?;
     let device_id = file
         .devices
@@ -303,7 +303,7 @@ async fn decide(id: String, socket: PathBuf, decision: Decision) -> Result<()> {
     // What is shown must be what is signed: the request's detail is the hash
     // of exactly what it would do, so text from anywhere else can't be
     // passed off as this request.
-    if waiting.request.detail.as_deref() != Some(harar_client::primary::waiting_detail(&waiting.waiting).as_str()) {
+    if waiting.request.detail.as_deref() != Some(harar::primary::waiting_detail(&waiting.waiting).as_str()) {
         return Err(anyhow!("request {id} doesn't match what it would do; not signing"));
     }
     // What the person is deciding, before Touch ID asks.
