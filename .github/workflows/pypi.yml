@@ -1,0 +1,94 @@
+# Publish the Python client (python/, `from harar import vault`) to PyPI as
+# `harar` from a stable release. Promote dispatches this after it tags vX.Y.Z;
+# Actions → Publish to PyPI → Run workflow retries a version by hand.
+# Canaries never publish here: PyPI versions are permanent (APS 9). The harar
+# binary ships from harar-releases, never from a registry (APS 13).
+#
+# PyPI trusted publishing (OIDC): PyPI trusts this workflow by its filename
+# (`pypi.yml`) in the `release` environment. There is no PyPI token anywhere.
+# Renaming this file breaks that trust.
+name: Publish to PyPI
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Stable version to publish (X.Y.Z, tagged vX.Y.Z)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish harar to PyPI
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: read
+      id-token: write # OIDC: trusted publishing
+    env:
+      V: ${{ inputs.version }}
+    steps:
+      - name: The version is a stable release
+        run: |
+          if [[ ! "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'$V' is not a stable version (X.Y.Z). Canaries never publish to PyPI."
+            exit 1
+          fi
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: v${{ inputs.version }}
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: The client is harar at this release's version
+        run: scripts/check-clients.sh && [ "$(scripts/version.sh)" = "$V" ]
+      - name: Test
+        working-directory: python
+        run: PYTHONPATH=src python -m unittest discover -s tests -v
+      # Dated by the release commit, so a rerun builds the bytes already served.
+      - name: Build
+        working-directory: python
+        run: |
+          pip install build==1.2.2.post1
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" python -m build --outdir ../dist
+      - name: Already published?
+        id: existing
+        run: |
+          set -euo pipefail
+          code="$(curl -sS -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/harar/${V}/json")"
+          echo "published=$([ "$code" = 200 ] && echo yes || echo no)" >> "$GITHUB_OUTPUT"
+          [ "$code" = 200 ] && echo "harar ${V} is already on PyPI; checking its bytes only."
+          true
+      - name: Publish
+        if: steps.existing.outputs.published == 'no'
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+      # Success is PyPI serving these bytes, not a green step: every file it
+      # lists for this version must be one this job built, with the same sha256.
+      - name: PyPI serves this release
+        run: |
+          set -euo pipefail
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -fsSL -o served.json "https://pypi.org/pypi/harar/${V}/json"; then
+              python3 - served.json dist <<'PY'
+          import hashlib, json, os, sys
+          served = {u["filename"]: u["digests"]["sha256"] for u in json.load(open(sys.argv[1]))["urls"]}
+          built = {f: hashlib.sha256(open(os.path.join(sys.argv[2], f), "rb").read()).hexdigest()
+                   for f in os.listdir(sys.argv[2])}
+          if served != built:
+              sys.exit("::error::PyPI serves %s, but this release builds %s" % (served, built))
+          for f, h in sorted(built.items()):
+              print("PyPI serves %s (sha256 %s)" % (f, h))
+          PY
+              {
+                echo "### harar ${V} is on PyPI"
+                echo "- https://pypi.org/project/harar/${V}/"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::PyPI does not serve harar ${V} after 150 s."
+          exit 1

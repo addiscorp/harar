@@ -131,3 +131,25 @@ jobs:
     with:
       version: ${{ needs.promote.outputs.v }}
     secrets: inherit
+
+  # The Python and Ruby clients go to PyPI and RubyGems, and Packagist (which
+  # reads the tag itself) is checked. These are dispatched, not called:
+  # trusted publishing trusts the workflow that runs at the top, so each must
+  # run as itself (pypi.yml, rubygems.yml), not inside Promote.
+  # workflow_dispatch is what GITHUB_TOKEN may start (as in tag-canary.yml).
+  clients:
+    needs: promote
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      V: ${{ needs.promote.outputs.v }}
+    steps:
+      - name: Dispatch PyPI, RubyGems and Packagist for this release
+        run: |
+          set -euo pipefail
+          for workflow in pypi.yml rubygems.yml packagist.yml; do
+            gh workflow run "$workflow" --repo "${{ github.repository }}" --ref main -f version="$V"
+            echo "- ${workflow} for ${V}" >> "$GITHUB_STEP_SUMMARY"
+          done

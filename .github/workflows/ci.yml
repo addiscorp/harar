@@ -33,6 +33,65 @@ jobs:
       - run: bun test test/
       - run: npm pack --dry-run
 
+  # The PyPI, RubyGems and Packagist clients (python/, ruby/, php/ with the
+  # root composer.json): each one's tests on its oldest and newest supported
+  # runtime, the package it would publish, and the release version it carries.
+  clients:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/check-clients.sh
+
+  python:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        python: ["3.9", "3.13"]
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+      - run: PYTHONPATH=src python -m unittest discover -s tests -v
+      - run: pip install build==1.2.2.post1 && python -m build --outdir ../dist
+
+  ruby:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        ruby: ["3.0", "3.4"]
+    defaults:
+      run:
+        working-directory: ruby
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1.338.0
+        with:
+          ruby-version: ${{ matrix.ruby }}
+      - run: ruby -Ilib test/vault_test.rb
+      - run: gem build harar.gemspec
+
+  php:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        php: ["8.1", "8.4"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+        with:
+          php-version: ${{ matrix.php }}
+          tools: composer
+      - run: composer validate --strict
+      - run: php php/tests/vault_test.php
+      # What a user's Composer autoloads: Harar\vault and Harar\Vault, from the root composer.json.
+      - run: composer dump-autoload
+      - run: |
+          php -r 'require "vendor/autoload.php"; exit(Harar\vault(socket: "/run/harar.sock") instanceof Harar\Vault ? 0 : 1);'
+
   linux:
     runs-on: ubuntu-24.04
     # Compilation is cached in R2. public-ci holds only the key for this
