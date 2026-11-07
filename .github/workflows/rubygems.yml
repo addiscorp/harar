@@ -6,7 +6,9 @@
 #
 # RubyGems trusted publishing (OIDC): RubyGems trusts this workflow by its
 # filename (`rubygems.yml`) in the `release` environment. There is no
-# RubyGems token anywhere. Renaming this file breaks that trust.
+# RubyGems token anywhere. Renaming this file breaks that trust. Until the
+# first push, the pending publisher on rubygems.org expires 12 hours after it
+# is made; an expired one is made again before the first release.
 name: Publish to RubyGems
 
 on:
@@ -60,13 +62,26 @@ jobs:
           echo "published=$([ "$code" = 200 ] && echo yes || echo no)" >> "$GITHUB_OUTPUT"
           [ "$code" = 200 ] && echo "harar ${V} is already on RubyGems; checking its bytes only."
           true
-      - name: Configure RubyGems credentials
-        if: steps.existing.outputs.published == 'no'
-        uses: rubygems/configure-rubygems-credentials@dc5a8d8553e6ee01fc26761a49e99e733d17954a # v2.1.0
+      # Trusted publishing by hand: GitHub's OIDC token for rubygems.org,
+      # exchanged for a 15-minute push key. The exchange names the account
+      # that owns the gem (samifouad's immutable RubyGems ID, public), which
+      # a pending publisher requires for the first push; no released
+      # rubygems/configure-rubygems-credentials passes it yet.
       - name: Publish
         if: steps.existing.outputs.published == 'no'
         working-directory: ruby
-        run: gem push "harar-${V}.gem"
+        env:
+          OWNER: "255354"
+        run: |
+          set -euo pipefail
+          jwt="$(curl -fsS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=rubygems.org" | jq -er .value)"
+          key="$(jq -n --arg jwt "$jwt" --arg owner "$OWNER" '{jwt: $jwt, owner: $owner}' \
+            | curl -fsS -X POST -H 'Content-Type: application/json' --data @- \
+              https://rubygems.org/api/v1/oidc/trusted_publisher/exchange_token \
+            | jq -er .rubygems_api_key)"
+          echo "::add-mask::${key}"
+          GEM_HOST_API_KEY="$key" gem push "harar-${V}.gem"
       # Success is RubyGems serving these bytes, not a green step: the .gem it
       # serves must be the one this job built.
       - name: RubyGems serves this release
