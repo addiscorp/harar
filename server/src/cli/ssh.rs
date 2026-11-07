@@ -2,7 +2,7 @@ use crate::cli::{SocketArgs, print_json};
 use crate::ssh::{KEY_PREFIX, StoredKey};
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Subcommand};
-use harar_client::VaultClient;
+use harar::VaultClient;
 
 /// SSH keys kept in the vault and served by `harar agent`.
 #[derive(Debug, Args)]

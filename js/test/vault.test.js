@@ -1,6 +1,6 @@
 // The client against a stand-in harar on a unix socket: the requests it
-// sends are the ones harar's `hosts` and `send` take (harar-client
-// PrimaryRequest::Hosts { key } and Send { key, host }, tag "op"), and every
+// sends are the ones harar's `hosts` and `send` take (the harar
+// crate's PrimaryRequest::Hosts { key } and Send { key, host }, tag "op"), and every
 // way harar can say no is an error naming why.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

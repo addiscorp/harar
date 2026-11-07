@@ -10,11 +10,11 @@ use crate::common::{PeerCred, load_keys, now_epoch_seconds, peer_credentials, re
 use crate::store::{envelope, postgres};
 use anyhow::{Context, Result, anyhow};
 use clap::Args;
-use harar_client::model::{Action, Binding, Decision, Kind, Name, Org, Permission, Policy, Request, Role, Verb, Zone, ZoneKind, ZoneMatch};
-use harar_client::oidc::{self, Alg, IdentityRequest};
-use harar_client::approvals::{self, Approval, ApprovalRequest, ApprovalRule, ApproverDevice, DeviceKind, Widens};
-use harar_client::primary::{Notice, Pending, PolicyChange, PolicyView, PrimaryRequest, PrimaryResponse, Waiting, waiting_detail};
-use harar_client::recovery::{StoredCode, replace_recovery_codes, use_recovery_code};
+use harar::model::{Action, Binding, Decision, Kind, Name, Org, Permission, Policy, Request, Role, Verb, Zone, ZoneKind, ZoneMatch};
+use harar::oidc::{self, Alg, IdentityRequest};
+use harar::approvals::{self, Approval, ApprovalRequest, ApprovalRule, ApproverDevice, DeviceKind, Widens};
+use harar::primary::{Notice, Pending, PolicyChange, PolicyView, PrimaryRequest, PrimaryResponse, Waiting, waiting_detail};
+use harar::recovery::{StoredCode, replace_recovery_codes, use_recovery_code};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, OpenOptions};
@@ -1152,7 +1152,7 @@ async fn open_postgres(
         return Err(anyhow!("{} already exists; move it aside before importing again", imported.display()));
     }
     let file_keys = load_keys(state_path, identity)?;
-    if let Some(bad) = file_keys.keys().find(|key| !harar_client::model::valid_secret_path(key)) {
+    if let Some(bad) = file_keys.keys().find(|key| !harar::model::valid_secret_path(key)) {
         return Err(anyhow!("{bad:?} isn't a secret path; rename it in the file vault first. Nothing was imported."));
     }
     let changes: Vec<postgres::Change<'_>> = file_keys.iter().map(|(key, value)| postgres::Change { path: key, value: Some(value.as_bytes()) }).collect();
@@ -1192,7 +1192,7 @@ async fn open(config: &Serve) -> Result<Primary> {
             open_postgres(pg, org.as_str(), &config.state_path, &identity, config.import_state).await?
         }
     };
-    let signing = load_or_create_key(&config.signing_key_file, "signing key", harar_client::generate_signing_key, |key| key.to_bytes().to_vec(), |bytes| {
+    let signing = load_or_create_key(&config.signing_key_file, "signing key", harar::generate_signing_key, |key| key.to_bytes().to_vec(), |bytes| {
         let bytes: [u8; 32] = bytes.try_into().map_err(|_| anyhow!("not 32 bytes"))?;
         Ok(ed25519_dalek::SigningKey::from_bytes(&bytes))
     })?;

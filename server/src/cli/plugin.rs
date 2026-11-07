@@ -2,7 +2,7 @@ use crate::cli::secret_input::SecretInput;
 use crate::cli::{SocketArgs, print_json};
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Subcommand};
-use harar_client::VaultClient;
+use harar::VaultClient;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 

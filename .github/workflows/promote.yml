@@ -28,6 +28,8 @@ jobs:
     name: Promote canary to stable
     runs-on: ubuntu-24.04
     environment: release
+    outputs:
+      v: ${{ steps.validate.outputs.v }}
     env:
       R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
       AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -119,3 +121,13 @@ jobs:
             echo "- https://harar-releases.addis.gg/${V}/release.json (from ${{ steps.validate.outputs.canary }})"
             echo "- latest.json points here"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # The stable release's `harar` crate goes to crates.io (canaries never do),
+  # once vX.Y.Z is tagged. A failure here leaves the release itself promoted;
+  # Actions → Publish to crates.io retries the version.
+  crate:
+    needs: promote
+    uses: ./.github/workflows/crates.yml
+    with:
+      version: ${{ needs.promote.outputs.v }}
+    secrets: inherit

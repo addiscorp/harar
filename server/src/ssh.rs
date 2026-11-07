@@ -39,7 +39,7 @@ pub struct StoredKey {
 
 impl StoredKey {
     pub fn generate(comment: String) -> Self {
-        let key = harar_client::generate_signing_key();
+        let key = harar::generate_signing_key();
         Self {
             kind: KEY_TYPE.to_string(),
             seed: BASE64.encode(key.to_bytes()),

@@ -1,0 +1,26 @@
+[package]
+name = "harar"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+description = "harar's client for Rust: secrets, identity tokens and policy from a harar primary or agent on its local socket"
+homepage = "https://harar.addis.gg"
+readme = "README.md"
+keywords = ["secrets", "vault", "oidc", "agents"]
+categories = ["authentication", "cryptography", "api-bindings"]
+# Published only from a stable release (.github/workflows/crates.yml).
+# Everything it ships is listed here, so nothing else in the repo leaks in.
+include = ["src/**/*.rs", "Cargo.toml", "README.md", "CHANGELOG.md", "LICENSE"]
+
+[dependencies]
+base64 = "0.22"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "net", "sync", "rt", "macros"] }
+p256 = { version = "0.13", features = ["ecdsa", "std"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

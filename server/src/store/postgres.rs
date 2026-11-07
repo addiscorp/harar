@@ -12,7 +12,7 @@
 //!   the number of writes it has made in an anchor file outside Postgres.
 
 use super::envelope::{self, MasterKey, Row, Sealed};
-use harar_client::model::{Org, valid_secret_path};
+use harar::model::{Org, valid_secret_path};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;

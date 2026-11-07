@@ -3,7 +3,7 @@ use crate::dotenv::{self, Line};
 use crate::mask::Masker;
 use anyhow::{Context, Result, anyhow};
 use clap::Args;
-use harar_client::VaultClient;
+use harar::VaultClient;
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

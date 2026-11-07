@@ -25,11 +25,24 @@ It installs `harar` into `~/.harar/bin`, checked against the SHA-256 in the
 release's manifest, with no sudo. Builds: macOS (Apple silicon and Intel) and
 Linux x86_64. `sh -s -- --canary` installs the newest build of `main`.
 
+## From your code
+
+The `harar` binary is the server. Programs talk to it through a client on its
+local socket; the clients hold no secrets.
+
+- **Rust:** the [`harar`](client/README.md) crate, `harar = "0.2"`, `use harar::VaultClient`.
+- **JavaScript and TypeScript:** the [`harar`](js/README.md) npm package,
+  `import { vault } from 'harar'`.
+
+Both publish from a stable release, at its version.
+
 ## Build
 
 ```sh
 cargo build --release --locked
 ```
+
+`server/` is the binary (package `harar-server`); `client/` is the `harar` crate.
 
 ## Run a primary
 

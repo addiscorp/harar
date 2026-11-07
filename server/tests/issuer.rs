@@ -3,8 +3,8 @@
 //! would: by fetching the discovery document and JWKS over HTTP.
 
 use age::secrecy::ExposeSecret;
-use harar_client::Jwks;
-use harar_client::oidc::{self, IdentityClaims};
+use harar::Jwks;
+use harar::oidc::{self, IdentityClaims};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;

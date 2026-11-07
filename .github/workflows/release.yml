@@ -119,7 +119,7 @@ jobs:
       # One binary; TLS is rustls and macOS's keychain is the system's, so a
       # release needs no system packages.
       - name: Build harar
-        run: cargo build --locked --release -p harar --bin harar
+        run: cargo build --locked --release -p harar-server --bin harar
       - name: Prepare the binary
         run: |
           mkdir -p dist

@@ -1,7 +1,7 @@
 //! The per-user agent: one per signed-in user, holding that user's vault.
 //!
 //! It speaks the daemon's socket protocol for `get`, `put`, `list` and
-//! `delete`, so `harar_client::VaultClient` works against it unchanged, and
+//! `delete`, so `harar::VaultClient` works against it unchanged, and
 //! adds `status`, `unlock` and `lock`.
 //!
 //! - Only the user who started the agent may talk to it (kernel-reported uid).
@@ -13,7 +13,7 @@
 //!   on macOS it does the same within 15 seconds of the screen locking.
 
 use crate::common::{PeerCred, load_keys, peer_credentials, read_request_bytes, write_encrypted_keys};
-use harar_client::primary::PrimaryResponse as VaultResponse;
+use harar::primary::PrimaryResponse as VaultResponse;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -224,8 +224,8 @@ impl Vault {
                 Err(reason) => VaultResponse::error(reason),
             },
             AgentRequest::Send { key, host } => {
-                let allowed = harar_client::model::valid_host(&host)
-                    && hosts_of(&unlocked.keys).is_ok_and(|all| all.get(&key).is_some_and(|hosts| hosts.iter().any(|pattern| harar_client::model::host_matches(pattern, &host))));
+                let allowed = harar::model::valid_host(&host)
+                    && hosts_of(&unlocked.keys).is_ok_and(|all| all.get(&key).is_some_and(|hosts| hosts.iter().any(|pattern| harar::model::host_matches(pattern, &host))));
                 match unlocked.keys.get(&key) {
                     _ if !allowed || reserved(&key) => VaultResponse::error("not_allowed"),
                     Some(value) => VaultResponse { value: Some(value.clone()), ..VaultResponse::ok() },
@@ -233,7 +233,7 @@ impl Vault {
                 }
             }
             AgentRequest::AllowHost { key, host } => {
-                if reserved(&key) || !harar_client::model::valid_secret_path(&key) || !harar_client::model::valid_host_pattern(&host) {
+                if reserved(&key) || !harar::model::valid_secret_path(&key) || !harar::model::valid_host_pattern(&host) {
                     return AgentReply::Vault(Box::new(VaultResponse::error("bad_host")));
                 }
                 let mut all = match hosts_of(&unlocked.keys) {
