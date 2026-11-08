@@ -782,6 +782,50 @@ for (const backend of backends) {
       }
     });
 
+    /** A membership entry as members write one: plain JSON in `sealed`. */
+    const entryOp = (m: ReturnType<typeof member>, kind: string, entry: Record<string, unknown>) =>
+      m.op(kind, "entry", null, { sealed: Buffer.from(JSON.stringify(entry)).toString("base64url"), wrapped_key: "" });
+
+    test("sync: since names the members; everyone else comes through one discovery cursor", async () => {
+      const env = await ring(backend);
+      const { mac, phone, macM } = env;
+      const pairing = await mac.as("POST", "/v1/pairings");
+      const stranger = await device(env.call, env.clock, pairing.body.code, "stranger");
+      const strangerM = member(stranger, env.clock);
+      await mac.as("PUT", "/v1/sync", { ops: [await macM.op("put", "a", "1"), await macM.op("put", "b", "2")] });
+      await stranger.as("PUT", "/v1/sync", { ops: [await strangerM.op("member.add", "x", null), await strangerM.op("put", "s", "1")] });
+      const first = await phone.as("POST", "/v1/sync", { since: { [mac.id]: 0 }, discover: "" });
+      assert.equal(first.status, 200);
+      assert.equal(typeof first.body.discover, "string", "the edge hands back a discovery cursor");
+      assert.deepEqual(first.body.ops.map((o: Row) => [o.author, o.seq]).sort(), [[mac.id, 1], [mac.id, 2], [stranger.id, 1], [stranger.id, 2]].sort());
+      assert.deepEqual(Object.keys(first.body.next), [mac.id], "next names only the authors in since");
+      const again = await phone.as("POST", "/v1/sync", { since: first.body.next, discover: first.body.discover });
+      assert.deepEqual(again.body.ops, [], "nothing discovered twice");
+      await stranger.as("PUT", "/v1/sync", { ops: [await strangerM.op("put", "t", "2")] });
+      const later = await phone.as("POST", "/v1/sync", { since: first.body.next, discover: first.body.discover });
+      assert.deepEqual(later.body.ops.map((o: Row) => [o.author, o.seq]), [[stranger.id, 3]]);
+    });
+
+    test("devices: the ring's authority can't be unpaired by another device, nor a member without the authority's removal", async () => {
+      const env = await ring(backend);
+      const { mac, phone, macM } = env;
+      const pairing = await mac.as("POST", "/v1/pairings");
+      const stranger = await device(env.call, env.clock, pairing.body.code, "stranger");
+      const keys = (d: { id: string }) => ({ device: d.id, name: "n", sign_pub: "s", agree_pub: "a" });
+      const found = await entryOp(macM, "member.add", { type: "found", n: 0, prev: "", epoch: 0, id: "i", member: keys(mac), wraps: {} });
+      const add = await entryOp(macM, "member.add", { type: "add", n: 1, prev: "h", epoch: 0, id: "i", member: keys(phone), wraps: {} });
+      assert.equal((await mac.as("PUT", "/v1/sync", { ops: [found, add] })).status, 200);
+
+      const byPhone = await phone.as("DELETE", `/v1/devices/${mac.id}`);
+      assert.deepEqual([byPhone.status, byPhone.body.error], [403, "authority"], "only the authority unpairs itself");
+      const early = await mac.as("DELETE", `/v1/devices/${phone.id}`);
+      assert.deepEqual([early.status, early.body.error], [409, "needs_removal"], "a member goes only after the authority's removal");
+      const remove = await entryOp(macM, "rekey", { type: "remove", n: 2, prev: "h2", epoch: 1, id: "j", removed: [{ device: phone.id, after: 0 }], wraps: {} });
+      assert.equal((await mac.as("PUT", "/v1/sync", { ops: [remove] })).status, 200);
+      assert.equal((await mac.as("DELETE", `/v1/devices/${phone.id}`)).status, 200);
+      assert.equal((await mac.as("DELETE", `/v1/devices/${stranger.id}`)).status, 200, "a device that isn't a member goes as before");
+    });
+
     test("sync: a page shares its room among authors, so one author with many ops never starves the others", async () => {
       const { mac, phone, macM, phoneM } = await ring(backend);
       const [first, second] = mac.id < phone.id ? [macM, phoneM] : [phoneM, macM];

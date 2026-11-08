@@ -9,4 +9,6 @@ pub(crate) mod op;
 #[cfg(test)]
 mod attacks;
 #[cfg(test)]
+mod round4;
+#[cfg(test)]
 mod tests;
