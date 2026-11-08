@@ -12,6 +12,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// The reserved vault key that holds `VaultMeta`.
 pub(crate) const META_KEY: &str = "harar:sync";
+/// History is kept this long (Sami's decision), then only each path's latest.
+pub(crate) const HISTORY_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+/// Op hashes remembered per path, newest last.
+const KNOWN: usize = 256;
+/// Conflict flags kept, newest last.
+const CONFLICTS: usize = 500;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct VaultMeta {
@@ -27,6 +33,13 @@ pub(crate) struct VaultMeta {
     pub history: Vec<Lost>,
     #[serde(default)]
     pub conflicts: Vec<Conflict>,
+    /// The removals already taken into account: device to its cut.
+    #[serde(default)]
+    pub revoked: BTreeMap<String, u64>,
+    /// Changed with every step, and kept in the sync state too: when the two
+    /// differ, one of them was restored from an older copy.
+    #[serde(default)]
+    pub mark: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,9 +50,40 @@ pub(crate) struct PathMeta {
     pub deleted: bool,
     /// sha256 of the value it set, to tell when the vault has changed since.
     pub value_sha256: String,
-    /// Every op hash seen for this path, winning or not.
+    /// Op hashes seen for this path, winning or not (the newest KNOWN).
     #[serde(default)]
-    pub known: BTreeSet<String>,
+    pub known: Vec<String>,
+    /// The ops this path had, with their values (30 days, and the latest):
+    /// what it falls back to when a removal takes an op back.
+    #[serde(default)]
+    pub versions: Vec<Version>,
+}
+
+/// One op a path had, with what it set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Version {
+    pub hash: String,
+    pub rank: Rank,
+    pub version: u64,
+    pub value: Option<String>,
+}
+
+impl PathMeta {
+    fn remember(&mut self, hash: &str) {
+        if !self.known.iter().any(|h| h == hash) {
+            self.known.push(hash.to_owned());
+        }
+        if self.known.len() > KNOWN {
+            let extra = self.known.len() - KNOWN;
+            self.known.drain(..extra);
+        }
+    }
+
+    fn keep(&mut self, v: Version) {
+        if !self.versions.iter().any(|x| x.hash == v.hash) {
+            self.versions.push(v);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,7 +154,7 @@ impl VaultMeta {
     }
 
     fn known(&self, path: &str, hash: &str) -> bool {
-        self.paths.get(path).is_some_and(|m| m.hash == hash || m.known.contains(hash))
+        self.paths.get(path).is_some_and(|m| m.hash == hash || m.known.iter().any(|h| h == hash))
     }
 
     /// What the vault holds that no op says yet: new paths (put), changed
@@ -144,33 +188,105 @@ impl VaultMeta {
 
     /// This member's queued ops were signed again with new seqs (the chain
     /// diverged): their hashes, old to new.
-    pub(crate) fn rename(&mut self, renamed: &BTreeMap<String, (String, u64)>) {
+    pub(crate) fn rename(&mut self, renamed: &BTreeMap<String, (String, u64, u64)>) {
         for m in self.paths.values_mut() {
-            if let Some((new, seq)) = renamed.get(&m.hash) {
+            if let Some((new, seq, at)) = renamed.get(&m.hash) {
                 m.hash = new.clone();
                 m.rank.seq = *seq;
+                m.rank.at = *at;
             }
-            m.known = m.known.iter().map(|h| renamed.get(h).map_or(h, |(new, _)| new).clone()).collect();
+            m.known = m.known.iter().map(|h| renamed.get(h).map_or(h, |(new, _, _)| new).clone()).collect();
+            for v in &mut m.versions {
+                if let Some((new, seq, at)) = renamed.get(&v.hash) {
+                    v.hash = new.clone();
+                    v.rank.seq = *seq;
+                    v.rank.at = *at;
+                }
+            }
         }
     }
 
     /// Records this member's own op for a change it made.
     pub(crate) fn record_own(&mut self, change: &Change, hash: &str, rank: Rank) {
-        let known = self.paths.remove(&change.path).map(|mut m| {
-            m.known.insert(m.hash.clone());
-            m.known
+        let mut m = self.paths.remove(&change.path).unwrap_or(PathMeta {
+            version: 0,
+            hash: String::new(),
+            rank: rank.clone(),
+            deleted: true,
+            value_sha256: String::new(),
+            known: Vec::new(),
+            versions: Vec::new(),
         });
-        self.paths.insert(
-            change.path.clone(),
-            PathMeta {
-                version: change.version,
-                hash: hash.to_owned(),
-                rank,
-                deleted: change.value.is_none(),
-                value_sha256: change.value.as_deref().map(sha256_hex).unwrap_or_default(),
-                known: known.unwrap_or_default(),
-            },
-        );
+        let old = m.hash.clone();
+        if !old.is_empty() {
+            m.remember(&old);
+        }
+        m.keep(Version { hash: hash.to_owned(), rank: rank.clone(), version: change.version, value: change.value.clone() });
+        m.version = change.version;
+        m.hash = hash.to_owned();
+        m.rank = rank;
+        m.deleted = change.value.is_none();
+        m.value_sha256 = change.value.as_deref().map(sha256_hex).unwrap_or_default();
+        self.paths.insert(change.path.clone(), m);
+    }
+
+    /// A removal cut `device` at `after`: every path whose current op is the
+    /// device's past the cut goes back to its best op that still counts (the
+    /// highest-ranked of the rest), or goes, if it had none. Returns the paths
+    /// whose value changed.
+    pub(crate) fn revoke(&mut self, keys: &mut HashMap<String, String>, device: &str, after: u64) -> BTreeSet<String> {
+        let mut changed = BTreeSet::new();
+        if self.revoked.get(device).is_some_and(|a| *a <= after) {
+            return changed;
+        }
+        self.revoked.insert(device.to_owned(), after);
+        let late = |r: &Rank| r.author == device && r.seq > after;
+        let paths: Vec<String> = self.paths.keys().cloned().collect();
+        for path in paths {
+            let m = self.paths.get_mut(&path).expect("listed");
+            m.versions.retain(|v| !late(&v.rank));
+            if !late(&m.rank) {
+                continue;
+            }
+            let before = keys.get(&path).cloned();
+            match m.versions.iter().max_by(|a, b| a.rank.cmp(&b.rank)).cloned() {
+                Some(v) => {
+                    m.hash = v.hash;
+                    m.rank = v.rank;
+                    m.version = v.version;
+                    m.deleted = v.value.is_none();
+                    m.value_sha256 = v.value.as_deref().map(sha256_hex).unwrap_or_default();
+                    match &v.value {
+                        Some(value) => keys.insert(path.clone(), value.clone()),
+                        None => keys.remove(&path),
+                    };
+                }
+                None => {
+                    self.paths.remove(&path);
+                    keys.remove(&path);
+                }
+            }
+            if keys.get(&path) != before.as_ref() {
+                changed.insert(path);
+            }
+        }
+        self.history.retain(|l| !late(&l.rank));
+        changed
+    }
+
+    /// Keeps history to 30 days: older lost versions go, and each path keeps
+    /// its older versions only as far as its current one.
+    pub(crate) fn prune(&mut self, now: u64) {
+        let since = now.saturating_sub(HISTORY_MS);
+        self.history.retain(|l| l.rank.at >= since);
+        if self.conflicts.len() > CONFLICTS {
+            let extra = self.conflicts.len() - CONFLICTS;
+            self.conflicts.drain(..extra);
+        }
+        for m in self.paths.values_mut() {
+            let current = m.hash.clone();
+            m.versions.retain(|v| v.hash == current || v.rank.at >= since);
+        }
     }
 
     /// Applies other members' secret ops to `keys`. A write whose base is
@@ -222,7 +338,9 @@ impl VaultMeta {
                     });
                 } else {
                     self.history.push(Lost { path: op.path.clone(), version: op.version, rank: op.rank.clone(), hash: op.hash.clone(), value: op.value.clone(), lost_to: cur.hash.clone() });
-                    self.paths.get_mut(&op.path).expect("current").known.insert(op.hash.clone());
+                    let m = self.paths.get_mut(&op.path).expect("current");
+                    m.remember(&op.hash);
+                    m.keep(Version { hash: op.hash.clone(), rank: op.rank.clone(), version: op.version, value: op.value.clone() });
                 }
                 wins
             }
@@ -235,23 +353,19 @@ impl VaultMeta {
             Some(value) => keys.insert(op.path.clone(), value.clone()),
             None => keys.remove(&op.path),
         };
-        let mut known = current.map(|c| {
-            let mut k = c.known;
-            k.insert(c.hash);
-            k
-        }).unwrap_or_default();
-        known.insert(op.hash.clone());
-        self.paths.insert(
-            op.path.clone(),
-            PathMeta {
-                version: op.version,
-                hash: op.hash,
-                rank: op.rank,
-                deleted: op.value.is_none(),
-                value_sha256: op.value.as_deref().map(sha256_hex).unwrap_or_default(),
-                known,
-            },
-        );
+        let mut m = current.unwrap_or(PathMeta { version: 0, hash: String::new(), rank: op.rank.clone(), deleted: true, value_sha256: String::new(), known: Vec::new(), versions: Vec::new() });
+        let old = m.hash.clone();
+        if !old.is_empty() {
+            m.remember(&old);
+        }
+        m.remember(&op.hash);
+        m.keep(Version { hash: op.hash.clone(), rank: op.rank.clone(), version: op.version, value: op.value.clone() });
+        m.version = op.version;
+        m.hash = op.hash;
+        m.rank = op.rank;
+        m.deleted = op.value.is_none();
+        m.value_sha256 = op.value.as_deref().map(sha256_hex).unwrap_or_default();
+        self.paths.insert(op.path.clone(), m);
         before != op.value
     }
 }

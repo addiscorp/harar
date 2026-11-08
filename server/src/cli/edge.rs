@@ -100,6 +100,11 @@ enum SyncCmd {
     Approve(SyncApprove),
     /// Make another member the ring's authority (only the authority can).
     Transfer(SyncTransfer),
+    /// After the edge's database was restored from a backup (status says the
+    /// edge is withholding or refusing this device's chain): take the edge's
+    /// view of this device's chain as the base. Explicit and logged.
+    #[command(name = "reset-edge-view")]
+    ResetEdgeView(AgentArg),
 }
 
 #[derive(Debug, Args)]
@@ -312,6 +317,7 @@ fn run_blocking(cmd: Edge) -> Result<()> {
                 SyncCmd::Trust(c) => (c.agent.socket, SyncCommand::Trust { fingerprint: c.fingerprint }),
                 SyncCmd::Approve(c) => (c.agent.socket, SyncCommand::Approve { device: c.device, fingerprint: c.fingerprint }),
                 SyncCmd::Transfer(c) => (c.agent.socket, SyncCommand::Transfer { device: c.device }),
+                SyncCmd::ResetEdgeView(a) => (a.socket, SyncCommand::ResetEdgeView),
             };
             super::agent::send(&socket, &AgentRequest::Sync(command))
         }

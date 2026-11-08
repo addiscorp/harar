@@ -179,7 +179,7 @@ fn round4_h7_a_removed_devices_later_ops_are_not_held() {
     edge.push(&mut r);
     b.forget();
     edge.pull(&mut b);
-    let after = op::Removed { device: String::new(), after: 0 }.after;
+    let after = op::Removed { device: String::new(), after: 0, after_hash: String::new() }.after;
     let held = b.state.pending.iter().filter(|o| o.author == R).count();
     assert_eq!(held, after as usize, "B holds {held} op(s) R wrote after its removal");
 }

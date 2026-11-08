@@ -32,7 +32,9 @@ pub(crate) struct Author {
     /// The last few ops' hashes, by seq.
     #[serde(default)]
     pub recent: BTreeMap<u64, String>,
-    /// The first seq at which the edge served this author two different ops.
+    /// The first seq at which this author proved to have signed two
+    /// different ops (both verify under its log key): its ops from there on
+    /// don't count.
     #[serde(default)]
     pub fork_at: Option<u64>,
 }
@@ -64,12 +66,26 @@ pub(crate) struct Rejected {
     pub reason: String,
 }
 
-/// Two different ops the edge served at one place in an author's chain.
+/// Proof that an author signed two different ops at one place in its
+/// chain: both hashes, and the second op itself (the first was verified and
+/// counted when it came).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Fork {
     pub author: String,
     pub seq: u64,
     pub hashes: [String; 2],
+    pub evidence: Served,
+}
+
+/// Whether a value op counts at the head it names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    Counts,
+    /// Not yet: its author's chain hasn't reached the cut its removal names.
+    Waits,
+    Refused(&'static str),
+    /// Not signed by the key the log gives its author.
+    Forged,
 }
 
 /// One ring key, in memory only while the vault is unlocked.
@@ -94,7 +110,10 @@ pub(crate) fn ring_id(key: &[u8; 32], epoch: u32) -> String {
 pub(crate) struct Linked {
     pub good: Vec<Served>,
     pub rejected: Vec<Rejected>,
-    pub forks: Vec<Fork>,
+    /// Ops at a seq already held, with another hash (their own hash checks
+    /// out). Proof of a fork only if each verifies under the author's log
+    /// key; the member decides that.
+    pub conflicts: Vec<Served>,
 }
 
 /// Links `ops` (one pull, in each author's seq order) onto the chains in
@@ -107,29 +126,25 @@ pub(crate) fn link_chains(authors: &mut BTreeMap<String, Author>, me: &str, ops:
             continue;
         }
         let a = authors.entry(op.author.clone()).or_default();
-        if a.fork_at.is_some() {
-            continue;
-        }
         let refuse = |reason: &str| Rejected { author: op.author.clone(), seq: op.seq, reason: reason.to_owned() };
-        if op.seq <= a.seq && op.author != me {
-            if let Some(known) = a.recent.get(&op.seq).filter(|h| **h != op.hash) {
-                out.forks.push(Fork { author: op.author.clone(), seq: op.seq, hashes: [known.clone(), op.hash.clone()] });
-                a.fork_at = Some(op.seq);
-                broken.push(op.author.clone());
-            }
-            continue;
-        }
         let canonical = match op.canonical() {
             Ok(text) => text,
             Err(err) => {
+                // Bogus (its ciphertext isn't what its hashes say): refused,
+                // and nothing about the author.
                 out.rejected.push(refuse(&format!("{err:#}")));
-                broken.push(op.author.clone());
                 continue;
             }
         };
         if super::crypto::sha256_hex(&canonical) != op.hash {
+            // Not even its own hash: bogus, and nothing about the author.
             out.rejected.push(refuse("its hash is not the hash of the op"));
-            broken.push(op.author.clone());
+            continue;
+        }
+        if op.seq <= a.seq && op.author != me {
+            if a.recent.get(&op.seq).is_some_and(|h| *h != op.hash) {
+                out.conflicts.push(op);
+            }
             continue;
         }
         if op.compacted && !op.kind.is_value() {
@@ -172,8 +187,8 @@ pub(crate) struct Member {
     pub keys: MemberKeys,
     /// The entry that added it.
     pub added_at: u64,
-    /// The entry that removed it, and its last op that counts.
-    pub removed: Option<(u64, u64)>,
+    /// The entry that removed it, its last op that counts, and that op's hash.
+    pub removed: Option<(u64, u64, String)>,
 }
 
 /// One entry on the log, and the op that carried it.
@@ -231,7 +246,12 @@ impl Log {
 
     /// Whether `device` is a member at entry `n`.
     pub(crate) fn member_at(&self, device: &str, n: u64) -> Option<&Member> {
-        self.members.get(device).filter(|m| m.added_at <= n && m.removed.is_none_or(|(r, _)| n < r))
+        self.members.get(device).filter(|m| m.added_at <= n && m.removed.as_ref().is_none_or(|(r, _, _)| n < *r))
+    }
+
+    /// A removed device's cut: (after, after_hash).
+    pub(crate) fn cut_of(&self, device: &str) -> Option<(u64, &str)> {
+        self.members.get(device).and_then(|m| m.removed.as_ref()).map(|(_, after, hash)| (*after, hash.as_str()))
     }
 
     /// Members now.
@@ -244,17 +264,33 @@ impl Log {
     }
 
     /// Whether `op` (a value op written under entry `n`) counts: its author
-    /// is a member there, signed it with the key the log gives it, and, if
-    /// removed later, wrote it no later than the removal's cut.
-    pub(crate) fn counts(&self, op: &Served, n: u64) -> Result<(), &'static str> {
-        let m = self.member_at(&op.author, n).ok_or("its author isn't a member at the head it names")?;
-        if m.removed.is_some_and(|(_, after)| op.seq > after) {
-            return Err("its author was removed before it");
+    /// is a member there and signed it with the key the log gives it; it
+    /// isn't past a fork its author was proven to make; and, if the author
+    /// was removed later, it is no later than the removal's cut, on the chain
+    /// that reaches the cut's hash.
+    pub(crate) fn counts(&self, op: &Served, n: u64, authors: &BTreeMap<String, Author>) -> Verdict {
+        let Some(m) = self.member_at(&op.author, n) else { return Verdict::Refused("its author isn't a member at the head it names") };
+        let chain = authors.get(&op.author);
+        if chain.and_then(|a| a.fork_at).is_some_and(|f| op.seq >= f) {
+            return Verdict::Refused("its author signed two different ops at one seq before it");
+        }
+        if let Some((_, after, after_hash)) = &m.removed {
+            if op.seq > *after {
+                return Verdict::Refused("its author was removed before it");
+            }
+            let at_cut = chain.and_then(|a| if a.seq == *after { Some(a.hash.as_str()) } else { a.recent.get(after).map(String::as_str) });
+            match at_cut {
+                _ if *after == 0 => {}
+                Some(h) if h == after_hash => {}
+                Some(_) => return Verdict::Refused("its author's chain isn't the one its removal cut"),
+                None if chain.is_none_or(|a| a.seq < *after) => return Verdict::Waits,
+                None => return Verdict::Refused("its author's chain at the cut is too far back to check"),
+            }
         }
         if !signed_by(op, &m.keys.sign_pub) {
-            return Err("forged: not signed by the key the log gives its author");
+            return Verdict::Forged;
         }
-        Ok(())
+        Verdict::Counts
     }
 }
 
@@ -380,7 +416,7 @@ fn apply_entry(log: &mut Log, head: String, e: Entry, back: String) {
         EntryType::Remove => {
             for r in &e.removed {
                 if let Some(m) = log.members.get_mut(&r.device) {
-                    m.removed = Some((n, r.after));
+                    m.removed = Some((n, r.after, r.after_hash.clone()));
                 }
             }
         }

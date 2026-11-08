@@ -44,14 +44,18 @@ const MAX_SEALED: usize = 48 * 1024;
 const PULL_PAGES: usize = 20;
 /// Ops held per author that isn't a member; past it the author is parked.
 const PER_AUTHOR: usize = if cfg!(test) { 20 } else { 2000 };
+/// Waiting ops held per member; past it its cursor waits until they apply.
+const PER_MEMBER: usize = if cfg!(test) { 200 } else { 20_000 };
+/// Devices that aren't members whose ops are held at all.
+const NONMEMBER_AUTHORS: usize = 50;
+/// The ciphertext held waiting, across every author.
+const HELD_BYTES: usize = 64 * 1024 * 1024;
 /// Refusals kept per author.
 const REJECTED_PER_AUTHOR: usize = 20;
 /// Changes remembered, so one recorded again after a crash isn't a new op.
 const OWN_CHANGES: usize = 512;
 /// How far ahead of now an op's `at` may be (the edge's own limit).
 const AHEAD_MS: u64 = 300_000;
-/// A parked author's cursor in a pull: past anything it has.
-const PARKED_SINCE: u64 = (1 << 31) - 1;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct State {
@@ -112,10 +116,34 @@ pub(crate) struct State {
     /// Changes already written as ops: (tag, op hash, rank).
     #[serde(default)]
     pub own_changes: Vec<(String, String, Rank)>,
-    /// Ops re-sequenced after a restore: old hash to (new hash, new seq),
+    /// Ops re-sequenced or re-dated: old hash to (new hash, new seq, new at),
     /// until the vault's record of them is updated.
     #[serde(default)]
-    pub renamed: BTreeMap<String, (String, u64)>,
+    pub renamed: BTreeMap<String, (String, u64, u64)>,
+    /// The discovery cursor the edge handed back: everyone not followed in
+    /// `since` comes through it.
+    #[serde(default)]
+    pub discover: String,
+    /// The edge showed ops of this device past the highest it knew it wrote:
+    /// this state was restored from an older copy. Nothing is signed until a
+    /// full pull has made the edge's view the base.
+    #[serde(default)]
+    pub restored: bool,
+    /// Changed with every step, and kept in the vault too (`VaultMeta`).
+    #[serde(default)]
+    pub mark: u64,
+    /// The mark before: a vault that holds it is one step behind (the agent
+    /// stopped between saving this state and saving the vault), which the
+    /// ops still held here cover (`applied` lets them go only after).
+    #[serde(default)]
+    pub prev_mark: u64,
+    /// Devices that aren't members, beyond the NONMEMBER_AUTHORS held: only
+    /// counted.
+    #[serde(default)]
+    pub unheld_authors: u64,
+    /// Waiting ops let go because no epoch's key opens them.
+    #[serde(default)]
+    pub unopenable: u64,
     #[serde(default)]
     pub rebased: u64,
     /// What's wrong with this member's chain on the edge, if anything.
@@ -143,6 +171,12 @@ pub(crate) fn state_path(url: &str) -> Result<PathBuf> {
     Ok(crate::common::ensure_state_subdir("sync")?.join(format!("{}.json", &super::crypto::hex(Sha256::digest(url.as_bytes()))[..16])))
 }
 
+/// A random nonzero-ish mark for the vault and the state to share.
+fn rand_mark() -> u64 {
+    use p256::elliptic_curve::rand_core::{OsRng, RngCore};
+    OsRng.next_u64()
+}
+
 /// The epoch after `epoch`, or an error at the last one.
 pub(crate) fn next_epoch(epoch: u32) -> Result<u32> {
     epoch.checked_add(1).ok_or_else(|| anyhow!("the ring is at its last epoch; it can't be rekeyed"))
@@ -162,9 +196,14 @@ pub(crate) struct Member {
     /// The ring keys, opened: only while the vault is unlocked.
     keys: Option<Vec<RingKey>>,
     /// Whether the last pull reached the end: a joiner's first step waits
-    /// for one.
+    /// for one, and so does every membership change.
     pub pull_complete: bool,
+    /// The log, followed once per change to the ring ops held.
+    log_cache: std::cell::RefCell<Option<(LogKey, Log)>>,
 }
+
+/// What the cached log was followed from.
+type LogKey = (usize, String, Option<String>);
 
 /// What one step did to the vault.
 #[derive(Debug, Default)]
@@ -176,10 +215,11 @@ pub(crate) struct Stepped {
     pub applied: BTreeSet<String>,
 }
 
-/// A pull: the ops, and whether it reached the end.
+/// A pull: the ops, whether it reached the end, and the discovery cursor.
 pub(crate) struct Pulled {
     pub ops: Vec<Served>,
     pub complete: bool,
+    pub discover: String,
 }
 
 impl Member {
@@ -201,7 +241,7 @@ impl Member {
         }
         let agree_pub = AgreementKey::load(&config.agreement)?.public_key()?;
         let sign_pub = edge.key()?.public_key()?;
-        Ok(Member { edge, state, path, agree_pub, sign_pub, keys: None, pull_complete: false })
+        Ok(Member { edge, state, path, agree_pub, sign_pub, keys: None, pull_complete: false, log_cache: Default::default() })
     }
 
     pub(crate) fn me(&self) -> &str {
@@ -235,25 +275,54 @@ impl Member {
         MemberKeys { device: self.edge.device.clone(), name: self.edge.name.clone(), sign_pub: b64(&self.sign_pub), agree_pub: b64(&self.agree_pub) }
     }
 
-    /// The membership log, as this member follows it. Needs no ring key.
+    /// The membership log, as this member follows it. Needs no ring key;
+    /// followed again only when the ring ops held change.
     pub(crate) fn log(&self) -> Log {
-        ledger::follow(&self.state.member_ops, self.state.trusted.as_deref(), self.me())
+        let key: LogKey = (
+            self.state.member_ops.len(),
+            self.state.member_ops.iter().map(|o| o.hash.as_str()).collect::<Vec<_>>().join(""),
+            self.state.trusted.clone(),
+        );
+        let key = (key.0, super::crypto::sha256_hex(&key.1), key.2);
+        if let Some((k, log)) = self.log_cache.borrow().as_ref()
+            && *k == key
+        {
+            return log.clone();
+        }
+        let log = ledger::follow(&self.state.member_ops, self.state.trusted.as_deref(), self.me());
+        *self.log_cache.borrow_mut() = Some((key, log.clone()));
+        log
     }
 
     // ------------------------------------------------------------ ingest
 
-    /// What to send as `since`: every author followed, a parked one at its end.
+    /// What to send as `since`: this device and the log's members (removed
+    /// ones while their chain hasn't reached its cut). Everyone else comes
+    /// through the discovery cursor, so `since` never grows with them.
     pub(crate) fn since(&self) -> BTreeMap<String, u64> {
-        let mut since = self.state.next.clone();
-        for a in &self.state.parked {
-            since.insert(a.clone(), PARKED_SINCE);
+        let log = self.log();
+        let mut since = BTreeMap::new();
+        let mut follow = |a: &str| {
+            since.insert(a.to_owned(), self.state.next.get(a).copied().unwrap_or(0));
+        };
+        follow(self.me());
+        for m in log.members.values() {
+            match log.cut_of(&m.keys.device) {
+                Some((after, _)) if self.state.next.get(&m.keys.device).copied().unwrap_or(0) >= after => {}
+                _ => follow(&m.keys.device),
+            }
         }
         since
     }
 
     /// Takes pulled ops: each author's chain is linked, the ring's ops kept,
-    /// and secret ops queued until they can be applied. An author that isn't
-    /// a member gets at most PER_AUTHOR ops held, then is parked.
+    /// and secret ops queued until they can be applied. What an author can
+    /// make this member hold is bounded: a removed one's ops past its cut are
+    /// let go as they come; a member's waiting ops stop at PER_MEMBER (its
+    /// cursor waits); at most NONMEMBER_AUTHORS devices that aren't members
+    /// are held at all, PER_AUTHOR ops each (then parked); and the waiting
+    /// ciphertext stops at HELD_BYTES. Nothing past a cursor is ever taken
+    /// and then let go: what isn't taken is pulled again.
     pub(crate) fn ingest(&mut self, ops: Vec<Served>) {
         let me = self.edge.device.clone();
         let log = self.log();
@@ -261,36 +330,84 @@ impl Member {
         for op in self.state.pending.iter().chain(self.state.member_ops.iter()) {
             *held.entry(op.author.clone()).or_default() += 1;
         }
+        let mut nonmembers: BTreeSet<String> = held.keys().filter(|a| **a != me && !log.members.contains_key(*a)).cloned().collect();
+        let mut bytes: usize = self.state.pending.iter().map(|o| o.sealed.as_ref().map_or(0, String::len)).sum();
+        let mut stopped: BTreeSet<String> = BTreeSet::new();
         let mut taken = Vec::new();
         let own_key = b64(&self.sign_pub);
         for op in ops {
-            if op.author == me && !ledger::signed_by(&op, &own_key) {
-                // Not ours, whatever it says: the edge made it.
-                self.reject(Rejected { author: op.author.clone(), seq: op.seq, reason: "forged: an op in this device's name it never signed".into() });
+            if stopped.contains(&op.author) {
                 continue;
             }
-            if op.author == me || log.members.contains_key(&op.author) {
+            if op.author == me {
+                if !ledger::signed_by(&op, &own_key) {
+                    // Not ours, whatever it says: the edge made it.
+                    self.reject(Rejected { author: op.author.clone(), seq: op.seq, reason: "forged: an op in this device's name it never signed".into() });
+                    stopped.insert(op.author.clone());
+                    continue;
+                }
+                if op.seq > self.state.high_seq || self.state.outbox.iter().any(|o| o.seq == op.seq && o.hash() != op.hash) {
+                    // The edge has ops of ours we didn't know we wrote (past
+                    // our newest, or at a seq we queued another op at): this
+                    // state was restored. Nothing is signed until a full pull
+                    // makes the edge's view the base (`rebase`).
+                    self.state.restored = true;
+                }
                 taken.push(op);
                 continue;
             }
-            if self.state.parked.contains(&op.author) {
+            if let Some((after, _)) = log.cut_of(&op.author)
+                && op.seq > after
+            {
+                self.reject(Rejected { author: op.author.clone(), seq: op.seq, reason: format!("written after its author was removed (its last op that counts is {after}): dropped") });
+                stopped.insert(op.author.clone());
                 continue;
             }
             let n = held.entry(op.author.clone()).or_default();
-            if *n >= PER_AUTHOR {
-                self.state.parked.insert(op.author.clone());
-                continue;
+            let size = op.sealed.as_ref().map_or(0, String::len);
+            if log.members.contains_key(&op.author) {
+                if op.kind.is_value() && (*n >= PER_MEMBER || bytes + size > HELD_BYTES) {
+                    stopped.insert(op.author.clone());
+                    continue;
+                }
+            } else {
+                if self.state.parked.contains(&op.author) || *n >= PER_AUTHOR || bytes + size > HELD_BYTES {
+                    self.state.parked.insert(op.author.clone());
+                    stopped.insert(op.author.clone());
+                    continue;
+                }
+                if !nonmembers.contains(&op.author) {
+                    if nonmembers.len() >= NONMEMBER_AUTHORS {
+                        self.state.unheld_authors += 1;
+                        stopped.insert(op.author.clone());
+                        continue;
+                    }
+                    nonmembers.insert(op.author.clone());
+                }
             }
             *n += 1;
+            bytes += size;
             taken.push(op);
         }
         let linked = ledger::link_chains(&mut self.state.authors, &me, taken);
         for r in linked.rejected {
             self.reject(r);
         }
-        for fork in linked.forks {
-            if !self.state.forks.iter().any(|f| f.author == fork.author && f.seq == fork.seq) {
-                self.state.forks.push(fork);
+        // A fork only on proof: the second op verifies under the key the log
+        // gives its author (the first was linked and verified already).
+        // Anything else is bogus: refused, and the author goes on.
+        for op in linked.conflicts {
+            let proven = log.members.get(&op.author).is_some_and(|m| ledger::signed_by(&op, &m.keys.sign_pub));
+            if !proven {
+                self.reject(Rejected { author: op.author.clone(), seq: op.seq, reason: "forged: a second op at a seq held, not signed by its author".into() });
+                continue;
+            }
+            let known = self.state.authors.get(&op.author).and_then(|a| a.recent.get(&op.seq).cloned()).unwrap_or_default();
+            if let Some(a) = self.state.authors.get_mut(&op.author) {
+                a.fork_at = Some(a.fork_at.map_or(op.seq, |f| f.min(op.seq)));
+            }
+            if !self.state.forks.iter().any(|f| f.author == op.author && f.seq == op.seq) {
+                self.state.forks.push(Fork { author: op.author.clone(), seq: op.seq, hashes: [known, op.hash.clone()], evidence: op });
             }
         }
         for op in linked.good {
@@ -310,6 +427,22 @@ impl Member {
             }
         }
         self.settle_log();
+        // A removal that came in this batch cuts what the batch brought too.
+        let log = self.log();
+        let mut dropped: BTreeSet<String> = BTreeSet::new();
+        let mut cut = Vec::new();
+        self.state.pending.retain(|op| match log.cut_of(&op.author) {
+            Some((after, _)) if op.seq > after => {
+                if dropped.insert(op.author.clone()) {
+                    cut.push(Rejected { author: op.author.clone(), seq: op.seq, reason: format!("written after its author was removed (its last op that counts is {after}): dropped") });
+                }
+                false
+            }
+            _ => true,
+        });
+        for r in cut {
+            self.reject(r);
+        }
     }
 
     fn reject(&mut self, r: Rejected) {
@@ -371,38 +504,72 @@ impl Member {
         }
     }
 
-    /// After a full pull: checks this member's chain on the edge. If the edge
-    /// shows fewer of its ops than it acknowledged, the edge is withholding
-    /// them: refused, nothing re-signed. If it shows ops of this member at or
-    /// past the first queued seq (this state file was restored from an older
-    /// copy), the queued ops are re-sequenced after the edge's newest; the
-    /// vault learns their new hashes. A seq is never reused.
+    /// After a full pull: checks this member's chain on the edge.
+    /// - The edge showed ops of this device past the highest it knew (this
+    ///   state was restored): the edge's view becomes the base, and the
+    ///   queued ops follow its newest. Only then is anything signed again.
+    /// - The edge shows fewer of this device's ops than it acknowledged: it
+    ///   is withholding them; refused, nothing re-signed (an edge restored
+    ///   from a backup needs `reset_edge_view`).
+    ///
+    /// A seq is never reused otherwise.
     pub(crate) fn rebase(&mut self) {
-        let (seq, hash) = self.state.authors.get(self.me()).map(|a| (a.seq, a.hash.clone())).unwrap_or((0, String::new()));
+        let (seq, hash) = self.edge_tip();
+        if self.state.restored {
+            self.state.high_seq = self.state.high_seq.max(seq);
+            self.state.acked_seq = self.state.acked_seq.max(seq);
+            self.state.tip = Tip { seq, hash: hash.clone(), at: self.state.tip.at };
+            self.resequence(seq, hash);
+            self.state.restored = false;
+            self.state.chain_error = None;
+            return;
+        }
         if seq < self.state.acked_seq {
             self.state.chain_error = Some(format!("the edge is withholding this device's ops: it took up to {}, and shows {seq}", self.state.acked_seq));
             return;
         }
-        self.state.chain_error = None;
-        let Some(first) = self.state.outbox.first() else { return };
-        if first.seq == seq + 1 && first.prev == hash {
-            return;
+        if self.state.chain_error.as_deref().is_some_and(|e| e.starts_with("the edge is withholding")) {
+            self.state.chain_error = None;
         }
-        if seq < first.seq {
-            // The edge has nothing at our queued seqs; the gap is ops it never
-            // took. Nothing to re-sequence; the push will say what's wrong.
+    }
+
+    /// The edge's newest op of this device: its seq and hash.
+    fn edge_tip(&self) -> (u64, String) {
+        self.state.authors.get(self.me()).map(|a| (a.seq, a.hash.clone())).unwrap_or((0, String::new()))
+    }
+
+    /// Writes the queued ops again after `seq`/`hash`, unsigned; the vault
+    /// learns their new hashes.
+    fn resequence(&mut self, seq: u64, hash: String) {
+        if self.state.outbox.first().is_none_or(|first| first.seq == seq + 1 && first.prev == hash) {
             return;
         }
         let mut prev = (seq, hash);
-        let mut moved = Vec::new();
-        for op in &mut self.state.outbox {
-            let old = op.hash();
+        self.rewrite_outbox(|op| {
             op.seq = prev.0 + 1;
             op.prev = prev.1.clone();
+            prev = (op.seq, op.hash());
+        });
+    }
+
+    /// Rewrites each queued op with `f` (which may change its seq, prev or
+    /// at; each op's prev is kept chained), clears its signature, and tells
+    /// the vault and the ring ops held about the new hashes.
+    fn rewrite_outbox(&mut self, mut f: impl FnMut(&mut Op)) {
+        let mut moved = Vec::new();
+        let mut prev: Option<String> = None;
+        for op in &mut self.state.outbox {
+            let old = op.hash();
+            if let Some(p) = &prev {
+                op.prev = p.clone();
+            }
+            f(op);
             op.sig = String::new();
             let new = op.hash();
-            prev = (op.seq, new.clone());
-            moved.push((old, new, op.clone()));
+            prev = Some(new.clone());
+            if new != old {
+                moved.push((old, new, op.clone()));
+            }
         }
         for (old, new, op) in moved {
             if let Some(m) = self.state.member_ops.iter_mut().find(|o| o.hash == old) {
@@ -412,14 +579,66 @@ impl Member {
                 if *h == old {
                     *h = new.clone();
                     r.seq = op.seq;
+                    r.at = op.at;
                 }
             }
-            self.state.renamed.insert(old, (new, op.seq));
+            for v in self.state.renamed.values_mut() {
+                if v.0 == old {
+                    *v = (new.clone(), op.seq, op.at);
+                }
+            }
+            self.state.renamed.insert(old, (new, op.seq, op.at));
             self.state.rebased += 1;
         }
-        let last = self.state.outbox.last().expect("not empty");
-        self.state.high_seq = self.state.high_seq.max(last.seq);
-        self.state.tip = Tip { seq: last.seq, hash: last.hash(), at: self.state.tip.at.max(last.at) };
+        if let Some(last) = self.state.outbox.last() {
+            self.state.high_seq = self.state.high_seq.max(last.seq);
+            self.state.tip = Tip { seq: last.seq, hash: last.hash(), at: self.state.tip.at.max(last.at) };
+        }
+    }
+
+    /// Whether the queued ops follow the edge's newest op of this device.
+    fn outbox_follows_edge(&self) -> bool {
+        let (seq, hash) = self.edge_tip();
+        self.state.outbox.first().is_none_or(|first| first.seq == seq + 1 && first.prev == hash) || self.state.outbox.first().is_some_and(|f| f.seq > seq + 1)
+    }
+
+    /// Membership changes are refused unless this member has a full, clean
+    /// view: the last pull reached the end, the edge's view of its chain is
+    /// sound, and nothing waits on a restore. A restored device must complete
+    /// a full sync before it acts.
+    fn may_change_membership(&self) -> Result<()> {
+        if !self.pull_complete {
+            bail!("this machine hasn't completed a full sync since it started; run harar edge sync now first");
+        }
+        if self.state.restored {
+            bail!("this machine's sync state was restored from an older copy; run harar edge sync now first");
+        }
+        if let Some(err) = &self.state.chain_error {
+            bail!("this machine's chain on the edge isn't sound ({err}); fix that first");
+        }
+        if !self.outbox_follows_edge() {
+            bail!("this machine's queued ops don't follow its chain on the edge yet; run harar edge sync now first");
+        }
+        Ok(())
+    }
+
+    /// After the edge's database was restored from a backup (it shows fewer
+    /// of this device's ops than it once took): after a full pull, takes the
+    /// edge's view as the base. Explicit, and logged: members that saw the
+    /// ops the edge lost may see this device fork.
+    pub(crate) fn reset_edge_view(&mut self) -> Result<Value> {
+        if !self.pull_complete {
+            bail!("run harar edge sync now first: the edge's view is taken only after a full pull");
+        }
+        let (seq, hash) = self.edge_tip();
+        let was = self.state.acked_seq;
+        eprintln!("harar agent: reset-edge-view on {}: this device's chain goes back from {was} to the edge's {seq}", self.edge.url);
+        self.state.acked_seq = seq;
+        self.state.high_seq = seq;
+        self.state.tip = Tip { seq, hash: hash.clone(), at: self.state.tip.at };
+        self.resequence(seq, hash);
+        self.state.chain_error = None;
+        Ok(json!({ "reset": true, "was": was, "now": seq }))
     }
 
     // ------------------------------------------------------------ keys
@@ -505,8 +724,13 @@ impl Member {
         op
     }
 
-    /// The queued ops not signed yet.
+    /// The queued ops not signed yet. None while this state may be a restored
+    /// one: nothing is signed until a full pull has made the edge's view the
+    /// base, so no seq is ever signed twice.
     pub(crate) fn unsigned(&self) -> Vec<Op> {
+        if self.state.restored {
+            return Vec::new();
+        }
         self.state.outbox.iter().filter(|o| o.sig.is_empty()).cloned().collect()
     }
 
@@ -566,7 +790,7 @@ impl Member {
     /// The authority only: what it does, or why this machine can't.
     fn as_authority(&self, log: &Log, doing: &str) -> Result<()> {
         match log.current_authority() {
-            Some(a) if a == self.me() => Ok(()),
+            Some(a) if a == self.me() => self.may_change_membership(),
             Some(a) => bail!("only the ring's authority can {doing}: that is {a} ({}); run it there", log.members.get(a).map_or("?", |m| m.keys.name.as_str())),
             None => bail!("this machine isn't a member of the ring, so it can't {doing}"),
         }
@@ -665,7 +889,7 @@ impl Member {
         }
         let (epoch, old) = self.current(&log).ok_or_else(|| anyhow!("this machine doesn't hold the ring's current key"))?;
         let next = next_epoch(epoch)?;
-        let after = self.state.authors.get(device).map_or(0, |a| a.seq);
+        let (after, after_hash) = self.state.authors.get(device).map_or((0, String::new()), |a| (a.seq, a.hash.clone()));
         let new = random_key();
         let mut wraps = BTreeMap::new();
         for m in log.active().filter(|m| m.keys.device != device) {
@@ -673,7 +897,7 @@ impl Member {
         }
         let back = b64(gcm_seal(&wrap_key(&new), &*old, op::rekey_ad(next).as_bytes(), random_iv()));
         self.write_entry(&log, EntryType::Remove, next, ring_id(&new, next), |e| {
-            e.removed = vec![Removed { device: device.to_owned(), after }];
+            e.removed = vec![Removed { device: device.to_owned(), after, after_hash }];
             e.wraps = wraps;
         }, back);
         let mut keys = self.keys.take().unwrap_or_default();
@@ -714,13 +938,31 @@ impl Member {
             self.state.renamed.clear();
         }
         let first = meta.ring.as_deref() != log.founder();
+        // The vault and this state are marked alike at every step: when they
+        // differ, one was restored from an older copy, and what was applied
+        // can't be told. The view starts over: everything is pulled again
+        // (applying again is harmless).
+        if !first && self.state.mark != 0 && meta.mark != self.state.mark && meta.mark != self.state.prev_mark {
+            self.reset_view();
+            meta.mark = 0;
+            meta.write(keys);
+            return Ok(Stepped::default());
+        }
         // A joiner's first step waits for a pull that reached the end.
         if first && !self.state.founded && !self.pull_complete {
             return Ok(Stepped::default());
         }
+        // Removals cut their device's ops: what came after a cut is taken
+        // back, each path falling back to its best op that still counts.
+        let mut revoked = BTreeSet::new();
+        for m in log.members.values() {
+            if let Some((after, _)) = log.cut_of(&m.keys.device) {
+                revoked.extend(meta.revoke(keys, &m.keys.device, after));
+            }
+        }
         let incoming = self.open_pending(&log);
         let applied: BTreeSet<String> = incoming.iter().map(|i| i.hash.clone()).collect();
-        let changed = if first {
+        let mut changed = if first {
             // Joining (or founding): the ring's current value wins. What the
             // vault held that differs goes to history, flagged; what the ring
             // lacks becomes this member's write at the lowest rank.
@@ -751,8 +993,39 @@ impl Member {
             meta.apply(keys, incoming)
         };
         self.record_changes(&mut meta, keys, &log, &head, None)?;
+        changed.extend(revoked);
+        meta.prune(now_ms());
+        let mark = loop {
+            let m = rand_mark();
+            if m != 0 {
+                break m;
+            }
+        };
+        meta.mark = mark;
+        self.state.prev_mark = self.state.mark;
+        self.state.mark = mark;
         meta.write(keys);
         Ok(Stepped { changed, applied })
+    }
+
+    /// Starts this member's view of the edge over: cursors, chains and what
+    /// it holds go, and the next pull brings everything again. Its ring keys,
+    /// its own queued ops and its seqs stay.
+    fn reset_view(&mut self) {
+        let own: Vec<Served> = self.state.member_ops.iter().filter(|o| o.author == self.edge.device && o.sig.is_empty()).cloned().collect();
+        let (high, acked) = (self.state.high_seq, self.state.acked_seq);
+        self.state.next.clear();
+        self.state.authors.clear();
+        self.state.member_ops = own;
+        self.state.pending.clear();
+        self.state.parked.clear();
+        self.state.discover.clear();
+        self.state.key_tips.clear();
+        self.state.mark = 0;
+        self.state.prev_mark = 0;
+        self.state.high_seq = high;
+        self.state.acked_seq = acked;
+        self.log_cache.borrow_mut().take();
     }
 
     /// The vault holding what `step` applied is saved: let those ops go.
@@ -819,6 +1092,8 @@ impl Member {
         let mut done: Vec<(String, Option<Rejected>)> = Vec::new();
         let mut forged = Vec::new();
         let mut tips: Vec<(String, Rank)> = Vec::new();
+        let all_epochs = log.entries.iter().all(|l| keys.iter().any(|k| k.epoch == l.entry.epoch));
+        let mut unopenable = 0;
         for op in &self.state.pending {
             let tip_key = format!("{}|{}", op.author, op.key);
             let Some((sealed, wrapped)) = op.ciphertext() else {
@@ -835,20 +1110,28 @@ impl Member {
                 let body: ValueBody = serde_json::from_slice(&plain).ok()?;
                 (name_mac(&k.key, &body.path) == op.key).then_some((k.epoch, body))
             });
-            let Some((epoch, body)) = opened else { continue };
-            let Some(n) = log.heads.get(&body.head).copied() else { continue };
             let refuse = |reason: &str| Some(Rejected { author: op.author.clone(), seq: op.seq, reason: reason.to_owned() });
+            let Some((epoch, body)) = opened else {
+                // Every epoch's key is held and none opens it: it never will.
+                if all_epochs {
+                    done.push((op.hash.clone(), None));
+                    unopenable += 1;
+                }
+                continue;
+            };
+            let Some(n) = log.heads.get(&body.head).copied() else { continue };
             if log.entries[n as usize].entry.epoch != epoch {
                 done.push((op.hash.clone(), refuse("not sealed with the key of the head it names")));
                 continue;
             }
-            match log.counts(op, n) {
-                Ok(()) => {}
-                Err(reason) if reason.starts_with("forged") => {
-                    forged.push(Rejected { author: op.author.clone(), seq: op.seq, reason: reason.to_owned() });
+            match log.counts(op, n, &self.state.authors) {
+                ledger::Verdict::Counts => {}
+                ledger::Verdict::Waits => continue,
+                ledger::Verdict::Forged => {
+                    forged.push(Rejected { author: op.author.clone(), seq: op.seq, reason: "forged: not signed by the key the log gives its author".into() });
                     continue;
                 }
-                Err(reason) => {
+                ledger::Verdict::Refused(reason) => {
                     done.push((op.hash.clone(), refuse(reason)));
                     continue;
                 }
@@ -875,6 +1158,7 @@ impl Member {
         for f in forged {
             self.forged(f);
         }
+        self.state.unopenable += unopenable;
         out
     }
 
@@ -882,25 +1166,28 @@ impl Member {
 
     /// The ops after the cursor, up to PULL_PAGES pages. Each page's `next`
     /// must move the cursor on, or the edge is refused.
-    pub(crate) fn pull(edge: &Paired, device: &DeviceKey, since: &BTreeMap<String, u64>) -> Result<Pulled> {
+    pub(crate) fn pull(edge: &Paired, device: &DeviceKey, since: &BTreeMap<String, u64>, discover: &str) -> Result<Pulled> {
         let mut since = since.clone();
+        let mut discover = discover.to_owned();
         let mut ops = Vec::new();
         for _ in 0..PULL_PAGES {
-            let page = edge.call_with(device, "POST", "/v1/sync", Some(&json!({ "since": since })))?;
+            let page = edge.call_with(device, "POST", "/v1/sync", Some(&json!({ "since": since, "discover": discover })))?;
             let got: Vec<Served> = serde_json::from_value(page["ops"].clone()).context("the edge's ops")?;
             let next: BTreeMap<String, u64> = serde_json::from_value(page["next"].clone()).context("the edge's next")?;
+            let found = page["discover"].as_str().unwrap_or(&discover).to_owned();
             let more = page["more"] == Value::Bool(true);
-            let moved = next.iter().any(|(a, s)| since.get(a).is_none_or(|old| s > old)) && next.iter().all(|(a, s)| since.get(a).is_none_or(|old| s >= old));
-            if more && (got.is_empty() || !moved) {
+            let moved = (next.iter().any(|(a, s)| since.get(a).is_none_or(|old| s > old)) || found > discover) && next.iter().all(|(a, s)| since.get(a).is_none_or(|old| s >= old)) && found >= discover;
+            if more && !moved {
                 bail!("{} says there is more to pull but doesn't move the cursor on", edge.url);
             }
             ops.extend(got);
             since = next;
+            discover = found;
             if !more {
-                return Ok(Pulled { ops, complete: true });
+                return Ok(Pulled { ops, complete: true, discover });
             }
         }
-        Ok(Pulled { ops, complete: false })
+        Ok(Pulled { ops, complete: false, discover })
     }
 
     /// Sends `ops` in batches the edge takes: how many were sent, and the
@@ -935,6 +1222,22 @@ impl Member {
             self.state.acked_seq = self.state.acked_seq.max(seq);
         }
         self.state.last_error = error.map(|err| format!("push: {err:#}"));
+        let Some(text) = error.map(|e| format!("{e:#}")) else { return };
+        if ["fork", "wrong_seq", "wrong_prev"].iter().any(|code| text.contains(&format!(" {code})"))) {
+            // The edge doesn't take this device's chain where it continues:
+            // nothing is re-signed below what was written. Check whether the
+            // edge was restored, then harar edge sync reset-edge-view.
+            self.state.chain_error = Some(format!("the edge refused this device's chain ({text}); if the edge was restored from a backup, run harar edge sync reset-edge-view"));
+        } else if text.contains(" clock)") {
+            // An op dated ahead of the edge's clock that it never took:
+            // dated again, no later than now, and signed again.
+            let (acked, now) = (self.state.acked_seq, now_ms());
+            self.rewrite_outbox(|op| {
+                if op.seq > acked {
+                    op.at = op.at.min(now);
+                }
+            });
+        }
     }
 
     // ------------------------------------------------------------ status
@@ -955,7 +1258,7 @@ impl Member {
         } else {
             "not a member"
         };
-        let members: Vec<Value> = log.members.values().map(|m| json!({ "device": m.keys.device, "name": m.keys.name, "added_at": m.added_at, "removed_at": m.removed.map(|(n, _)| n) })).collect();
+        let members: Vec<Value> = log.members.values().map(|m| json!({ "device": m.keys.device, "name": m.keys.name, "added_at": m.added_at, "removed_at": m.removed.as_ref().map(|(n, _, _)| *n) })).collect();
         // A request shows no fingerprint here: the person reads it on the
         // joining device, never copies it from the approver's own screen.
         let requests: Vec<Value> = log.requests.values().map(|r| json!({ "device": r.device, "name": r.name })).collect();
@@ -1008,6 +1311,9 @@ impl Member {
             "behind": behind,
             "waiting_compacted": self.state.pending.iter().filter(|o| o.compacted).count(),
             "parked": self.state.parked,
+            "unheld_authors": self.state.unheld_authors,
+            "unopenable": self.state.unopenable,
+            "restored": self.state.restored,
             "forged": self.state.forged,
             "ignored": log.ignored,
             "forks": self.state.forks,

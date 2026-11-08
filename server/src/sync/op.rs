@@ -213,11 +213,13 @@ pub(crate) struct MemberKeys {
     pub agree_pub: String,
 }
 
-/// A removed device, and the newest of its ops that still counts.
+/// A removed device, the newest of its ops that still counts, and that op's
+/// hash: its ops count only on the chain that reaches it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Removed {
     pub device: String,
     pub after: u64,
+    pub after_hash: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

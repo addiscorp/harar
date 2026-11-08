@@ -48,7 +48,7 @@ fn c1_a_removed_member_cannot_remove_its_remover() {
     assert!(r.remove(A).unwrap_err().to_string().contains("only the ring's authority"));
     fake_entry(&mut r, EntryType::Remove, |e| {
         e.epoch += 1;
-        e.removed = vec![Removed { device: A.into(), after: 0 }];
+        e.removed = vec![Removed { device: A.into(), after: 0, after_hash: String::new() }];
     });
     edge.push(&mut a);
     edge.push(&mut r);
@@ -208,11 +208,15 @@ fn h5_a_capped_author_is_parked_and_never_starves_a_member() {
     assert!(a.state.parked.contains(JUNK), "parked while locked too");
     let held = |m: &Member| m.state.pending.iter().chain(m.state.member_ops.iter()).filter(|o| o.author == JUNK).count();
     assert_eq!(held(&a), 20);
-    assert_eq!(a.since()[JUNK], (1 << 31) - 1, "pulls skip it");
+    assert!(!a.since().contains_key(JUNK), "pulls name only members: it comes through discovery, and isn't taken past its cap");
     let cursor = a.state.next[JUNK];
     bv.insert("from/b".into(), "gets through".into());
     settle(&mut edge, &mut [(&mut b, &mut bv), (&mut a, &mut av)], 2);
-    assert_eq!((held(&a), a.state.next[JUNK]), (20, cursor), "nothing past the cursor taken or let go");
+    // Nothing past the cursor taken; the junk ops no epoch's key opens are
+    // let go and counted, only its request stays.
+    assert_eq!((held(&a), a.state.next[JUNK]), (1, cursor), "nothing past the cursor taken");
+    assert!(a.state.parked.contains(JUNK), "still parked");
+    assert_eq!(a.status(None).unwrap()["unopenable"], 19);
     assert_eq!(av.get("from/b").map(String::as_str), Some("gets through"));
 }
 
@@ -291,7 +295,7 @@ fn a_membership_entry_by_anyone_but_the_authority_changes_nothing() {
     fake_entry(&mut b, EntryType::Remove, |e| {
         e.epoch += 1;
         e.id = super::ledger::ring_id(&evil, e.epoch);
-        e.removed = vec![Removed { device: A.into(), after: 0 }];
+        e.removed = vec![Removed { device: A.into(), after: 0, after_hash: String::new() }];
         e.wraps.insert(A.into(), b64(super::crypto::wrap_ring(&a_agree, e.epoch, A, &evil)));
     });
     edge.push(&mut b);
@@ -452,7 +456,7 @@ fn a_restored_state_file_rebases_its_queued_ops_removal_included() {
     a.state = old;
     a.remove(B).unwrap().unwrap();
     edge.sync(&mut a, &mut av);
-    assert!(a.state.outbox.is_empty(), "rebased and sent");
+    assert!(a.state.outbox.is_empty(), "rebased and sent: {:?} {:?} {}", a.state.chain_error, a.state.outbox.iter().map(|o| (o.seq, o.kind)).collect::<Vec<_>>(), a.state.restored);
     assert!(a.state.rebased > 0);
     av.insert("after/removal".into(), "secret".into());
     edge.sync(&mut a, &mut av);
@@ -563,7 +567,7 @@ fn a_pull_that_never_moves_on_is_refused() {
     let mut m = member(dir.path(), A, "mac");
     m.edge.url = url;
     let device = m.edge.key().unwrap();
-    let err = Member::pull(&m.edge, &device, &Default::default()).err().expect("refused");
+    let err = Member::pull(&m.edge, &device, &Default::default(), "").err().expect("refused");
     assert!(format!("{err:#}").contains("doesn't move the cursor"), "{err:#}");
 }
 

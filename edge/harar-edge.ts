@@ -138,6 +138,14 @@ const MAX_OPS = 100;
 const MAX_SEALED = 48 * 1024;
 const MAX_WRAPPED = 1024;
 const MAX_SINCE = 1000;
+/** Room on a page always left for authors found through `discover`. */
+const DISCOVER_ROOM = 20;
+/** Discovery reads only ops visible this long (a batch commits in well under it). */
+const DISCOVER_LAG_MS = 5000;
+/** Reads of the discovery order one pull makes at most. */
+const DISCOVER_READS = 10;
+/** A discovery cursor: stored_at|author|seq, as a pull handed it back. */
+const DISCOVER = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z\|d-[0-9a-f]{16}\|\d{1,10}$/;
 const SYNC_PAGE = 100;
 const SYNC_PAGE_BYTES = 1024 * 1024;
 const HISTORY_MS = 30 * 24 * 60 * 60 * 1000;
@@ -548,6 +556,40 @@ export function edge(config: Config): { fetch(request: Request): Promise<Respons
     );
   }
 
+  /** Who the stored membership entries make a ring's authority (founders,
+   *  and devices a transfer named or that wrote one), its members, and the
+   *  members a removal by one of those authorities names. The entries are
+   *  plain JSON (docs/edge.md §5b); the edge checked each op's signature
+   *  when it took it. Anything that doesn't read is no entry. */
+  async function membership(): Promise<{ authorities: Set<string>; members: Set<string>; removed: Set<string> }> {
+    const rows = await sql.query(`SELECT author, kind, sealed FROM harar_ops WHERE batch IS NULL AND sealed IS NOT NULL AND kind IN ('member.add', 'rekey')`);
+    const entries = rows.flatMap((r) => {
+      try {
+        const e = JSON.parse(new TextDecoder().decode(unb64(String(r.sealed)) ?? new Uint8Array()));
+        return e && typeof e === "object" && typeof e.type === "string" ? [{ author: String(r.author), kind: String(r.kind), e }] : [];
+      } catch {
+        return [];
+      }
+    });
+    const authorities = new Set<string>();
+    const members = new Set<string>();
+    for (const { author, kind, e } of entries) {
+      if (kind === "member.add" && e.type === "found" && e.member?.device === author) authorities.add(author);
+      if (kind === "member.add" && e.type === "transfer") {
+        authorities.add(author);
+        if (typeof e.authority === "string") authorities.add(e.authority);
+      }
+      if (kind === "member.add" && (e.type === "found" || e.type === "add") && typeof e.member?.device === "string") members.add(e.member.device);
+    }
+    const removed = new Set<string>();
+    for (const { author, kind, e } of entries) {
+      if (kind === "rekey" && e.type === "remove" && authorities.has(author) && Array.isArray(e.removed)) {
+        for (const r of e.removed) if (typeof r?.device === "string") removed.add(r.device);
+      }
+    }
+    return { authorities, members, removed };
+  }
+
   /** An op as members get it back: what its author sent, its hash, and the
    *  sha256 of its ciphertext (all a compacted op still has). */
   function served(row: Row) {
@@ -672,11 +714,22 @@ export function edge(config: Config): { fetch(request: Request): Promise<Respons
 
     const deviceMatch = /^\/v1\/devices\/(d-[0-9a-f]{16})$/.exec(path);
     if (method === "DELETE" && deviceMatch) {
-      device(actor);
+      const by = device(actor);
       const id = deviceMatch[1];
       const live = await sql.query(`SELECT id FROM harar_devices WHERE removed_at IS NULL`);
       if (!live.some((d) => d.id === id)) throw new Refusal(404, "not_found", `no paired device ${id}`);
       if (live.length === 1) throw new Refusal(409, "last_device", "the last device can't be removed; pair another first");
+      // Members' rings (docs/edge.md §5b): their membership entries are
+      // plain JSON, so the edge can tell who founded or was handed a ring
+      // (only that device unpairs itself), and who is a member (it goes only
+      // once one of those has stored a removal of it).
+      const ring = await membership();
+      if (ring.authorities.has(id) && by !== id) {
+        throw new Refusal(403, "authority", `${id} is a ring's authority; only it can unpair itself (it can hand the authority over first)`);
+      }
+      if (ring.members.has(id) && !ring.authorities.has(id) && !ring.removed.has(id)) {
+        throw new Refusal(409, "needs_removal", `${id} is a member of a ring; its authority removes it from the ring first (harar edge unpair on the authority does both)`);
+      }
       return {
         action: "device.remove",
         resource: id,
@@ -955,7 +1008,10 @@ export function edge(config: Config): { fetch(request: Request): Promise<Respons
               await sql.query(`DELETE FROM harar_ops WHERE batch = ?`, [batch]);
               throw new Refusal(409, "sync_busy", "another sync wrote these ops' places first; pull and try again");
             }
-            const committed = await sql.query(`UPDATE harar_ops SET batch = NULL WHERE batch = ? RETURNING hash`, [batch]);
+            // stored_at is when the batch became visible: the order discovery
+            // reads in (with DISCOVER_LAG, so a batch committing as a pull
+            // reads is never passed over).
+            const committed = await sql.query(`UPDATE harar_ops SET batch = NULL, stored_at = ? WHERE batch = ? RETURNING hash`, [iso(), batch]);
             if (committed.length !== fresh.length) {
               await sql.query(`DELETE FROM harar_ops WHERE batch = ?`, [batch]);
               throw new Refusal(409, "sync_busy", "this sync took too long to commit; try again");
@@ -969,41 +1025,49 @@ export function edge(config: Config): { fetch(request: Request): Promise<Respons
 
     if (method === "POST" && path === "/v1/sync") {
       device(actor);
-      const { since = {} } = input();
+      const { since = {}, discover } = input();
       if (!since || typeof since !== "object" || Array.isArray(since)) throw new Refusal(400, "bad_request", "since is { <device id>: <seq> }");
       const entries = Object.entries(since as Record<string, unknown>);
       if (entries.length > MAX_SINCE || !entries.every(([a, s]) => DEVICE_ID.test(a) && count(s, MAX_INT))) {
         throw new Refusal(400, "bad_request", `since is { <device id>: <seq> }, at most ${MAX_SINCE} authors`);
       }
+      if (discover !== undefined && (typeof discover !== "string" || !(discover === "" || DISCOVER.test(discover)))) {
+        throw new Refusal(400, "bad_request", "discover is the cursor a pull handed back, or \"\" to start");
+      }
       const from = new Map(entries as [string, number][]);
+      const cols = `author, seq, prev, kind, key, version, sealed, wrapped_key, sealed_sha256, wrapped_key_sha256, at, sig, hash, stored_at`;
       return {
         action: "sync.read",
         resource: "",
         act: async () => {
           await compact();
-          // The authors with ops after their cursor; each gets an equal share
-          // of the page, so one author with many ops never starves the rest.
+          // With `discover`, `since` names the authors the member follows
+          // (its ring's members) and everyone else comes in the order the
+          // edge stored them, through one cursor; without it, every author
+          // is followed from `since` (or 0).
+          const discovering = typeof discover === "string";
           const tips = await sql.query(`SELECT author, MAX(seq) AS seq FROM harar_ops WHERE batch IS NULL GROUP BY author ORDER BY author`);
-          const last = new Map(tips.map((t) => [String(t.author), Number(t.seq)]));
+          const last = new Map(tips.map((t) => [String(t.author), Number(t.seq)]).filter(([a]) => !discovering || from.has(a as string)) as [string, number][]);
           const ops: ReturnType<typeof served>[] = [];
           const next: Record<string, number> = Object.fromEntries(from);
           const at = (a: string) => next[a] ?? 0;
           let behind = [...last.keys()].filter((a) => last.get(a)! > at(a));
+          // Who goes first turns with the cursor, so the same authors don't
+          // always take the room.
+          const turn = behind.length > 0 ? entries.reduce((n, [, s]) => n + Number(s), 0) % behind.length : 0;
+          behind = [...behind.slice(turn), ...behind.slice(0, turn)];
+          const forMembers = discovering ? SYNC_PAGE - DISCOVER_ROOM : SYNC_PAGE;
           let bytes = 0;
           // In passes, each author still behind gets an equal share of the
           // room left, so one author with many ops never starves the rest and
           // no room is left unused. Each author's ops go in seq order: they
           // become visible only in order, so a cursor never skips one.
-          while (behind.length > 0 && ops.length < SYNC_PAGE && bytes < SYNC_PAGE_BYTES) {
-            const share = Math.max(1, Math.ceil((SYNC_PAGE - ops.length) / behind.length));
+          while (behind.length > 0 && ops.length < forMembers && bytes < SYNC_PAGE_BYTES) {
+            const share = Math.max(1, Math.ceil((forMembers - ops.length) / behind.length));
             for (const a of behind) {
-              const room = Math.min(share, SYNC_PAGE - ops.length);
+              const room = Math.min(share, forMembers - ops.length);
               if (room <= 0 || bytes >= SYNC_PAGE_BYTES) break;
-              const rows = await sql.query(
-                `SELECT author, seq, prev, kind, key, version, sealed, wrapped_key, sealed_sha256, wrapped_key_sha256, at, sig, hash
-                 FROM harar_ops WHERE author = ? AND seq > ? AND batch IS NULL ORDER BY seq LIMIT ?`,
-                [a, at(a), room],
-              );
+              const rows = await sql.query(`SELECT ${cols} FROM harar_ops WHERE author = ? AND seq > ? AND batch IS NULL ORDER BY seq LIMIT ?`, [a, at(a), room]);
               for (const row of rows) {
                 if (bytes >= SYNC_PAGE_BYTES) break;
                 const op = served(row);
@@ -1014,8 +1078,42 @@ export function edge(config: Config): { fetch(request: Request): Promise<Respons
             }
             behind = behind.filter((a) => last.get(a)! > at(a));
           }
-          const more = behind.length > 0;
-          return { status: 200, body: { ops, next, more } };
+          let more = behind.length > 0;
+          let cursor = typeof discover === "string" ? discover : "";
+          if (discovering) {
+            // Everyone not in since, in the order stored (stored_at, then
+            // author, then seq: an author's ops are stored in seq order).
+            const settled = iso(now() - DISCOVER_LAG_MS);
+            const [s, a, q] = cursor === "" ? ["", "", 0] : cursor.split("|");
+            let after: [string, string, number] = [String(s), String(a), Number(q)];
+            // A few reads at most: rows of followed authors are passed over
+            // (their cursor moves on all the same), never sent twice.
+            outer: for (let read = 0; read < DISCOVER_READS && ops.length < SYNC_PAGE && bytes < SYNC_PAGE_BYTES; read++) {
+              const limit = SYNC_PAGE;
+              const rows = await sql.query(
+                `SELECT ${cols} FROM harar_ops WHERE batch IS NULL AND stored_at <= ?
+                   AND (stored_at > ? OR (stored_at = ? AND (author > ? OR (author = ? AND seq > ?))))
+                 ORDER BY stored_at, author, seq LIMIT ?`,
+                [settled, after[0], after[0], after[1], after[1], after[2], limit],
+              );
+              for (const row of rows) {
+                if (ops.length >= SYNC_PAGE || bytes >= SYNC_PAGE_BYTES) break outer;
+                after = [String(row.stored_at), String(row.author), Number(row.seq)];
+                cursor = after.join("|");
+                if (from.has(String(row.author))) continue;
+                const op = served(row);
+                ops.push(op);
+                bytes += (op.sealed?.length ?? 0) + (op.wrapped_key?.length ?? 0);
+              }
+              if (rows.length < limit) break;
+            }
+            const rest = await sql.query(
+              `SELECT 1 AS one FROM harar_ops WHERE batch IS NULL AND stored_at <= ? AND (stored_at > ? OR (stored_at = ? AND (author > ? OR (author = ? AND seq > ?)))) LIMIT 1`,
+              [settled, after[0], after[0], after[1], after[1], after[2]],
+            );
+            more ||= rest.length > 0;
+          }
+          return { status: 200, body: discovering ? { ops, next, discover: cursor, more } : { ops, next, more } };
         },
       };
     }

@@ -66,12 +66,15 @@ impl Edge {
         m.sent(&ready, None);
     }
 
-    /// Serves everything after the member's cursor (`since`), as the edge does.
+    /// Serves what the edge would: each author in `since` after its cursor,
+    /// and through discovery every other author's ops (all of them each
+    /// time here: taking an op again is harmless, which is the point).
     pub(crate) fn pull(&self, m: &mut Member) {
         let since = m.since();
-        let mut ops: Vec<Served> = self.ops.iter().filter(|o| o.seq > since.get(&o.author).copied().unwrap_or(0)).cloned().collect();
+        let mut ops: Vec<Served> = self.ops.iter().filter(|o| since.get(&o.author).is_none_or(|s| o.seq > *s)).cloned().collect();
         ops.sort_by(|a, b| (&a.author, a.seq).cmp(&(&b.author, b.seq)));
         m.ingest(ops);
+        m.state.discover = format!("{}", self.ops.len());
         m.pull_complete = true;
         m.rebase();
     }
@@ -333,13 +336,17 @@ fn a_chain_that_breaks_is_refused_from_the_break_and_nothing_in_it_applies() {
     other.sealed = Some(served.wrapped_key.clone().unwrap());
     let key = a.edge.key().unwrap();
     let resign = |seq: u64, prev: &str| Served::from(&Op::sign(&op.author, seq, prev, op.kind, &op.key, op.version, op.sealed.clone(), op.wrapped_key.clone(), op.at, &|m| key.sign(m)).unwrap());
-    let cases: Vec<(&str, Served, &str)> = vec![
-        ("tampered ciphertext", other, "ciphertext is not what its hashes say"),
-        ("wrong prev", resign(op.seq, &"0".repeat(64)), "prev is not the hash"),
-        ("skips a seq", resign(op.seq + 1, &op.prev), "seq"),
-        ("hash lies", Served { hash: "f".repeat(64), ..served.clone() }, "hash is not the hash"),
+    // (what, the bad op, why it's refused, whether it breaks A's chain).
+    // An op that isn't even what its own hashes say is forged by whoever
+    // served it: refused and ignored, and A's real op behind it still counts.
+    // A well-formed op that doesn't link breaks the chain from there.
+    let cases: Vec<(&str, Served, &str, bool)> = vec![
+        ("tampered ciphertext", other, "ciphertext is not what its hashes say", false),
+        ("wrong prev", resign(op.seq, &"0".repeat(64)), "prev is not the hash", true),
+        ("skips a seq", resign(op.seq + 1, &op.prev), "seq", true),
+        ("hash lies", Served { hash: "f".repeat(64), ..served.clone() }, "hash is not the hash", false),
     ];
-    for (what, bad, reason) in cases {
+    for (what, bad, reason, breaks) in cases {
         let probe_dir = tempfile::tempdir().unwrap();
         let mut probe = member(probe_dir.path(), B, "laptop");
         probe.state = b.state.clone();
@@ -348,8 +355,13 @@ fn a_chain_that_breaks_is_refused_from_the_break_and_nothing_in_it_applies() {
         assert_eq!(probe.state.rejected.len(), before + 1, "{what}: rejected");
         let got = &probe.state.rejected.last().unwrap().reason;
         assert!(got.contains(reason), "{what}: rejected for {got:?}");
-        assert!(probe.state.pending.is_empty(), "{what}: nothing after the break is taken either");
-        assert_eq!(probe.state.next.get(A), b.state.next.get(A), "{what}: the cursor stays");
+        if breaks {
+            assert!(probe.state.pending.is_empty(), "{what}: nothing after the break is taken either");
+            assert_eq!(probe.state.next.get(A), b.state.next.get(A), "{what}: the cursor stays");
+        } else {
+            assert_eq!(probe.state.pending.len(), 1, "{what}: A's real op still counts");
+            assert_eq!(probe.state.next.get(A), Some(&op.seq), "{what}: the cursor moves past the real op");
+        }
     }
     // An op that links but isn't signed by the key the log gives A: forged,
     // and A's chain goes back to before it.
@@ -457,7 +469,7 @@ fn the_test_vectors_are_what_this_code_makes_and_they_follow_verify_and_open() {
     assert_eq!(log.head(), built["head"].as_str());
     let ring = [4u8; 32];
     for (v, op) in built["ops"].as_array().unwrap().iter().zip(&ops).skip(1) {
-        assert_eq!(log.counts(op, 0), Ok(()));
+        assert!(matches!(log.counts(op, 0, &authors), ledger::Verdict::Counts));
         let plain = super::crypto::open_value(&ring, &op.key, op.version, op.sealed.as_deref().unwrap(), op.wrapped_key.as_deref().unwrap()).unwrap();
         assert_eq!(serde_json::from_slice::<Value>(&plain).unwrap(), v["opens"]);
     }

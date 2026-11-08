@@ -794,6 +794,9 @@ for (const backend of backends) {
       const strangerM = member(stranger, env.clock);
       await mac.as("PUT", "/v1/sync", { ops: [await macM.op("put", "a", "1"), await macM.op("put", "b", "2")] });
       await stranger.as("PUT", "/v1/sync", { ops: [await strangerM.op("member.add", "x", null), await strangerM.op("put", "s", "1")] });
+      const fresh = await phone.as("POST", "/v1/sync", { since: { [mac.id]: 0 }, discover: "" });
+      assert.deepEqual(fresh.body.ops.filter((o: Row) => o.author === stranger.id), [], "discovery waits a few seconds, so a batch still committing is never passed over");
+      env.clock.ms += 10_000;
       const first = await phone.as("POST", "/v1/sync", { since: { [mac.id]: 0 }, discover: "" });
       assert.equal(first.status, 200);
       assert.equal(typeof first.body.discover, "string", "the edge hands back a discovery cursor");
@@ -802,6 +805,7 @@ for (const backend of backends) {
       const again = await phone.as("POST", "/v1/sync", { since: first.body.next, discover: first.body.discover });
       assert.deepEqual(again.body.ops, [], "nothing discovered twice");
       await stranger.as("PUT", "/v1/sync", { ops: [await strangerM.op("put", "t", "2")] });
+      env.clock.ms += 10_000;
       const later = await phone.as("POST", "/v1/sync", { since: first.body.next, discover: first.body.discover });
       assert.deepEqual(later.body.ops.map((o: Row) => [o.author, o.seq]), [[stranger.id, 3]]);
     });

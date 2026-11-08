@@ -58,6 +58,8 @@ pub(crate) enum SyncCommand {
     Trust { fingerprint: String },
     Approve { device: String, fingerprint: String },
     Transfer { device: String },
+    #[serde(rename = "reset-edge-view")]
+    ResetEdgeView,
     Remove { device: String },
 }
 
@@ -644,14 +646,14 @@ fn lock_vault(vault: &Mutex<Vault>) -> std::sync::MutexGuard<'_, Vault> {
 pub(crate) fn sync_cycle(vault: &Mutex<Vault>) -> Result<serde_json::Value> {
     use crate::sync::member::Member;
     let _one = CYCLE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let (edge, since) = {
+    let (edge, since, discover) = {
         let v = lock_vault(vault);
         let Some(member) = v.sync.as_ref() else { return Ok(serde_json::json!({ "on": false })) };
-        (member.edge.clone(), member.since())
+        (member.edge.clone(), member.since(), member.state.discover.clone())
     };
     // The network and every signature happen outside the vault's lock.
     let device = edge.key()?;
-    let pulled = Member::pull(&edge, &device, &since);
+    let pulled = Member::pull(&edge, &device, &since, &discover);
     let (unsigned, more) = {
         let mut v = lock_vault(vault);
         let Some(member) = v.sync.as_mut().filter(|m| m.edge.url == edge.url) else { return Ok(serde_json::json!({ "on": false })) };
@@ -664,6 +666,7 @@ pub(crate) fn sync_cycle(vault: &Mutex<Vault>) -> Result<serde_json::Value> {
             }
         };
         member.ingest(pulled.ops);
+        member.state.discover = pulled.discover;
         member.pull_complete = pulled.complete;
         if pulled.complete {
             member.rebase();
@@ -688,7 +691,7 @@ pub(crate) fn sync_cycle(vault: &Mutex<Vault>) -> Result<serde_json::Value> {
     let mut v = lock_vault(vault);
     // There was more to pull than one sync takes: another follows, but only
     // if this one moved the cursor on, and later each time it repeats.
-    let advanced = v.sync.as_ref().is_some_and(|m| m.since() != since);
+    let advanced = v.sync.as_ref().is_some_and(|m| m.since() != since || m.state.discover != discover);
     v.more_streak = if more && advanced { v.more_streak.saturating_add(1) } else { 0 };
     if v.more_streak > 0
         && let Some(wake) = v.wake.clone()
@@ -818,6 +821,23 @@ fn run_sync(vault: &Mutex<Vault>, command: SyncCommand) -> Result<serde_json::Va
             };
             sync_cycle(vault)?;
             Ok(approved)
+        }
+        SyncCommand::ResetEdgeView => {
+            sync_cycle(vault).ok();
+            let reset = {
+                let mut v = lock_vault(vault);
+                let member = v.sync.as_mut().ok_or_else(|| anyhow!("sync is off; harar edge sync on first"))?;
+                let reset = member.reset_edge_view()?;
+                member.save()?;
+                reset
+            };
+            let synced = sync_cycle(vault);
+            let mut status = sync_status(vault)?;
+            status["reset"] = reset;
+            if let Err(err) = synced {
+                status["error"] = json!(format!("{err:#}"));
+            }
+            Ok(status)
         }
         SyncCommand::Transfer { device } => {
             sync_cycle(vault)?;
