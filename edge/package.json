@@ -1,0 +1,17 @@
+{
+  "name": "harar-edge",
+  "private": true,
+  "description": "harar edge: the one-file API and its platform entry files (docs/edge.md). Never published; harar edge init writes it into your project.",
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "test": "node --test test/edge.test.ts",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@neondatabase/serverless": "1.2.0",
+    "@types/node": "24.19.2",
+    "postgres": "3.4.9",
+    "typescript": "7.0.2"
+  }
+}
