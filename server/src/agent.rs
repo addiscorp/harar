@@ -649,11 +649,12 @@ pub(crate) fn sync_cycle(vault: &Mutex<Vault>) -> Result<serde_json::Value> {
     let (edge, since, discover) = {
         let v = lock_vault(vault);
         let Some(member) = v.sync.as_ref() else { return Ok(serde_json::json!({ "on": false })) };
-        (member.edge.clone(), member.since(), member.state.discover.clone())
+        (member.edge.clone(), member.since(), member.discovery())
     };
     // The network and every signature happen outside the vault's lock.
     let device = edge.key()?;
-    let pulled = Member::pull(&edge, &device, &since, &discover);
+    let pulled = Member::pull(&edge, &device, &since, discover.as_deref());
+    let discover = discover.unwrap_or_default();
     let (unsigned, more) = {
         let mut v = lock_vault(vault);
         let Some(member) = v.sync.as_mut().filter(|m| m.edge.url == edge.url) else { return Ok(serde_json::json!({ "on": false })) };

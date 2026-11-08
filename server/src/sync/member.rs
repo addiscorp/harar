@@ -1182,14 +1182,29 @@ impl Member {
 
     // ------------------------------------------------------------ the edge
 
+    /// How the next pull reads the authors it doesn't follow: through the
+    /// discovery cursor once this member follows a ring; before that (it
+    /// is deciding whether to found one, or waits to join), everything with
+    /// no lag, so it never founds a second ring for missing an op stored a
+    /// moment ago.
+    pub(crate) fn discovery(&self) -> Option<String> {
+        self.log().head().is_some().then(|| self.state.discover.clone())
+    }
+
     /// The ops after the cursor, up to PULL_PAGES pages. Each page's `next`
-    /// must move the cursor on, or the edge is refused.
-    pub(crate) fn pull(edge: &Paired, device: &DeviceKey, since: &BTreeMap<String, u64>, discover: &str) -> Result<Pulled> {
+    /// must move the cursor on, or the edge is refused. Without `discover`
+    /// (`Member::discovery`), every author is read from `since` or 0, with
+    /// no lag.
+    pub(crate) fn pull(edge: &Paired, device: &DeviceKey, since: &BTreeMap<String, u64>, discovery: Option<&str>) -> Result<Pulled> {
         let mut since = since.clone();
-        let mut discover = discover.to_owned();
+        let mut discover = discovery.unwrap_or_default().to_owned();
         let mut ops = Vec::new();
         for _ in 0..PULL_PAGES {
-            let page = edge.call_with(device, "POST", "/v1/sync", Some(&json!({ "since": since, "discover": discover })))?;
+            let body = match discovery {
+                Some(_) => json!({ "since": since, "discover": discover }),
+                None => json!({ "since": since }),
+            };
+            let page = edge.call_with(device, "POST", "/v1/sync", Some(&body))?;
             let got: Vec<Served> = serde_json::from_value(page["ops"].clone()).context("the edge's ops")?;
             let next: BTreeMap<String, u64> = serde_json::from_value(page["next"].clone()).context("the edge's next")?;
             let found = page["discover"].as_str().unwrap_or(&discover).to_owned();

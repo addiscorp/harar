@@ -630,7 +630,10 @@ Every push is preceded by a pull. Ops that fail to go stay queued
   edge is refused. `since` names this device and the log's members (a
   removed one only until its cursor reaches its cut); every other device
   comes through discovery (section 5a), so the edge sends nothing twice and
-  a pull's size doesn't grow with the devices that ever asked.
+  a pull's size doesn't grow with the devices that ever asked. A device that
+  follows no ring yet (deciding whether to found one, or waiting to join)
+  pulls without discovery, everything with no lag, so it never founds a
+  second ring for missing a `found` stored a moment ago.
 - **Seqs are never reused.** A member keeps the highest seq it ever wrote
   and never writes at or below it. If the edge shows ops of this device
   past that, or another op at a seq it has queued, its state file was

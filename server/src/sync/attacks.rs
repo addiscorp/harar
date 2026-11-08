@@ -626,7 +626,7 @@ fn a_pull_that_never_moves_on_is_refused() {
     let mut m = member(dir.path(), A, "mac");
     m.edge.url = url;
     let device = m.edge.key().unwrap();
-    let err = Member::pull(&m.edge, &device, &Default::default(), "").err().expect("refused");
+    let err = Member::pull(&m.edge, &device, &Default::default(), Some("")).err().expect("refused");
     assert!(format!("{err:#}").contains("doesn't move the cursor"), "{err:#}");
 }
 
