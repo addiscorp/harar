@@ -20,6 +20,7 @@ base64 = "0.22"
 clap = { version = "4.5", features = ["derive", "env"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 harar = { workspace = true }
+hkdf = "0.12"
 hmac = "0.12"
 libc = "0.2"
 p256 = { version = "0.13", features = ["ecdh", "ecdsa", "std"] }

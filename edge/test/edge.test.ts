@@ -2,7 +2,7 @@
 // HARAR_TEST_POSTGRES names one), real P-256 device keys and a stand-in log
 // sink: every test asserts what a caller or the database would see.
 import assert from "node:assert/strict";
-import { createCipheriv, createDecipheriv, createHash, createHmac, webcrypto } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, createHmac, hkdfSync, webcrypto } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { after, describe, test } from "node:test";
@@ -829,6 +829,9 @@ for (const backend of backends) {
       const jwk = { kty: "EC", crv: "P-256", x: pub.subarray(1, 33).toString("base64url"), y: pub.subarray(33).toString("base64url"), d: v.device.sign_d };
       const keys = { privateKey: await webcrypto.subtle.importKey("jwk", jwk, curve, false, ["sign"]), publicKey: await webcrypto.subtle.importKey("raw", pub, curve, true, ["verify"]) };
       const ring = Buffer.from(v.ring, "base64url");
+      // The ring's subkeys (docs/edge.md §5b): names, and the wrap of data keys.
+      const subkey = (info: string) => Buffer.from(hkdfSync("sha256", ring, "harar-ring-v1", info, 32));
+      const [nameKey, wrapKey] = [subkey("harar-ring-name"), subkey("harar-ring-wrap")];
 
       // Read the way this file reads docs/edge.md, not the way harar does.
       for (const [i, { op, canonical, hash, opens }] of v.ops.entries()) {
@@ -838,8 +841,9 @@ for (const backend of backends) {
         const sig = Buffer.from(op.sig, "base64url");
         assert.ok(await webcrypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, keys.publicKey, sig, new TextEncoder().encode(canonical)), `op ${op.seq}'s signature`);
         if (opens) {
-          assert.deepEqual(open(op, ring), opens, `op ${op.seq} opens with the ring key`);
-          assert.equal(createHmac("sha256", ring).update(opens.path).digest("base64url"), op.key, `op ${op.seq}'s key is the HMAC of its path`);
+          assert.deepEqual(open(op, wrapKey), opens, `op ${op.seq} opens with the ring's wrap subkey`);
+          assert.throws(() => open(op, ring), `op ${op.seq}'s data key isn't wrapped by the bare ring key`);
+          assert.equal(createHmac("sha256", nameKey).update(opens.path).digest("base64url"), op.key, `op ${op.seq}'s key is the HMAC of its path under the name subkey`);
         }
       }
 

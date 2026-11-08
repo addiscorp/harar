@@ -866,6 +866,7 @@ dependencies = [
  "core-foundation-sys",
  "ed25519-dalek",
  "harar",
+ "hkdf",
  "hmac 0.12.1",
  "libc",
  "p256",

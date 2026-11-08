@@ -94,13 +94,17 @@ b_id="$(field "$asked" device)"
 if out="$(as b get --socket "$work/b/s" "$path" 2>&1)"; then echo "B has A's secret before approval: $out"; exit 1; fi
 status="$(sync_ a now)"
 expect "$status" requests.0.device "$b_id"
-expect "$status" requests.0.fingerprint "$(field "$asked" fingerprint)"
-expect "$(sync_ a approve "$b_id")" approved "$b_id"
-expect "$(sync_ b now)" role member
+b_fp="$(field "$asked" fingerprint)"
+expect "$status" requests.0.fingerprint "$b_fp"
+if out="$(sync_ a approve "$b_id" 0000-0000-0000-0000-0000-0000-0000-0000 2>&1)"; then echo "approve took a wrong fingerprint: $out"; exit 1; fi
+expect "$(sync_ a approve "$b_id" "$b_fp")" approved "$b_id"
+# Approved, but B takes no grant until the person pins the ring there.
+expect "$(sync_ b now)" role requested
+expect "$(sync_ b trust "$(field "$on" ring)")" role member
 [ "$(get b "$path")" = "$first" ] || { echo "B didn't get A's secret"; exit 1; }
 sync_ a now >/dev/null
 [ "$(get a only/on/b)" = "b-own-plaintext" ] || { echo "A didn't get B's own secret"; exit 1; }
-echo "ok  B asks to join, A approves, and each gets the other's secrets"
+echo "ok  B asks to join, A approves it by fingerprint, B pins the ring, and each gets the other's secrets"
 
 # The edge goes down; both write the same secret, B a second later.
 { kill "$server" && wait "$server"; } 2>/dev/null || true
@@ -148,6 +152,13 @@ for m in a b; do
   done
 done
 echo "ok  the edge's database and the members' sync state hold no path and no value"
+
+# A machine that doesn't sync can't unpair a ring member: it couldn't rekey.
+sync_ b off >/dev/null
+if out="$(as b edge unpair "$a_id" --socket "$work/b/s" 2>&1)"; then echo "a machine with sync off unpaired a ring member: $out"; exit 1; fi
+case "$out" in *"doesn't sync"*) ;; *) echo "unpair refused for the wrong reason: $out"; exit 1 ;; esac
+expect "$(sync_ b on)" role member
+echo "ok  a machine that doesn't sync refuses to unpair a ring member"
 
 # Unpairing B removes it from the ring and rekeys; A writes on with the new key.
 unpaired="$(as a edge unpair "$b_id" --socket "$work/a/s")"

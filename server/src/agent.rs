@@ -55,7 +55,8 @@ pub(crate) enum SyncCommand {
     Off,
     Status,
     Now,
-    Approve { device: String },
+    Trust { fingerprint: String },
+    Approve { device: String, fingerprint: String },
     Remove { device: String },
 }
 
@@ -638,36 +639,51 @@ pub(crate) fn sync_cycle(vault: &Mutex<Vault>) -> Result<serde_json::Value> {
         let Some(member) = v.sync.as_ref() else { return Ok(serde_json::json!({ "on": false })) };
         (member.edge.clone(), member.state.next.clone())
     };
+    // The network and every signature happen outside the vault's lock.
     let device = edge.key()?;
     let pulled = Member::pull(&edge, &device, &since);
-    let outbox = {
+    let (unsigned, more) = {
         let mut v = lock_vault(vault);
         let Some(member) = v.sync.as_mut().filter(|m| m.edge.url == edge.url) else { return Ok(serde_json::json!({ "on": false })) };
-        let ops = match pulled {
-            Ok(ops) => ops,
+        let pulled = match pulled {
+            Ok(pulled) => pulled,
             Err(err) => {
                 member.state.last_error = Some(format!("pull: {err:#}"));
                 member.save()?;
                 return Err(err.context("pull"));
             }
         };
-        member.ingest(ops);
+        member.ingest(pulled.ops);
+        if pulled.complete {
+            member.rebase();
+        }
         member.found_or_request()?;
         if v.unlocked.is_some() {
             v.sync_step()?;
         }
         let member = v.sync.as_mut().expect("still syncing");
         member.save()?;
-        member.state.outbox.clone()
+        (member.unsigned(), !pulled.complete)
     };
-    let (sent, pushed) = Member::push(&edge, &device, &outbox);
+    let signed = Member::sign(&device, unsigned)?;
+    let ready = {
+        let mut v = lock_vault(vault);
+        let Some(member) = v.sync.as_mut().filter(|m| m.edge.url == edge.url) else { return Ok(serde_json::json!({ "on": false })) };
+        member.signed(signed);
+        member.save()?;
+        member.ready()
+    };
+    let (sent, pushed) = Member::push(&edge, &device, &ready);
     let mut v = lock_vault(vault);
+    if more && let Some(wake) = &v.wake {
+        // There was more to pull than one sync takes: another follows.
+        let _ = wake.send(());
+    }
     let Some(member) = v.sync.as_mut().filter(|m| m.edge.url == edge.url) else { return Ok(serde_json::json!({ "on": false })) };
-    member.sent(&outbox[..sent]);
-    member.state.last_error = pushed.as_ref().err().map(|err| format!("push: {err:#}"));
+    member.sent(&ready[..sent], pushed.as_ref().err());
     member.save()?;
     pushed.context("push")?;
-    Ok(serde_json::json!({ "pushed": sent, "queued": member.state.outbox.len(), "waiting": member.state.pending.len() }))
+    Ok(serde_json::json!({ "pushed": sent, "queued": member.state.outbox.len(), "waiting": member.state.pending.len(), "more": more }))
 }
 
 /// `harar edge sync …`, for the owner, with the terminal approved as for
@@ -755,12 +771,28 @@ fn run_sync(vault: &Mutex<Vault>, command: SyncCommand) -> Result<serde_json::Va
             status["synced"] = synced;
             Ok(status)
         }
-        SyncCommand::Approve { device } => {
+        SyncCommand::Trust { fingerprint } => {
+            let trusted = {
+                let mut v = lock_vault(vault);
+                let member = v.sync.as_mut().ok_or_else(|| anyhow!("sync is off; harar edge sync on first"))?;
+                let trusted = member.trust(&fingerprint)?;
+                member.save()?;
+                trusted
+            };
+            let synced = sync_cycle(vault);
+            let mut status = sync_status(vault)?;
+            status["trusted"] = trusted["trusted"].clone();
+            if let Err(err) = synced {
+                status["error"] = json!(format!("{err:#}"));
+            }
+            Ok(status)
+        }
+        SyncCommand::Approve { device, fingerprint } => {
             sync_cycle(vault)?;
             let approved = {
                 let mut v = lock_vault(vault);
                 let member = v.sync.as_mut().ok_or_else(|| anyhow!("sync is off; harar edge sync on first"))?;
-                let approved = member.approve(&device)?;
+                let approved = member.approve(&device, &fingerprint)?;
                 member.save()?;
                 approved
             };

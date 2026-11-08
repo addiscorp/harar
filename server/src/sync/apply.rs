@@ -15,6 +15,10 @@ pub(crate) const META_KEY: &str = "harar:sync";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct VaultMeta {
+    /// The founder of the ring `paths` belong to. Joining another ring
+    /// starts `paths` over.
+    #[serde(default)]
+    pub ring: Option<String>,
     /// Each synced path's current op.
     #[serde(default)]
     pub paths: BTreeMap<String, PathMeta>,
@@ -138,6 +142,17 @@ impl VaultMeta {
         out
     }
 
+    /// This member's queued ops were signed again with new seqs (the chain
+    /// diverged): their hashes, old to new.
+    pub(crate) fn rename(&mut self, renamed: &BTreeMap<String, String>) {
+        for m in self.paths.values_mut() {
+            if let Some(new) = renamed.get(&m.hash) {
+                m.hash = new.clone();
+            }
+            m.known = m.known.iter().map(|h| renamed.get(h).unwrap_or(h).clone()).collect();
+        }
+    }
+
     /// Records this member's own op for a change it made.
     pub(crate) fn record_own(&mut self, change: &Change, hash: &str, rank: Rank) {
         let known = self.paths.remove(&change.path).map(|mut m| {
@@ -184,9 +199,13 @@ impl VaultMeta {
             return false;
         }
         let current = self.paths.get(&op.path).cloned();
+        // The value is always the highest-ranked op seen: a successor
+        // replaces the op it names only when it also ranks higher (writers
+        // make sure it does); otherwise it is judged as concurrent. So the
+        // end is the same whatever order ops arrive in.
         let wins = match &current {
             None => true,
-            Some(cur) if cur.hash == op.base => true,
+            Some(cur) if cur.hash == op.base && op.rank > cur.rank => true,
             Some(cur) => {
                 let wins = op.rank > cur.rank;
                 let (kept, lost) = if wins { ((&op.rank, op.version), (&cur.rank, cur.version)) } else { ((&cur.rank, cur.version), (&op.rank, op.version)) };
@@ -256,16 +275,23 @@ mod tests {
     }
 
     #[test]
-    fn a_successor_replaces_without_a_conflict_in_any_order() {
+    fn a_successor_replaces_without_a_conflict_in_any_order_and_one_that_ranks_lower_is_concurrent() {
         let a1 = write("h1", "", rank(100, "d-a", 1), 1, "p", Some("one"));
-        let a2 = write("h2", "h1", rank(50, "d-b", 1), 2, "p", Some("two"));
+        let a2 = write("h2", "h1", rank(101, "d-b", 1), 2, "p", Some("two"));
         for batch in [vec![a1.clone(), a2.clone()], vec![a2.clone(), a1.clone()]] {
             let (mut meta, mut keys) = (VaultMeta::default(), HashMap::new());
             meta.apply(&mut keys, batch);
-            assert_eq!(keys["p"], "two", "the successor wins though its clock is behind");
+            assert_eq!(keys["p"], "two");
             assert!(meta.conflicts.is_empty());
             assert_eq!(meta.paths["p"].version, 2);
         }
+        // A writer never stamps a successor below what it replaces; one that
+        // does (a wrong clock, or worse) doesn't get to win by it.
+        let behind = write("h3", "h1", rank(50, "d-b", 1), 2, "p", Some("behind"));
+        let (mut meta, mut keys) = (VaultMeta::default(), HashMap::new());
+        meta.apply(&mut keys, vec![a1, behind]);
+        assert_eq!(keys["p"], "one");
+        assert_eq!(meta.conflicts.len(), 1);
     }
 
     #[test]
@@ -319,6 +345,7 @@ mod tests {
         assert_eq!(meta.apply(&mut keys, vec![put.clone()]).len(), 1);
         assert!(meta.apply(&mut keys, vec![put]).is_empty());
         meta.apply(&mut keys, vec![write("h2", "h1", rank(2, "d-a", 2), 2, "p", None)]);
+        assert!(meta.conflicts.is_empty(), "a successor that ranks higher is no conflict");
         assert!(!keys.contains_key("p"));
         assert!(meta.paths["p"].deleted);
         assert!(meta.changes(&keys).is_empty(), "a delete applied is not a change to send");

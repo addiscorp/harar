@@ -95,7 +95,9 @@ impl Op {
         sha256_hex(self.canonical())
     }
 
-    /// Signs the op's fields with the author's device key (raw r || s).
+    /// Signs the op's fields with the author's device key (raw r || s), in
+    /// one go: for tests (members write ops unsigned and sign them later).
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments, reason = "one argument per op field, in the edge's order")]
     pub(crate) fn sign(
         author: &str,

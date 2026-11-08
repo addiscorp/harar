@@ -92,8 +92,20 @@ enum SyncCmd {
     Status(AgentArg),
     /// Pull, apply and push now.
     Now(AgentArg),
+    /// Pin the ring to join, by the fingerprint `status` shows on any member.
+    /// No grant is taken, and nothing sealed, before this.
+    Trust(SyncTrust),
     /// Add a device that asked to join: the ring key, wrapped to its key.
+    /// Refused unless the fingerprint is the one `status` shows on it.
     Approve(SyncApprove),
+}
+
+#[derive(Debug, Args)]
+struct SyncTrust {
+    /// The ring's fingerprint (32 hex, dashes optional).
+    fingerprint: String,
+    #[command(flatten)]
+    agent: AgentArg,
 }
 
 #[derive(Debug, Args)]
@@ -115,6 +127,8 @@ struct SyncOn {
 struct SyncApprove {
     /// The device id (d-…), from `harar edge sync status`.
     device: String,
+    /// Its fingerprint, as `harar edge sync status` shows it on that device.
+    fingerprint: String,
     #[command(flatten)]
     agent: AgentArg,
 }
@@ -175,6 +189,10 @@ struct Unpair {
     /// from the ring first.
     #[command(flatten)]
     agent: AgentArg,
+    /// Unpair a member of the ring from a machine that doesn't sync, without
+    /// removing it from the ring: it keeps reading what is written after.
+    #[arg(long)]
+    force_no_rekey: bool,
 }
 
 #[derive(Debug, Args)]
@@ -281,11 +299,29 @@ fn run_blocking(cmd: Edge) -> Result<()> {
                 SyncCmd::Off(a) => (a.socket, SyncCommand::Off),
                 SyncCmd::Status(a) => (a.socket, SyncCommand::Status),
                 SyncCmd::Now(a) => (a.socket, SyncCommand::Now),
-                SyncCmd::Approve(c) => (c.agent.socket, SyncCommand::Approve { device: c.device }),
+                SyncCmd::Trust(c) => (c.agent.socket, SyncCommand::Trust { fingerprint: c.fingerprint }),
+                SyncCmd::Approve(c) => (c.agent.socket, SyncCommand::Approve { device: c.device, fingerprint: c.fingerprint }),
             };
             super::agent::send(&socket, &AgentRequest::Sync(command))
         }
     }
+}
+
+/// Whether `device` has written any sync op on the edge: asks for its ops
+/// alone, by putting every other paired device's cursor at the end.
+fn ring_participant(edge: &Paired, device: &str) -> Result<bool> {
+    let devices = edge.call("GET", "/v1/devices", None)?;
+    let since: serde_json::Map<String, Value> = devices["devices"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|d| d["id"].as_str())
+        .filter(|id| *id != device)
+        .take(99)
+        .map(|id| (id.to_owned(), json!(i32::MAX)))
+        .collect();
+    let page = edge.call("POST", "/v1/sync", Some(&json!({ "since": since })))?;
+    Ok(page["ops"].as_array().is_some_and(|ops| ops.iter().any(|op| op["author"] == device)))
 }
 
 /// Unpairs a device. When this vault syncs through the edge and the device
@@ -302,9 +338,24 @@ fn unpair(cmd: Unpair) -> Result<()> {
         }
         Some(answer)
     } else {
+        if cmd.device != edge.device && ring_participant(&edge, &cmd.device)? {
+            if !cmd.force_no_rekey {
+                bail!(
+                    "{} has ops in the ring this edge syncs, and this machine doesn't sync with it, so it can't remove the device from the ring or rekey. Unpair it from a machine that does (harar edge sync status there says member), so it reads nothing written after; or pass --force-no-rekey to unpair it here and leave it the ring key",
+                    cmd.device
+                );
+            }
+            eprintln!(
+                "WARNING: unpairing {} without removing it from the ring: it still holds the ring key and can read everything written from now on if it gets the ops. Remove it from a syncing member (which rekeys) as soon as you can.",
+                cmd.device
+            );
+        }
         None
     };
     let mut answer = edge.call("DELETE", &format!("/v1/devices/{}", cmd.device), None)?;
+    if cmd.force_no_rekey {
+        answer["warning"] = json!("removed from the edge but not from the ring: it keeps the ring key");
+    }
     if let Some(ring) = ring {
         answer["ring"] = ring;
     }

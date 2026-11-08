@@ -1,44 +1,46 @@
 {
-  "about": "A ring member's chain, made by server/src/sync (Rust) from fixed keys and IVs. Both harar's tests and the edge's read it: the canonical encoding, hashes, signatures and seals must agree (docs/edge.md §5a, §5b). Test keys only.",
+  "about": "A ring member's chain, made by server/src/sync (Rust) from fixed keys and IVs. Both harar's tests and the edge's read it: the canonical encoding, hashes, signatures and seals must agree (docs/edge.md §5a, §5b). The ring's subkeys are HKDF-SHA256(salt harar-ring-v1, info harar-ring-name | harar-ring-member | harar-ring-wrap). Test keys only.",
   "device": {
     "agree_d": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI",
     "agree_pub": "BFUPRxAD89-Xw99QaseX9nIfsaH7e49vg9IkSYplyI4kE2CT1wEuUJpzcVy9CwCjzA_0tcAbP_oZarH7MnA2uOY",
+    "fingerprint": "9b3f-3f32-7fcd-7a5e-d36a-0f58-32a9-19bd",
     "id": "d-0123456789abcdef",
+    "ring_fingerprint": "2bc5-21d4-9883-516d-fa15-ebcc-f8ad-52c9",
     "sign_d": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
     "sign_pub": "BG_wO5SSQc4drdQ1GeaWDgqFtBppoFwygQOqK84VlMoWPE91OlW_AdxT9sCwx-7ni0DG_30lqW4igrmJzvccFEo"
   },
   "ops": [
     {
-      "canonical": "harar-op-v1\nd-0123456789abcdef\n1\n\nmember.add\nLGFqBYLLQmlE5be97GXkLro84vui9XKxfyN8vdqBIZo\n0\n9d88c6c921a7a4ca511b47c275dd06fe3972e9e731a702452bbf6b6a5e64c86d\n43933b0a1eaf36b276739ef7fb6d05e7468254898d7461bdca9cd2aeede0f58f\n1762603200000",
-      "hash": "bb674eb07b703242ac558afd062bda6d97de745e01fccbe7a9ce17a2adebdb33",
+      "canonical": "harar-op-v1\nd-0123456789abcdef\n1\n\nmember.add\nATcl1V1gSry4fgSmCW-6Ss7Lv5gYf45RAURM7hnitzk\n0\n9d88c6c921a7a4ca511b47c275dd06fe3972e9e731a702452bbf6b6a5e64c86d\nb9a10d9f2833cc2052a80e4b1da8d4b8b70c19588b1de9efe0b5db419dcc19af\n1762603200000",
+      "hash": "3571b6304e382ce8d3e4bbc1ce318b7f0254740e587766d1a6ab2f5e827e0c4f",
       "op": {
         "at": 1762603200000,
         "author": "d-0123456789abcdef",
-        "key": "LGFqBYLLQmlE5be97GXkLro84vui9XKxfyN8vdqBIZo",
+        "key": "ATcl1V1gSry4fgSmCW-6Ss7Lv5gYf45RAURM7hnitzk",
         "kind": "member.add",
         "prev": "",
         "sealed": "eyJkZXZpY2UiOiJkLTAxMjM0NTY3ODlhYmNkZWYiLCJuYW1lIjoidmVjdG9yIiwic2lnbl9wdWIiOiJCR193TzVTU1FjNGRyZFExR2VhV0RncUZ0QnBwb0Z3eWdRT3FLODRWbE1vV1BFOTFPbFdfQWR4VDlzQ3d4LTduaTBER18zMGxxVzRpZ3JtSnp2Y2NGRW8iLCJhZ3JlZV9wdWIiOiJCRlVQUnhBRDg5LVh3OTlRYXNlWDluSWZzYUg3ZTQ5dmc5SWtTWXBseUk0a0UyQ1Qxd0V1VUpwemNWeTlDd0NqekFfMHRjQWJQX29aYXJIN01uQTJ1T1kiLCJlcG9jaCI6MH0",
         "seq": 1,
-        "sig": "otH7jerctdRWa-WBcfJg0vNnqAre_G9dKbrHcKLr51kE2jafxJocemHYgJc243Ooi8xCbpv5yFNU45G9ryrQ2A",
+        "sig": "deqc430g0d0xsbV4rXuTJA1z7MX8DtpgQ4lPLnAf8Rf2vP5bZyRmp2JgKupPfi2CilQyq5DkRn9QE4NuGz6ATA",
         "version": 0,
-        "wrapped_key": "BFkat3HrvP1tnLkJTRBlKK3Rpp1EwsH2J_CJ7Fi5xhrfn05qvw0EXAxpOjxorXyXynK-ZN70om_s0mPdmKkngPCjbjLcGAKzDBIg-UbAFYCfl_2M6I40jxLiVdX5bf2dUvgXJEZtwb6Dg9OMyS_1uEo"
+        "wrapped_key": "BFkat3HrvP1tnLkJTRBlKK3Rpp1EwsH2J_CJ7Fi5xhrfn05qvw0EXAxpOjxorXyXynK-ZN70om_s0mPdmKkngPDPC0S5bivFYXhD0DW2cPS25ciC7Iowi3LLYeDPWs2sYAPIn4DdmEdKFQ-AiCkMjrXI71YoAwnd6UmGOB_cFWujYSqxnn3sN3tloteUDqzwu6dKDNWHp2ANVWM"
       },
       "opens": null
     },
     {
-      "canonical": "harar-op-v1\nd-0123456789abcdef\n2\nbb674eb07b703242ac558afd062bda6d97de745e01fccbe7a9ce17a2adebdb33\nput\n4H9tJz1JnutVZJ8EYtS1C1aLM3-kRpntmDKDYk2Wpz8\n1\n286b042d9ee349467afdc30dd098bc1902864f5c9d52a5df1394d5ff6f1d57e0\nd11dbeeb48ce91aa13a09c5af41fefef99025c52bd8e167134c79f6de270b429\n1762603201000",
-      "hash": "9160f865f9fad48a53ff63f47fa6613f93d0ad18b872f383bbe2366c7204a847",
+      "canonical": "harar-op-v1\nd-0123456789abcdef\n2\n3571b6304e382ce8d3e4bbc1ce318b7f0254740e587766d1a6ab2f5e827e0c4f\nput\nKAM2Wq_n5_s1sH3GxDK_5pp8QjwF_T3V6TSHW-k3MiM\n1\nbdaac78f3d0fe23926c1c089addccc6cff00f93440b63531ff5b902c33a6e778\n18f63911ed8c2644116ba365ae4627acdeec73044d6d7642e4923bf281b56087\n1762603201000",
+      "hash": "ce01173b47e9e335547cf07f9cf94adea94e4cc5a4248efe7c6c85c7793ede24",
       "op": {
         "at": 1762603201000,
         "author": "d-0123456789abcdef",
-        "key": "4H9tJz1JnutVZJ8EYtS1C1aLM3-kRpntmDKDYk2Wpz8",
+        "key": "KAM2Wq_n5_s1sH3GxDK_5pp8QjwF_T3V6TSHW-k3MiM",
         "kind": "put",
-        "prev": "bb674eb07b703242ac558afd062bda6d97de745e01fccbe7a9ce17a2adebdb33",
-        "sealed": "BQUFBQUFBQUFBQUFCHJQujmSx8h5G8x0ZT_5hRHxTWEl2HVJleEIaTnQqSn9tTgW7FKn52GjkwESsd-9Ve9D90gkjAN_n0qLhePqn82_DgbFP6bdleVZSjXf-7XOEA",
+        "prev": "3571b6304e382ce8d3e4bbc1ce318b7f0254740e587766d1a6ab2f5e827e0c4f",
+        "sealed": "BQUFBQUFBQUFBQUFCHJQujmSx8h5G8x0ZT_5hRHxTWEl2HVJleEIaTnQqSn9tTgW7FKn52GjkwESsd-9Ve9D90gkjAN_n0qLhePqn82_eYcf5NZw7OsNnGF2I8J7ew",
         "seq": 2,
-        "sig": "86ws2-B0oM_nzXkvYv6VCrypU1OR7cLUlTEk6IKIN55sw8JgyD0Lk169Q16ixcJQJakMEDEqYWnJPmY5Xduh_A",
+        "sig": "oBHMq5Js06uzK64H8AM8ZDyIjeVqdMguYkdQDCTxdmta1floDHYpHfd8lxhJaZQI-W4ADFB7Ir690iU-o0wfLQ",
         "version": 1,
-        "wrapped_key": "Dw8PDw8PDw8PDw8Pi3ysikT1V0aJhyhcGTt2LSAJ3cEPrA47Ctvpb0qaem__qC_Xt83fBZI0euwhDdja"
+        "wrapped_key": "Dw8PDw8PDw8PDw8PuJyPLOKR7b90Og14lpWkIyS1_T0I1KRIRcwQpPOmy9Pe__0RqopXVoV7kIwWzi0O"
       },
       "opens": {
         "base": "",
@@ -47,43 +49,43 @@
       }
     },
     {
-      "canonical": "harar-op-v1\nd-0123456789abcdef\n3\n9160f865f9fad48a53ff63f47fa6613f93d0ad18b872f383bbe2366c7204a847\nrotate\n4H9tJz1JnutVZJ8EYtS1C1aLM3-kRpntmDKDYk2Wpz8\n2\nd20d3c065495eea51f23a93575e3e4523f7a7745e116e393cb5ec42892e32ca2\n64146a9ca53fa87940ffae12c22bd5e9c43a40ae2e955b4d12411f93ad0a977c\n1762603202000",
-      "hash": "97047e8cd21a58c01919ad8710f144ce7eec05e85acade603ec0614c2fded2f9",
+      "canonical": "harar-op-v1\nd-0123456789abcdef\n3\nce01173b47e9e335547cf07f9cf94adea94e4cc5a4248efe7c6c85c7793ede24\nrotate\nKAM2Wq_n5_s1sH3GxDK_5pp8QjwF_T3V6TSHW-k3MiM\n2\n709cdb0a9d01b8bf3254642fdb720ff5fd09db64f72c0f7f5b08b8bafa52578f\n203a8d8fb838ea89e098e9a35933fc8b8a4ae058488ab65587dac3899cd0a6a8\n1762603202000",
+      "hash": "e655035a274847164b2546d9c389c4d87589684b3d6b3f0e7262f4c3e95b17fb",
       "op": {
         "at": 1762603202000,
         "author": "d-0123456789abcdef",
-        "key": "4H9tJz1JnutVZJ8EYtS1C1aLM3-kRpntmDKDYk2Wpz8",
+        "key": "KAM2Wq_n5_s1sH3GxDK_5pp8QjwF_T3V6TSHW-k3MiM",
         "kind": "rotate",
-        "prev": "9160f865f9fad48a53ff63f47fa6613f93d0ad18b872f383bbe2366c7204a847",
-        "sealed": "BgYGBgYGBgYGBgYG2Pd4kXQE5UucREQSVolaPBCanXO6AprtjScCJtXE4x4axq6mj0Lbz2s9cvDz_YR5S2-UYFZyTAYHbIALgajkQ7U-v3Y6Nx3bakcS3JhhFiJlNGOkU32uaxG9QhKlLniTEB21coAYCgfnameMG3Qt2CMSUFR47FR4S3NrOGpOgMBY27OYG2pKGgSbSrhFF0BNlMxt",
+        "prev": "ce01173b47e9e335547cf07f9cf94adea94e4cc5a4248efe7c6c85c7793ede24",
+        "sealed": "BgYGBgYGBgYGBgYG2Pd4kXQE5UucREQSVolaPBCanXO6AprtjScCJtXE4x4axq6mj0Lbz2s9cvDz_YR5S2-UYFZyTAYHbIALgajkQ7Vk63A7YBLePRUc38BgESkxNGT1Vi2tOkOzRxWqLCjEE0W_ItVNDVXqaWuJHSp7hnVHUQcp51ctH3NgOztL3cZb27NC_D1mCxB7GyJqDGbkAeu_",
         "seq": 3,
-        "sig": "JmVatNiOgg1C306GUWaZwxmF4lrL77BNKwco16q3VuB_GH3x-3A0Y9v9b4toCN556H1weE3KCfqLQQjgNvDCuw",
+        "sig": "P6eitmQW8zsAah0sBpSwUQ2RNhV65joyn9T3nDi_S5fsCLh2WiuunnbwMVO-wzFmzQx7dt3MeRJ9NtMloZjFKg",
         "version": 2,
-        "wrapped_key": "EBAQEBAQEBAQEBAQwqWQhOU5wkubO70zPpKq4LB1SOtGzzpAiO-4aoja8EUK-vvRLLqUoZM6KThjLH5o"
+        "wrapped_key": "EBAQEBAQEBAQEBAQORX4UQtNyTW84DNepblmQL7DoBQQHcCeYYsakvUeF4_NbC12VxSykjqaKujK5YC6"
       },
       "opens": {
-        "base": "9160f865f9fad48a53ff63f47fa6613f93d0ad18b872f383bbe2366c7204a847",
+        "base": "ce01173b47e9e335547cf07f9cf94adea94e4cc5a4248efe7c6c85c7793ede24",
         "path": "prod/shop/STRIPE_KEY",
         "value": "sk_live_rotated"
       }
     },
     {
-      "canonical": "harar-op-v1\nd-0123456789abcdef\n4\n97047e8cd21a58c01919ad8710f144ce7eec05e85acade603ec0614c2fded2f9\ndelete\n4H9tJz1JnutVZJ8EYtS1C1aLM3-kRpntmDKDYk2Wpz8\n3\n4a64ac8740baf22e33b1bd788c5f0b413aa6f3fd454de4ef5a89c1aff571f83a\nb43fbcc661a31722eeb2c5d873c4ca1e72ab2430c5a573f42dc7941011307a37\n1762603203000",
-      "hash": "681ebabb20ac29025ab3efda3ebdfb5925e49fc229ae2c4a5cbc00c8bba25b8b",
+      "canonical": "harar-op-v1\nd-0123456789abcdef\n4\ne655035a274847164b2546d9c389c4d87589684b3d6b3f0e7262f4c3e95b17fb\ndelete\nKAM2Wq_n5_s1sH3GxDK_5pp8QjwF_T3V6TSHW-k3MiM\n3\nf8413b7d300adb2d9b5c53246051b0cce014848eda986bf52049973d8c724a53\n1203bb74c3f1f0bcf954c278df48f89d7687ee709dfa3331b1e198e4bf8d6407\n1762603203000",
+      "hash": "b3a1fbb90438f74b3639bb6d785c1c2bfa771a28cdf26ff40dcdc91d84a03ef5",
       "op": {
         "at": 1762603203000,
         "author": "d-0123456789abcdef",
-        "key": "4H9tJz1JnutVZJ8EYtS1C1aLM3-kRpntmDKDYk2Wpz8",
+        "key": "KAM2Wq_n5_s1sH3GxDK_5pp8QjwF_T3V6TSHW-k3MiM",
         "kind": "delete",
-        "prev": "97047e8cd21a58c01919ad8710f144ce7eec05e85acade603ec0614c2fded2f9",
-        "sealed": "BwcHBwcHBwcHBwcHtbk6XnKOnV9umfNVW_bVHCPVqEOtLC0xK95eutDKPfyK07qSN_P6XNLSqd5yeG7B8EMSLxLAsCrpYFQVwqTrMuZvGUdE_Ll1bvaxrveOmzLsDGMKPXIQfpz1jQhW2i05sodyBt-d5E5WF_Q4TxS0hbAbUEX08AGQzsWuJvjXM1Mvf_mfb8g",
+        "prev": "e655035a274847164b2546d9c389c4d87589684b3d6b3f0e7262f4c3e95b17fb",
+        "sealed": "BwcHBwcHBwcHBwcHtbk6XnKOnV9umfNVW_bVHCPVqEOtLC0xK95eutDKPfyK07qSN_P6XNLSqd5yeG7B8EMSL07BtSvuNlkXlKHua-dgS0FBp7p5O6TtoKWNxTq7DGRXPSJNJJr43FJQ33g65YR0U9vKsUwGEqNoGEvlguUeUB708Cod1wfhDoKPhL4rW4Oynf0",
         "seq": 4,
-        "sig": "Ezx3g0HAgo_9gYNnu6pw9cgvtsUCSYc--4LDuJ_X5K6rRuc6jzR2slrHkxO8BdirUe2jj4cFuOwQH7l1b6gl3w",
+        "sig": "1ZMBGGgl_urcsvz9sFTN5mMUpbqm_fdSRG4ETN7lUuB68o3VtjyjrbHlgBd63KQJCMACykJ7ywaL3Npq_3Frag",
         "version": 3,
-        "wrapped_key": "ERERERERERERERERoETq_AAO8_efPq9DVdIckO7kvTgXONMdj8xpz59weL41sRNyUrhdPS55OF1eB_M3"
+        "wrapped_key": "ERERERERERERERERj1pmVNhbnYpMkoBz1lNwAfaV8JwErlmdrgvl7RiYXd_nyTZp2NUIWXUOFHlSvvhq"
       },
       "opens": {
-        "base": "97047e8cd21a58c01919ad8710f144ce7eec05e85acade603ec0614c2fded2f9",
+        "base": "e655035a274847164b2546d9c389c4d87589684b3d6b3f0e7262f4c3e95b17fb",
         "path": "prod/shop/STRIPE_KEY",
         "value": null
       }

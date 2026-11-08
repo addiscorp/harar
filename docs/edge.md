@@ -101,7 +101,7 @@ state folder, where the agent keeps its vault too.
 | `harar edge token create <name> --read <pattern> --write <pattern> [--expires-in <s>]` | a service token, shown once |
 | `harar edge token list`, `harar edge token revoke <id>` | the tokens |
 | `harar edge log [--after <seq>]` | the log, with its hash chain checked here |
-| `harar edge sync on [--edge]`, `off`, `status`, `now`, `approve <device>` | the agent's vault as a member of a ring, synced through this edge (section 5b); off until `on` |
+| `harar edge sync on [--edge]`, `off`, `status`, `now`, `trust <ring fingerprint>`, `approve <device> <fingerprint>` | the agent's vault as a member of a ring, synced through this edge (section 5b); off until `on` |
 
 With more than one edge paired, `--edge <url>` says which. Every command
 answers in JSON.
@@ -358,7 +358,12 @@ Each op comes back as sent, plus `hash`, `sealed_sha256`,
   with the writes that make it.
 
 The edge does not resolve conflicts, check versions or open anything: members
-do, by these same rules (#101).
+do, by these same rules (#101). Members also hold the edge to these rules:
+a `member.*` or `rekey` op served compacted, or the latest op on a key
+served compacted with nothing later, is taken as the edge hiding it
+(section 5b), and joining a ring needs its fingerprint pinned by the person,
+so an edge (or any paired device) can't stand up a ring of its own around a
+member.
 
 ## 5b. Members: the agent's vault in a ring (phase 2, step 2)
 
@@ -374,16 +379,27 @@ can't drift on the encoding, the hashes, the signatures or the seals.
 - **Key agreement**: a second P-256 key per edge, made by `sync on`: in the
   Secure Enclave when the device key is, otherwise a 0600 file beside it in
   `edge-keys/`. Its public half travels in the member's ops.
-- **The ring key**: 32 random bytes, made by the ring's founder. A member
-  holds it only wrapped to its own key-agreement key (ECIES, Apple's
-  cofactor variable-IV X9.63 SHA-256 AES-GCM, as `enclave.rs`; the Rust
-  implementation is checked against the Secure Enclave on the macOS runner).
-  It is never sent unwrapped, logged, or written to disk unwrapped.
+- **The ring key**: 32 random bytes per epoch, made by the ring's founder
+  (epoch 0) and by each rekey. A member holds it only wrapped to its own
+  key-agreement key (ECIES, Apple's cofactor variable-IV X9.63 SHA-256
+  AES-GCM, as `enclave.rs`; the Rust implementation is checked against the
+  Secure Enclave on the macOS runner). Apple's ECIES takes no associated
+  data, so a wrap seals `"harar-ring-wrap-v1\n" ‖ epoch (4 bytes) ‖ device
+  id ‖ "\n" ‖ key`, and unwrapping checks the epoch and recipient. The key is
+  never sent unwrapped, logged, or written to disk unwrapped.
+- **Subkeys.** The ring key is never used directly: HKDF-SHA256 (salt
+  `harar-ring-v1`) gives a *name* subkey (info `harar-ring-name`), a
+  *member* subkey (`harar-ring-member`) and a *wrap* subkey
+  (`harar-ring-wrap`).
 - **A secret version** has its own data key. `sealed` is `iv ‖ AES-256-GCM`
   of `{"path", "value", "base"}` under the data key; `wrapped_key` is the
-  data key under the ring key; both with associated data
-  `harar-op|<key>|<version>`, where `key` is `HMAC-SHA256(ring key, path)`.
-  After opening, a member checks the path inside against `key`.
+  data key under the wrap subkey; both with associated data
+  `harar-op|<key>|<version>`, where `key` is `HMAC-SHA256(name subkey,
+  path)`. After opening, a member checks the path inside against `key`.
+- **Fingerprints**, 128 bits as 32 hex in groups of four: a *device's* is
+  `sha256("harar-device-fp-v1\n" ‖ sign_pub ‖ agree_pub)`; a *ring's* is
+  `sha256("harar-ring-fp-v1\n" ‖ …)` over its founder's two keys. They are
+  what a person compares: `approve` takes the device's, `trust` the ring's.
 
 ### What member ops hold
 
@@ -398,13 +414,13 @@ say is public keys and device ids the edge already knows:
 | Op | `sealed` | `wrapped_key` | `key` | `version` |
 |---|---|---|---|---|
 | `member.add` by the device itself: a request to join | `{device, name, sign_pub, agree_pub, epoch: 0}` | empty | `sha256("harar:member\|request\|<device>")` | 0 |
-| `member.add` by a member: adds `device` | the same, with the epoch | the ring key, ECIES to `agree_pub` | ring MAC of `harar:member\|add\|<device>\|<epoch>` | the epoch |
+| `member.add` by a member: adds `device` | the same, with the epoch, and the device's own two keys | the ring key, wrapped to `agree_pub` for that epoch and device | ring MAC of `harar:member\|add\|<device>\|<epoch>` | the epoch |
 | `member.remove` | `{device, after}` | empty | ring MAC of `harar:member\|remove\|<device>\|<after>` | the epoch |
-| `rekey` | `{epoch, wraps: {device: ECIES(new key)}}` | the previous ring key under the new one, AES-GCM, ad `harar-rekey\|<epoch>` | MAC of `harar:member\|rekey\|<epoch>` under the previous key | the new epoch |
+| `rekey` | `{epoch, wraps: {device: the new key wrapped for that epoch and device}}` | the previous ring key under the new key's wrap subkey, AES-GCM, ad `harar-rekey\|<epoch>` | MAC of `harar:member\|rekey\|<epoch>` under the previous key | the new epoch |
 
-A ring MAC proves the author holds the ring key. The texts start with the
-vault's reserved `harar:`, which no synced path has, so none is a secret's
-`key`.
+A ring MAC is an HMAC-SHA256 under the member subkey; it proves the author
+holds the ring key. The texts start with the vault's reserved `harar:`,
+which no synced path has.
 
 ### Who is a member
 
@@ -413,48 +429,84 @@ A member verifies everything it pulls; it trusts the edge for nothing.
 - **Chains.** Each author's ops verify from its first: seq counts up by one,
   prev is the hash before, the hash is recomputed (from the served
   ciphertext hashes for a compacted op), and the signature checks. An
-  author's first op must be a `member.add` of itself, and it carries the
-  signing key every later op is checked with. A chain that breaks is taken
-  up to the break; the rest is refused, listed in `status`, and asked for
-  again at the next pull.
-- **The founder** is the author whose first op adds itself with a MAC under
-  the ring key of epoch 0. Members are the founder and every device a
-  member's `member.add` names; a `member.remove` ends a member's ops at the
-  seq it names (`after`, the last op the remover had from it). This is a
-  fixed point over all the ring's ops, so it doesn't depend on the order
-  they arrive in.
+  author's first op must be a `member.add` of itself; it carries the signing
+  and key-agreement keys every later op is checked against. A chain that
+  breaks is taken up to the break; the rest is refused, listed in `status`,
+  and asked for again at the next pull.
+- **Compaction can't hide anything.** The edge never compacts a ring op
+  (section 5a), so one served compacted is a broken chain: its author is
+  refused from there. A compacted secret op counts only when a later op on
+  the same `key` (in last-write-wins order) is already held; otherwise it
+  waits, and `status` lists it (`waiting_compacted`), since the edge may be
+  hiding the latest value.
+- **The founder** is the one author whose first op adds itself with a MAC
+  under the epoch-0 ring key the member holds, and whose ring fingerprint
+  the member founded or pinned (`trust`). Two founder ops that verify under
+  the keys held are a ring conflict: nobody counts until it is resolved.
+  A second, different epoch-0 key is never taken.
+- **Members** are the founder and the devices members' grants name, with
+  the keys that device's own first op carries: a grant naming other keys
+  makes no member, and that device's ops don't count. A `member.remove`
+  ends a member's ops at the seq it names (`after`, the last op the remover
+  had from it). This is three fixed passes, each only growing a set (the
+  devices grants reach; the removals they made; the devices grants within
+  their author's cut reach, and the removals within theirs), so it doesn't
+  depend on the order ops arrive in.
 - **A secret op counts** only if its author is a member at its seq. One
   written after its author's removal is refused; one from an author not
-  known to be a member yet waits.
-- **Rekeys.** A rekey's wrap to a member gives it the new key, and each
-  rekey's key opens the key before, so a member who has the newest key has
-  them all (a device approved after a rekey reads the whole history). New
-  writes use the newest epoch a member's rekey made.
+  known to be a member yet waits (at most 5000 wait; past that the oldest
+  from non-members are dropped, counted in `status`).
+- **Rekeys** are taken only from an author who counts at the rekey's seq,
+  with an epoch of at least 1 that is one past a key the member holds,
+  whose back-wrap opens (with the new key) to that held key, and whose MAC
+  is under it. Each rekey's key opens the key before, so a member who has
+  the newest key has them all (a device approved after a rekey reads the
+  whole history). New writes use the newest epoch a counting member's
+  rekey made (the later rekey if two made one epoch), else the founder's
+  epoch-0 key; a key with neither origin is never written with. An epoch
+  past 2^32 − 1 is refused.
 
 ### Joining
 
 1. The first member to turn sync on, on an edge that holds no ops, founds
    the ring: a new ring key, wrapped to itself, and a `member.add` of
-   itself. Its vault's secrets become `put` ops.
+   itself. Its vault's secrets become `put` ops. `status` shows the ring's
+   fingerprint (`ring`).
 2. Any later device that turns sync on publishes a request (its first op).
    It needs no change to pairing: the request is signed with the pairing
-   key it carries, and the edge took it only from a paired device.
-3. A member runs `harar edge sync approve <device>`, after comparing the
-   request's `fingerprint` (in `status` on both machines): that wraps the
-   ring key to the request's key-agreement key and publishes the
-   `member.add`. (Approval from the phone is phase 3.)
-4. The newcomer's next sync opens the ring key, then applies the ring's ops.
-   What its vault held before is its own write: the same value as the
-   ring's is just adopted; a different one is a concurrent write, so last
-   write wins and the loser is kept (below).
+   key it carries, and the edge took it only from a paired device. It is
+   `requested` and seals nothing.
+3. **The joiner pins the ring, out of band:** the person runs `harar edge
+   sync trust <ring fingerprint>` with the fingerprint a member's `status`
+   shows. Until then the joiner takes no grant at all, so a paired device
+   (or the edge) that founds a fake ring around it collects nothing; after,
+   it takes only a grant that chains to the founder it pinned. (Phase 3:
+   the phone does this by scanning a QR code.)
+4. A member runs `harar edge sync approve <device> <fingerprint>` with the
+   device fingerprint `status` shows on the joiner; a different one is
+   refused. That wraps the ring key to the request's key-agreement key and
+   publishes the `member.add`. Steps 3 and 4 can come in either order.
+5. The joiner's next sync opens the ring key, then applies the ring's ops.
+   **On joining, the ring's current value wins**: what the joiner's vault
+   held that differs goes to its history and is flagged as a conflict there;
+   the same value is adopted; what the ring lacks becomes the joiner's write.
+6. **Two founders at once** (two machines turned sync on before either saw
+   the other): the one that founded first, by `at` then device id, keeps
+   its ring; the other gives its own up and asks to join (steps 3 and 4),
+   unless its ring already has another member, in which case both rings
+   stand and `status` shows the conflict (`ring_conflicts`).
 
 ### Applying: last write wins
 
-For each path, a write whose `base` is the path's current op replaces it.
-Two writes that didn't see each other are a conflict: the later one by
-(`at`, author id, `seq`) is kept, the same order the edge compacts by; the
-other goes into the vault's history with its value, and the conflict is
-flagged. Both members reach the same result and both flag it; `harar edge
+The value of a path is always the highest-ranked op seen, by (`at`, author
+id, `seq`), the same order the edge compacts by, whatever order ops arrive
+in. A writer stamps a write later than what it replaces (`at` = max(now,
+its last op, the replaced op's `at` + 1)), so a successor (`base` = the
+path's current op) outranks it and replaces it without a conflict. Two
+writes that didn't see each other, or a "successor" that doesn't outrank,
+are a conflict: the higher-ranked is kept; the other goes into the vault's
+history with its value, and the conflict is flagged. Both members reach the
+same result and both flag it; `harar edge
 sync status` shows the flags (paths, devices, times, versions; never
 values). A delete is a version too. A value another member changed has no
 hosts here (`harar hosts`) until the owner allows them again, as with a
@@ -479,16 +531,31 @@ nothing.
 Every push is preceded by a pull. Ops that fail to go stay queued
 (`status` says how many, and the last error) and go at the next of these.
 
+- **Ops are written unsigned** under the agent's lock (an op's hash doesn't
+  cover its signature) and signed and sent outside it, so a Secure Enclave
+  signature or a slow edge never holds the vault.
+- **A pull** takes at most 20 pages per sync (the next sync carries on), and
+  each page's `next` must move the cursor on, or the edge is refused.
+- **A diverged chain** (the state file restored from an older copy, or a
+  push refused as `fork`, `wrong_seq` or `wrong_prev`): after the next full
+  pull, the queued ops are written again after the edge's newest op of this
+  member, signed and sent; the vault learns their new hashes. `status`
+  shows `chain` and how many were `rebased`.
+- **A crash** between saving the ops and saving the vault doesn't make the
+  same change a second op: each change has a tag (a ring MAC of path,
+  version, base and the value's hash), and a tag already written is reused.
+
 ### Commands
 
 | Command | Does |
 |---|---|
 | `harar edge sync on [--edge <url>]` | makes the key-agreement key, and founds the ring or asks to join it. One ring per vault: a second edge is refused |
 | `harar edge sync off` | stops syncing. Nothing is deleted; `on` picks up where it left off, and what changed meanwhile goes as ops |
-| `harar edge sync status` | role (member, requested, removed), members and requests with fingerprints, the epoch, queued and waiting ops, refused ops, conflicts |
+| `harar edge sync status` | role (member, requested, removed), this device's fingerprint, the ring's fingerprint, members and requests with fingerprints, the epoch, queued and waiting ops, refused ops, ring conflicts, the chain, conflicts |
 | `harar edge sync now` | one sync |
-| `harar edge sync approve <device>` | adds a device that asked |
-| `harar edge unpair <device>` | with sync on, a member is first removed from the ring and the ring rekeyed, then unpaired |
+| `harar edge sync trust <ring fingerprint>` | pins the ring to join; no grant is taken before |
+| `harar edge sync approve <device> <fingerprint>` | adds a device that asked, if the fingerprint is the one its `status` shows |
+| `harar edge unpair <device> [--force-no-rekey]` | with sync on, a member is first removed from the ring and the ring rekeyed, then unpaired. From a machine that doesn't sync, a device with ops in the ring is refused (unpair it from a member, so the ring is rekeyed); `--force-no-rekey` unpairs it anyway, with a warning: it keeps the ring key |
 
 They all go through the agent (`--socket` for another one), which is the
 only writer of the member's chain, so no two processes ever sign the same
@@ -498,8 +565,8 @@ request.
 **Not verified here:** the Secure Enclave key-agreement key. CI and the
 end-to-end test (`edge/test/sync-e2e.sh`) use file keys, since an enclave
 key that needs presence would ask for Touch ID. With enclave keys, a sync
-that unwraps the ring key asks once while the vault stays unlocked, and
-each op signed asks too.
+that unwraps the ring key asks once while the vault stays unlocked (that
+unwrap still happens under the agent's lock), and each op signed asks too.
 
 ## 6. The log
 
