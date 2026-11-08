@@ -770,7 +770,7 @@ dependencies = [
 
 [[package]]
 name = "harar"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -785,7 +785,7 @@ dependencies = [
 
 [[package]]
 name = "harar-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "age",
  "anyhow",

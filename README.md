@@ -30,15 +30,20 @@ Linux x86_64. `sh -s -- --canary` installs the newest build of `main`.
 The `harar` binary is the server. Programs talk to it through a client on its
 local socket; the clients hold no secrets.
 
-- **Rust:** the [`harar`](client/README.md) crate, `harar = "0.2"`, `use harar::VaultClient`.
-- **JavaScript and TypeScript:** the [`harar`](js/README.md) npm package,
-  `import { vault } from 'harar'`.
-- **Python:** the [`harar`](python/README.md) PyPI package, `pip install harar`,
-  `from harar import vault`.
-- **Ruby:** the [`harar`](ruby/README.md) gem, `gem install harar`,
-  `Harar.vault(socket: ...)`.
-- **PHP:** the [`addis/harar`](php/README.md) Composer package,
-  `composer require addis/harar`, `Harar\vault(socket: ...)`.
+- **Rust:** the [`harar`](client/README.md) crate, `harar = "0.3"`.
+- **JavaScript and TypeScript:** the [`harar`](js/README.md) npm package.
+- **Python:** the [`harar`](python/README.md) PyPI package, `pip install harar`.
+- **Ruby:** the [`harar`](ruby/README.md) gem, `gem install harar`.
+- **PHP:** the [`addis/harar`](php/README.md) Composer package, `composer require addis/harar`.
+
+Each one resolves `harar://` references, the way 1Password's SDKs resolve
+`op://` ones, from the agent on your machine with no account or token:
+
+```ts
+import { vault } from 'harar'
+
+const key = await vault().secrets.resolve('harar://prod/shop/STRIPE_KEY')
+```
 
 All of them publish from a stable release, at its version.
 

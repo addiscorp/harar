@@ -9,10 +9,12 @@
 declare(strict_types=1);
 
 require __DIR__ . '/../src/HararError.php';
+require __DIR__ . '/../src/Secrets.php';
 require __DIR__ . '/../src/Vault.php';
 require __DIR__ . '/../src/functions.php';
 
 use Harar\HararError;
+use function Harar\agent_socket;
 use function Harar\vault;
 
 function check(bool $ok, string $what): void
@@ -98,5 +100,39 @@ foreach ([
 }
 refuses(fn () => vault(socket: '/nonexistent/h.sock')->hosts('a/b'), HararError::class, '~harar at /nonexistent/h\.sock~');
 refuses(fn () => vault(socket: 'relative.sock'), InvalidArgumentException::class, '~absolute path~');
+
+// secrets->resolve reads the key a harar:// reference names, as op:// does in 1Password
+harar('{"ok":true,"value":"sk_live_real"}', function (string $socket, callable $requests) {
+    $v = vault(socket: $socket);
+    check($v->secrets->resolve('harar://prod/shop/STRIPE_KEY') === 'sk_live_real', 'resolve');
+    check($v->secrets->resolveAll(['harar://prod/shop/STRIPE_KEY', 'harar://prod/shop/OTHER']) === ['sk_live_real', 'sk_live_real'], 'resolveAll');
+    // Not a reference: refused before harar is asked anything.
+    foreach (['prod/shop/STRIPE_KEY', 'op://Prod/Stripe/credential', 'harar://', 'harar://a b'] as $notOne) {
+        refuses(fn () => $v->secrets->resolve($notOne), HararError::class, '~not a harar:// reference~');
+    }
+    check($requests() === [
+        ['op' => 'get', 'key' => 'prod/shop/STRIPE_KEY'],
+        ['op' => 'get', 'key' => 'prod/shop/STRIPE_KEY'],
+        ['op' => 'get', 'key' => 'prod/shop/OTHER'],
+    ], 'the requests harar saw');
+});
+harar('{"ok":false,"error":"not_found"}', function (string $socket) {
+    refuses(fn () => vault(socket: $socket)->secrets->resolve('harar://prod/shop/GONE'), HararError::class, '~harar refused harar://prod/shop/GONE: not_found~');
+});
+
+// vault() with no socket asks the agent where `harar agent` listens
+$saved = ['HOME' => getenv('HOME'), 'XDG_RUNTIME_DIR' => getenv('XDG_RUNTIME_DIR')];
+putenv('HOME=/home/someone');
+putenv('XDG_RUNTIME_DIR=/run/user/1000');
+$want = PHP_OS_FAMILY === 'Darwin' ? '/home/someone/Library/Application Support/harar/agent.sock' : '/run/user/1000/harar/agent.sock';
+check(agent_socket() === $want, "agent_socket() is {$want}");
+refuses(fn () => vault()->secrets->resolve('harar://a/b'), HararError::class, '~^harar at ' . preg_quote($want, '~') . ':~');
+putenv('XDG_RUNTIME_DIR');
+if (PHP_OS_FAMILY !== 'Darwin') {
+    check(agent_socket() === '/home/someone/.harar/agent.sock', 'agent_socket() falls back to ~/.harar');
+}
+foreach ($saved as $name => $value) {
+    putenv($value === false ? $name : "{$name}={$value}");
+}
 
 echo "ok: php client\n";

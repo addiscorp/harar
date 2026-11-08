@@ -9,12 +9,12 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 license = "Apache-2.0"
 
 [workspace.dependencies]
 axum = "0.7"
-harar = { path = "client", version = "0.2.0" }
+harar = { path = "client", version = "0.3.0" }
 hyper = "1"
 hyper-util = "0.1"
 serde = "1"

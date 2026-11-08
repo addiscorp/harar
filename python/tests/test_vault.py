@@ -4,12 +4,16 @@
 # way harar can say no is an error naming why. The same cases as js/test.
 import json
 import os
+import re
+import sys
 import socket
 import tempfile
 import threading
 import unittest
 
-from harar import HararError, vault
+from unittest import mock
+
+from harar import HararError, agent_socket, vault
 
 
 class Harar:
@@ -96,6 +100,51 @@ class VaultTest(unittest.TestCase):
             vault(socket="/nonexistent/h.sock").hosts("a/b")
         with self.assertRaisesRegex(ValueError, r"absolute path"):
             vault(socket="relative.sock")
+
+    def test_secrets_resolve_reads_the_key_a_harar_reference_names(self):
+        values = {"prod/shop/STRIPE_KEY": "sk_live_real", "prod/shop/OTHER": "other"}
+
+        def answer(r):
+            if r["key"] in values:
+                return json.dumps({"ok": True, "value": values[r["key"]]})
+            return json.dumps({"ok": False, "error": "not_found"})
+
+        with Harar(answer) as h:
+            v = vault(socket=h.socket)
+            self.assertEqual(v.secrets.resolve("harar://prod/shop/STRIPE_KEY"), "sk_live_real")
+            self.assertEqual(
+                v.secrets.resolve_all(["harar://prod/shop/STRIPE_KEY", "harar://prod/shop/OTHER"]),
+                ["sk_live_real", "other"],
+            )
+            with self.assertRaisesRegex(HararError, r"harar refused harar://prod/shop/GONE: not_found"):
+                v.secrets.resolve("harar://prod/shop/GONE")
+            # Not a reference: refused before harar is asked anything.
+            for not_one in ["prod/shop/STRIPE_KEY", "op://Prod/Stripe/credential", "harar://", "harar://a b", None]:
+                with self.assertRaisesRegex(HararError, r"not a harar:// reference"):
+                    v.secrets.resolve(not_one)
+            self.assertEqual(
+                h.requests,
+                [
+                    {"op": "get", "key": "prod/shop/STRIPE_KEY"},
+                    {"op": "get", "key": "prod/shop/STRIPE_KEY"},
+                    {"op": "get", "key": "prod/shop/OTHER"},
+                    {"op": "get", "key": "prod/shop/GONE"},
+                ],
+            )
+
+    def test_vault_with_no_socket_asks_the_agent_where_harar_agent_listens(self):
+        with mock.patch.dict(os.environ, {"HOME": "/home/someone", "XDG_RUNTIME_DIR": "/run/user/1000"}):
+            want = (
+                "/home/someone/Library/Application Support/harar/agent.sock"
+                if sys.platform == "darwin"
+                else "/run/user/1000/harar/agent.sock"
+            )
+            self.assertEqual(agent_socket(), want)
+            with self.assertRaisesRegex(HararError, "^harar at " + re.escape(want) + ":"):
+                vault().secrets.resolve("harar://a/b")
+            del os.environ["XDG_RUNTIME_DIR"]
+            if sys.platform != "darwin":
+                self.assertEqual(agent_socket(), "/home/someone/.harar/agent.sock")
 
 
 if __name__ == "__main__":

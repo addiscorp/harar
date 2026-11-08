@@ -23,6 +23,43 @@ use primary::{PolicyChange, PolicyView, PrimaryRequest, PrimaryResponse};
 
 /// Where a primary listens on its machine.
 pub const DEFAULT_PRIMARY_SOCKET: &str = "/run/harar.sock";
+
+/// What a reference to a vault key starts with: `harar://prod/shop/STRIPE_KEY`
+/// names the key `prod/shop/STRIPE_KEY`, as `op://` names a 1Password field.
+pub const REFERENCE_PREFIX: &str = "harar://";
+
+/// The vault key a value refers to, if the whole value is a reference.
+pub fn reference(value: &str) -> Option<&str> {
+    value
+        .strip_prefix(REFERENCE_PREFIX)
+        .filter(|key| !key.is_empty() && !key.chars().any(char::is_whitespace))
+}
+
+/// The per-user agent's folder (`harar agent`): its socket and vault. In the
+/// user's Application Support on macOS, in `$XDG_RUNTIME_DIR/harar` on Linux,
+/// else `~/.harar`.
+pub fn agent_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join("Library/Application Support/harar");
+    }
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return PathBuf::from(runtime).join("harar");
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
+    home.join(".harar")
+}
+
+/// Where the per-user agent listens.
+pub fn default_agent_socket() -> PathBuf {
+    agent_dir().join("agent.sock")
+}
+
+/// The harar agent on this machine, at its own socket: no account, no token.
+/// The agent answers only the user it runs as.
+pub fn vault() -> VaultClient {
+    VaultClient::from_socket_path(default_agent_socket())
+}
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 fn b64_url(bytes: impl AsRef<[u8]>) -> String {
@@ -123,6 +160,8 @@ pub enum VaultClientError {
     InvalidResponse(String),
     /// The primary or agent refused, with its reason.
     Vault(String),
+    /// Not a `harar://` reference.
+    Reference(String),
     Json(serde_json::Error),
 }
 
@@ -132,6 +171,7 @@ impl fmt::Display for VaultClientError {
             VaultClientError::Io(err) => write!(f, "harar I/O error: {err}"),
             VaultClientError::InvalidResponse(message) => write!(f, "harar sent an invalid response: {message}"),
             VaultClientError::Vault(reason) => write!(f, "harar refused: {reason}"),
+            VaultClientError::Reference(value) => write!(f, "not a harar:// reference: {value:?}"),
             VaultClientError::Json(err) => write!(f, "harar JSON error: {err}"),
         }
     }
@@ -150,6 +190,11 @@ impl std::error::Error for VaultClientError {
 impl VaultClient {
     pub fn from_socket_path(path: impl AsRef<Path>) -> Self {
         Self { socket_path: path.as_ref().to_path_buf() }
+    }
+
+    /// `harar://` references resolved to their values.
+    pub fn secrets(&self) -> Secrets<'_> {
+        Secrets { client: self }
     }
 
     pub async fn get(&self, key: &str) -> Result<String, VaultClientError> {
@@ -283,6 +328,31 @@ impl VaultClient {
     }
 }
 
+/// `harar://` references resolved to their values, the shape of 1Password's
+/// `client.secrets.resolve("op://…")`. The value is read when asked for and
+/// held only by the caller.
+#[derive(Debug)]
+pub struct Secrets<'a> {
+    client: &'a VaultClient,
+}
+
+impl Secrets<'_> {
+    /// The value `reference` (`harar://prod/shop/STRIPE_KEY`) names.
+    pub async fn resolve(&self, reference: &str) -> Result<String, VaultClientError> {
+        let key = crate::reference(reference).ok_or_else(|| VaultClientError::Reference(reference.into()))?;
+        self.client.get(key).await
+    }
+
+    /// Each reference's value, in order; the first that fails is the error.
+    pub async fn resolve_all(&self, references: &[&str]) -> Result<Vec<String>, VaultClientError> {
+        let mut values = Vec::with_capacity(references.len());
+        for reference in references {
+            values.push(self.resolve(reference).await?);
+        }
+        Ok(values)
+    }
+}
+
 /// What `add_device` did.
 #[derive(Debug)]
 pub struct AddedDevice {
@@ -302,4 +372,64 @@ pub struct Approvals {
     /// About the caller's own account, newest last.
     pub notices: Vec<primary::Notice>,
     pub recovery_codes_left: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::UnixListener;
+
+    /// A stand-in harar on a unix socket: answers each request with
+    /// `reply(request)` and records what it was asked.
+    async fn harar(reply: fn(&serde_json::Value) -> String) -> (tempfile::TempDir, PathBuf, tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("h.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let (asked, requests) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut conn, _)) = listener.accept().await {
+                let mut body = Vec::new();
+                conn.read_to_end(&mut body).await.expect("read");
+                let request: serde_json::Value = serde_json::from_slice(&body).expect("json");
+                let answer = reply(&request);
+                asked.send(request).expect("record");
+                conn.write_all(answer.as_bytes()).await.expect("write");
+            }
+        });
+        (dir, socket, requests)
+    }
+
+    #[tokio::test]
+    async fn resolve_reads_the_key_a_reference_names() {
+        let (_dir, socket, mut requests) = harar(|r| match r["key"].as_str() {
+            Some("prod/shop/STRIPE_KEY") => r#"{"ok":true,"value":"sk_live_real"}"#.into(),
+            Some("prod/shop/OTHER") => r#"{"ok":true,"value":"other"}"#.into(),
+            _ => r#"{"ok":false,"error":"not_found"}"#.into(),
+        })
+        .await;
+        let v = VaultClient::from_socket_path(&socket);
+        assert_eq!(v.secrets().resolve("harar://prod/shop/STRIPE_KEY").await.unwrap(), "sk_live_real");
+        assert_eq!(requests.recv().await.unwrap(), serde_json::json!({ "op": "get", "key": "prod/shop/STRIPE_KEY" }));
+        assert_eq!(
+            v.secrets().resolve_all(&["harar://prod/shop/STRIPE_KEY", "harar://prod/shop/OTHER"]).await.unwrap(),
+            ["sk_live_real", "other"]
+        );
+        assert!(matches!(v.secrets().resolve("harar://prod/shop/GONE").await, Err(VaultClientError::Vault(reason)) if reason == "not_found"));
+        // Not a reference: refused before harar is asked anything.
+        for not_one in ["prod/shop/STRIPE_KEY", "op://Prod/Stripe/credential", "harar://", "harar://a b"] {
+            assert!(matches!(v.secrets().resolve(not_one).await, Err(VaultClientError::Reference(_))), "{not_one}");
+        }
+        drop(v);
+        let mut asked = 1;
+        while requests.try_recv().is_ok() {
+            asked += 1;
+        }
+        assert_eq!(asked, 4, "the three references after the first, and nothing for the non-references");
+    }
+
+    #[test]
+    fn vault_finds_the_agent_where_harar_agent_listens() {
+        assert_eq!(vault().socket_path, default_agent_socket());
+        assert_eq!(default_agent_socket(), agent_dir().join("agent.sock"));
+    }
 }

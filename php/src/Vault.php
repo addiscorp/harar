@@ -2,9 +2,11 @@
 
 // harar's client for PHP:
 //
-//   $v = Harar\vault(socket: '/run/harar.sock');
-//   $v->hosts('prod/shop/STRIPE_KEY');                   // ['api.stripe.com']
-//   $v->send('prod/shop/STRIPE_KEY', 'api.stripe.com');  // the key, for that host only
+//   $harar = Harar\vault();                                // the agent on this machine
+//   $harar->secrets->resolve('harar://prod/shop/STRIPE_KEY'); // the key it names
+//
+// A gateway that attaches keys on their way out asks where each may go, and
+// for it for one host only: hosts($secret) and send($secret, $host).
 //
 // One JSON request on harar's local socket, the write side closed, one JSON
 // answer: the protocol the per-user agent and a primary both speak. harar
@@ -14,7 +16,10 @@ declare(strict_types=1);
 
 namespace Harar;
 
-/** A vault on harar's socket: where each secret may go, and the secret itself for one host only. */
+/**
+ * A vault on harar's socket: the secrets its references name, and for a
+ * gateway, where each may go and the secret itself for one host only.
+ */
 final class Vault
 {
     /** harar's answers are small; anything longer is refused. */
@@ -22,15 +27,18 @@ final class Vault
     /** How long harar has to answer (a per-user agent may be asking for Touch ID). */
     public const TIMEOUT_S = 60;
 
+    public readonly Secrets $secrets;
+
     public function __construct(private readonly string $socket)
     {
         if (!str_starts_with($socket, '/')) {
             throw new \InvalidArgumentException('Harar\vault(socket:): the socket is an absolute path');
         }
+        $this->secrets = new Secrets($this->ask(...));
     }
 
     /**
-     * The host patterns `$secret` may go to: an exact name, or `*.example.com`
+     * For a gateway: the host patterns `$secret` may go to: an exact name, or `*.example.com`
      * for any name under it (never the name itself).
      *
      * @return list<string>
@@ -44,7 +52,7 @@ final class Vault
         return $hosts;
     }
 
-    /** `$secret`'s value, for a request to `$host` only. harar decides, and records the host. */
+    /** For a gateway: `$secret`'s value, for a request to `$host` only. */
     public function send(string $secret, string $host): string
     {
         $value = $this->ask(['op' => 'send', 'key' => $secret, 'host' => $host], "{$secret} to {$host}")['value'] ?? null;
