@@ -202,6 +202,8 @@ jobs:
           node-version: 24
       - run: cargo build --locked -p harar-server --bin harar
       - run: edge/test/cli-e2e.sh target/debug/harar
+      # Every client (TypeScript, Python, Ruby, PHP, Go, Rust) against that edge.
+      - run: edge/test/clients-e2e.sh target/debug/harar
       - run: sccache --show-stats
 
   macos:
