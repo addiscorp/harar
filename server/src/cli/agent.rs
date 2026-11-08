@@ -50,6 +50,16 @@ pub async fn run(cmd: Agent) -> Result<()> {
         return Err(anyhow!("no master key at {}; create one with `harar key init`", cmd.key.display()));
     }
     let (unlock, approve, approvals) = key_closures(master_key::MasterKeyFile::read(&cmd.key)?);
+    let listener = agent::bind(&cmd.socket)?;
+    let ssh = agent::bind(&cmd.ssh_socket)?;
+    // After binding, so a second agent is refused before it can move anything.
+    // A vault named with --state is the person's choice; only the default one
+    // is looked for where an older harar kept it.
+    let old = agent::old_state_path();
+    let old = (cmd.state == agent::default_state_path()).then_some(old.as_path());
+    if let (true, Some(old)) = (agent::prepare_state(&cmd.state, old)?, old) {
+        eprintln!("harar agent moved the vault from {} to {}", old.display(), cmd.state.display());
+    }
     let vault = Vault::new(
         VaultConfig {
             state_path: cmd.state,
@@ -63,8 +73,6 @@ pub async fn run(cmd: Agent) -> Result<()> {
         approve,
         Instant::now(),
     );
-    let listener = agent::bind(&cmd.socket)?;
-    let ssh = agent::bind(&cmd.ssh_socket)?;
     eprintln!(
         "harar agent listening on {} and {} (locked)",
         cmd.socket.display(),

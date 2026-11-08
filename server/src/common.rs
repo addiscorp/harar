@@ -1,5 +1,6 @@
 //! What the primary and the per-user agent share: who is on the other end of
-//! a local socket, reading one request from it, and the encrypted key file.
+//! a local socket, reading one request from it, the encrypted key file, and
+//! the folder this user's state lives in.
 
 use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
@@ -7,7 +8,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::io::AsyncReadExt;
 use tokio::net::UnixStream;
 
@@ -153,6 +154,19 @@ pub(crate) fn write_encrypted_keys(path: &Path, recipient: &age::x25519::Recipie
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).with_context(|| format!("chmod 0600 {}", path.display()))?;
     fs::File::open(parent).and_then(|dir| dir.sync_all()).with_context(|| format!("sync {}", parent.display()))?;
     Ok(())
+}
+
+/// This user's harar state, which must outlive a logout and a reboot: the
+/// agent's vault (`vault.age`) and `harar edge`'s edges and device keys. On
+/// macOS it is the agent's folder (Application Support), sockets and all; on
+/// Linux `~/.local/state/harar`, never the agent's `$XDG_RUNTIME_DIR/harar`,
+/// a tmpfs emptied at logout that holds only its sockets.
+pub(crate) fn state_dir() -> PathBuf {
+    if cfg!(target_os = "macos") {
+        return harar::agent_dir();
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
+    home.join(".local/state/harar")
 }
 
 pub(crate) fn now_epoch_seconds() -> u64 {

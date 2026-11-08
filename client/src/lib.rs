@@ -40,9 +40,10 @@ pub fn reference(value: &str) -> Option<&str> {
         .filter(|key| !key.is_empty() && !key.chars().any(char::is_whitespace))
 }
 
-/// The per-user agent's folder (`harar agent`): its socket and vault. In the
-/// user's Application Support on macOS, in `$XDG_RUNTIME_DIR/harar` on Linux,
-/// else `~/.harar`.
+/// The per-user agent's folder (`harar agent`): its sockets. In the user's
+/// Application Support on macOS, in `$XDG_RUNTIME_DIR/harar` on Linux, else
+/// `~/.harar`. Its vault lives here only on macOS; on Linux it is in
+/// `~/.local/state/harar`, since `$XDG_RUNTIME_DIR` is emptied at logout.
 pub fn agent_dir() -> PathBuf {
     #[cfg(target_os = "macos")]
     if let Some(home) = std::env::var_os("HOME") {

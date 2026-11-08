@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use super::print_json;
 use super::secret_input::SecretInput;
+use crate::common::state_dir;
 
 mod files {
     include!(concat!(env!("OUT_DIR"), "/edge_files.rs"));
@@ -502,18 +503,6 @@ struct Paired {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct EdgesFile {
     edges: Vec<Paired>,
-}
-
-/// Where this machine keeps its edges and their device keys: state that must
-/// outlive a reboot. The agent's folder on macOS (Application Support); on
-/// Linux `~/.local/state/harar`, never the agent's `$XDG_RUNTIME_DIR`, which
-/// is emptied at logout.
-fn state_dir() -> PathBuf {
-    if cfg!(target_os = "macos") {
-        return harar::agent_dir();
-    }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
-    home.join(".local/state/harar")
 }
 
 fn edges_path() -> PathBuf {

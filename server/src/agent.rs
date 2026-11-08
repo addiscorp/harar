@@ -18,7 +18,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -333,8 +333,112 @@ pub(crate) fn default_ssh_socket_path() -> PathBuf {
     harar::agent_dir().join("ssh.sock")
 }
 
+/// The encrypted vault, in the state folder: it outlives a logout and a reboot.
 pub(crate) fn default_state_path() -> PathBuf {
+    crate::common::state_dir().join("vault.age")
+}
+
+/// Where the vault was kept before #100: beside the sockets, which on Linux is
+/// `$XDG_RUNTIME_DIR/harar`, emptied at logout. On macOS it is the same file
+/// as `default_state_path()`.
+pub(crate) fn old_state_path() -> PathBuf {
     harar::agent_dir().join("vault.age")
+}
+
+/// Makes the vault's folder (0700 when harar creates it), and moves a vault
+/// found at `old` to `state` when `state` has none. Returns whether it moved
+/// one. A vault at both is an error that touches neither: only the person
+/// knows which one holds their secrets.
+pub(crate) fn prepare_state(state: &Path, old: Option<&Path>) -> Result<bool> {
+    if let Some(parent) = state.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        create_private_dir(parent)?;
+    }
+    let Some(old) = old.filter(|old| *old != state) else {
+        return Ok(false);
+    };
+    if !file_exists(old)? {
+        return Ok(false);
+    }
+    if file_exists(state)? {
+        return Err(anyhow!(
+            "there are two vaults, {} (where an older harar kept it) and {}; harar won't choose between them and has touched neither. Keep the one you want at {}, move the other one away, and start the agent again",
+            old.display(),
+            state.display(),
+            state.display()
+        ));
+    }
+    move_file(old, state)?;
+    Ok(true)
+}
+
+fn file_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err).with_context(|| format!("inspect {}", path.display())),
+    }
+}
+
+/// Creates `dir` 0700; a folder that already exists is left as it is.
+fn create_private_dir(dir: &Path) -> Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    if let Some(up) = dir.parent() {
+        fs::create_dir_all(up).with_context(|| format!("create {}", up.display()))?;
+    }
+    match fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("create {}", dir.display())),
+    }
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).with_context(|| format!("restrict {}", dir.display()))
+}
+
+/// Renames `from` to `to` (0600). From a tmpfs to a disk the rename fails with
+/// EXDEV, so then it copies to a temporary file beside `to`, syncs it, renames
+/// it into place and syncs the folder, and only then removes `from`.
+fn move_file(from: &Path, to: &Path) -> Result<()> {
+    let parent = to.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    match fs::rename(from, to) {
+        Ok(()) => {}
+        Err(err) if err.raw_os_error() == Some(libc::EXDEV) => return copy_across_filesystems(from, to, parent),
+        Err(err) => return Err(err).with_context(|| format!("move {} to {}", from.display(), to.display())),
+    }
+    fs::set_permissions(to, fs::Permissions::from_mode(0o600)).with_context(|| format!("chmod 0600 {}", to.display()))?;
+    sync_dir(parent)
+}
+
+fn copy_across_filesystems(from: &Path, to: &Path, parent: &Path) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let bytes = fs::read(from).with_context(|| format!("read {}", from.display()))?;
+    let tmp = to.with_extension(format!("age.moving.{}", std::process::id()));
+    let _ = fs::remove_file(&tmp);
+    let copied = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        file.write_all(&bytes).with_context(|| format!("write {}", tmp.display()))?;
+        file.sync_all().with_context(|| format!("sync {}", tmp.display()))?;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600)).with_context(|| format!("chmod 0600 {}", tmp.display()))?;
+        fs::rename(&tmp, to).with_context(|| format!("rename {} to {}", tmp.display(), to.display()))?;
+        sync_dir(parent)
+    })();
+    if copied.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    copied?;
+    fs::remove_file(from).with_context(|| {
+        format!("the vault is now at {}, but the old copy {} could not be removed; remove it by hand", to.display(), from.display())
+    })
+}
+
+fn sync_dir(dir: &Path) -> Result<()> {
+    fs::File::open(dir).and_then(|dir| dir.sync_all()).with_context(|| format!("sync {}", dir.display()))
 }
 
 pub(crate) fn disable_core_dumps() -> Result<()> {
@@ -641,5 +745,96 @@ mod tests {
         let plist = launch_agent_plist(Path::new("/opt/harar & co/bin/harar"));
         assert!(plist.contains("<string>/opt/harar &amp; co/bin/harar</string>\n    <string>agent</string>"));
         assert!(plist.contains("<key>RunAtLoad</key>\n  <true/>"));
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// An old vault (0600, as the agent wrote it) in `<dir>/run/harar`, and
+    /// where the state folder would be, `<dir>/home/.local/state/harar`.
+    fn old_vault(dir: &Path, bytes: &[u8]) -> (PathBuf, PathBuf) {
+        let old = dir.join("run/harar/vault.age");
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::write(&old, bytes).unwrap();
+        fs::set_permissions(&old, fs::Permissions::from_mode(0o600)).unwrap();
+        (old, dir.join("home/.local/state/harar/vault.age"))
+    }
+
+    #[test]
+    fn a_vault_left_in_the_runtime_folder_moves_to_the_state_folder_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old, state) = old_vault(dir.path(), b"age-encryption.org/v1 sealed bytes");
+
+        assert!(prepare_state(&state, Some(&old)).unwrap(), "reports the move");
+        assert_eq!(fs::read(&state).unwrap(), b"age-encryption.org/v1 sealed bytes");
+        assert_eq!(mode(&state), 0o600);
+        assert_eq!(mode(state.parent().unwrap()), 0o700, "the state folder harar made is private");
+        assert!(!old.exists(), "the old copy is gone");
+        assert!(!prepare_state(&state, Some(&old)).unwrap(), "nothing left to move");
+    }
+
+    #[test]
+    fn two_vaults_refuse_to_start_and_neither_is_touched() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old, state) = old_vault(dir.path(), b"the old vault");
+        fs::create_dir_all(state.parent().unwrap()).unwrap();
+        fs::write(&state, b"the new vault").unwrap();
+
+        let err = format!("{:#}", prepare_state(&state, Some(&old)).unwrap_err());
+        assert!(err.contains(&old.display().to_string()) && err.contains(&state.display().to_string()), "{err}");
+        assert_eq!(fs::read(&old).unwrap(), b"the old vault");
+        assert_eq!(fs::read(&state).unwrap(), b"the new vault");
+    }
+
+    #[test]
+    fn without_an_old_vault_the_state_folder_is_made_private_and_nothing_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("home/.local/state/harar/vault.age");
+        assert!(!prepare_state(&state, Some(&dir.path().join("run/harar/vault.age"))).unwrap());
+        assert_eq!(mode(state.parent().unwrap()), 0o700);
+        assert!(!state.exists());
+        // On macOS the old place is the new one: nothing to move.
+        fs::write(&state, b"vault").unwrap();
+        assert!(!prepare_state(&state, Some(&state)).unwrap());
+        assert_eq!(fs::read(&state).unwrap(), b"vault");
+    }
+
+    #[test]
+    fn the_copy_used_across_filesystems_keeps_the_bytes_and_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old, state) = old_vault(dir.path(), b"sealed");
+        fs::set_permissions(&old, fs::Permissions::from_mode(0o644)).unwrap();
+        create_private_dir(state.parent().unwrap()).unwrap();
+
+        copy_across_filesystems(&old, &state, state.parent().unwrap()).unwrap();
+        assert_eq!(fs::read(&state).unwrap(), b"sealed");
+        assert_eq!(mode(&state), 0o600, "0600 whatever the old file was");
+        assert!(!old.exists());
+        let left: Vec<_> = fs::read_dir(state.parent().unwrap()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, ["vault.age"], "no temporary file left");
+    }
+
+    /// For real across filesystems: /dev/shm is a tmpfs, as $XDG_RUNTIME_DIR is,
+    /// and the test's temporary folder is on disk.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_vault_on_a_tmpfs_moves_to_disk() {
+        use std::os::unix::fs::MetadataExt;
+        let shm = tempfile::tempdir_in("/dev/shm").expect("a folder in /dev/shm, the tmpfs every Linux has");
+        let disk = tempfile::tempdir().unwrap();
+        assert_ne!(
+            fs::metadata(shm.path()).unwrap().dev(),
+            fs::metadata(disk.path()).unwrap().dev(),
+            "TMPDIR must be on another filesystem than /dev/shm for this test"
+        );
+        let (old, _) = old_vault(shm.path(), b"sealed on tmpfs");
+        let state = disk.path().join("state/harar/vault.age");
+        fs::create_dir_all(state.parent().unwrap()).unwrap();
+        assert_eq!(fs::rename(&old, &state).unwrap_err().raw_os_error(), Some(libc::EXDEV), "a plain rename can't cross");
+        assert!(prepare_state(&state, Some(&old)).unwrap());
+        assert_eq!(fs::read(&state).unwrap(), b"sealed on tmpfs");
+        assert_eq!(mode(&state), 0o600);
+        assert!(!old.exists());
     }
 }
