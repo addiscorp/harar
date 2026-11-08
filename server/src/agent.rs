@@ -324,30 +324,17 @@ pub(crate) fn session_of(pid: i32) -> i32 {
     if sid > 0 { sid } else { pid }
 }
 
-/// Default agent socket: in the user's harar folder on macOS, in
-/// `$XDG_RUNTIME_DIR/harar` on Linux.
+/// Default agent socket: the client's (`harar::vault()` finds the agent there).
 pub(crate) fn default_socket_path() -> PathBuf {
-    agent_dir().join("agent.sock")
+    harar::default_agent_socket()
 }
 
 pub(crate) fn default_ssh_socket_path() -> PathBuf {
-    agent_dir().join("ssh.sock")
+    harar::agent_dir().join("ssh.sock")
 }
 
 pub(crate) fn default_state_path() -> PathBuf {
-    agent_dir().join("vault.age")
-}
-
-fn agent_dir() -> PathBuf {
-    #[cfg(target_os = "macos")]
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join("Library/Application Support/harar");
-    }
-    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime).join("harar");
-    }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
-    home.join(".harar")
+    harar::agent_dir().join("vault.age")
 }
 
 pub(crate) fn disable_core_dumps() -> Result<()> {

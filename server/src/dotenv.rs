@@ -3,14 +3,8 @@
 
 use anyhow::{Result, anyhow};
 
-pub const REFERENCE_PREFIX: &str = "harar://";
-
-/// The vault key a value refers to, if the whole value is a reference.
-pub fn reference(value: &str) -> Option<&str> {
-    value
-        .strip_prefix(REFERENCE_PREFIX)
-        .filter(|key| !key.is_empty() && !key.chars().any(char::is_whitespace))
-}
+// The client's, so `harar run` and `secrets().resolve` read a reference alike.
+pub use harar::{REFERENCE_PREFIX, reference};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Line {

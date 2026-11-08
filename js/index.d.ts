@@ -1,14 +1,28 @@
-/** A vault on harar's local socket: where each secret may go, and the
- *  secret itself for one host only. The shape a gateway asks for
- *  (`import { gateway } from 'rixse'`). */
+/** A vault on harar's local socket. */
 export interface Vault {
-  /** The host patterns `secret` may go to: an exact name, or `*.example.com`
-   *  for any name under it (never the name itself). */
+  /** `harar://` references resolved to their values, the shape of 1Password's
+   *  `client.secrets.resolve('op://…')`. Read when asked for; held only by you. */
+  secrets: {
+    /** The value `reference` (`harar://prod/shop/STRIPE_KEY`) names. */
+    resolve(reference: string): Promise<string>
+    /** Each reference's value, in order; the first that fails is the error. */
+    resolveAll(references: string[]): Promise<string[]>
+  }
+  /** For a gateway (`import { gateway } from 'rixse'`): the host patterns
+   *  `secret` may go to, an exact name or `*.example.com` for any name under
+   *  it (never the name itself). */
   hosts(secret: string): Promise<string[]>
-  /** `secret`'s value, for a request to `host` only. harar decides, and
-   *  records the host. */
+  /** For a gateway: `secret`'s value, for a request to `host` only. */
   send(secret: string, host: string): Promise<string>
 }
 
-/** harar at `socket`: a per-user agent or a primary. */
-export function vault(options: { socket: string }): Vault
+/** harar at `socket`: by default the per-user agent on this machine
+ *  (`harar agent`), else a primary (`/run/harar.sock`). */
+export function vault(options?: { socket?: string }): Vault
+
+/** What a reference to a vault key starts with. */
+export const REFERENCE_PREFIX: 'harar://'
+/** The vault key `value` names, if the whole value is a `harar://` reference. */
+export function reference(value: string): string | undefined
+/** Where the per-user agent listens. */
+export function agentSocket(): string

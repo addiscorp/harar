@@ -84,4 +84,47 @@ class VaultTest < Minitest::Test
     assert_match %r{harar at /nonexistent/h\.sock}, e.message
     assert_match(/absolute path/, assert_raises(ArgumentError) { Harar.vault(socket: "relative.sock") }.message)
   end
+
+  def test_secrets_resolve_reads_the_key_a_harar_reference_names
+    values = { "prod/shop/STRIPE_KEY" => "sk_live_real", "prod/shop/OTHER" => "other" }
+    answer = lambda do |r|
+      if values.key?(r["key"])
+        JSON.generate(ok: true, value: values[r["key"]])
+      else
+        JSON.generate(ok: false, error: "not_found")
+      end
+    end
+    harar(answer) do |socket, requests|
+      v = Harar.vault(socket: socket)
+      assert_equal "sk_live_real", v.secrets.resolve("harar://prod/shop/STRIPE_KEY")
+      assert_equal %w[sk_live_real other], v.secrets.resolve_all(%w[harar://prod/shop/STRIPE_KEY harar://prod/shop/OTHER])
+      e = assert_raises(Harar::Error) { v.secrets.resolve("harar://prod/shop/GONE") }
+      assert_match %r{harar refused harar://prod/shop/GONE: not_found}, e.message
+      # Not a reference: refused before harar is asked anything.
+      ["prod/shop/STRIPE_KEY", "op://Prod/Stripe/credential", "harar://", "harar://a b", nil].each do |not_one|
+        assert_match %r{not a harar:// reference}, assert_raises(Harar::Error) { v.secrets.resolve(not_one) }.message
+      end
+      assert_equal [
+        { "op" => "get", "key" => "prod/shop/STRIPE_KEY" },
+        { "op" => "get", "key" => "prod/shop/STRIPE_KEY" },
+        { "op" => "get", "key" => "prod/shop/OTHER" },
+        { "op" => "get", "key" => "prod/shop/GONE" }
+      ], requests
+    end
+  end
+
+  def test_vault_with_no_socket_asks_the_agent_where_harar_agent_listens
+    saved = ENV.to_h.slice("HOME", "XDG_RUNTIME_DIR")
+    ENV["HOME"] = "/home/someone"
+    ENV["XDG_RUNTIME_DIR"] = "/run/user/1000"
+    darwin = RUBY_PLATFORM.include?("darwin")
+    want = darwin ? "/home/someone/Library/Application Support/harar/agent.sock" : "/run/user/1000/harar/agent.sock"
+    assert_equal want, Harar.agent_socket
+    e = assert_raises(Harar::Error) { Harar.vault.secrets.resolve("harar://a/b") }
+    assert e.message.start_with?("harar at #{want}:"), e.message
+    ENV.delete("XDG_RUNTIME_DIR")
+    assert_equal "/home/someone/.harar/agent.sock", Harar.agent_socket unless darwin
+  ensure
+    %w[HOME XDG_RUNTIME_DIR].each { |k| saved&.key?(k) ? ENV[k] = saved[k] : ENV.delete(k) }
+  end
 end

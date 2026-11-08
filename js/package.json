@@ -1,6 +1,6 @@
 {
   "name": "harar",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "harar's client: import { vault } from 'harar'. Where each secret may go, and the secret itself for one host only.",
   "license": "Apache-2.0",
   "homepage": "https://harar.addis.org",

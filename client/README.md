@@ -6,22 +6,33 @@ is the OS user your program runs as: the kernel tells harar.
 
 ```toml
 [dependencies]
-harar = "0.2"
+harar = "0.3"
 ```
 
 ```rust,no_run
-use harar::{VaultClient, VaultClientError};
+use harar::{VaultClientError, vault};
 
 async fn example() -> Result<(), VaultClientError> {
-    let v = VaultClient::from_socket_path(harar::DEFAULT_PRIMARY_SOCKET);
-    let database_url = v.get("prod/site/DATABASE_URL").await?;
+    // The harar agent on this machine (`harar agent`): no account, no token.
+    // It answers only the user it runs as, and the first time a terminal
+    // asks, it asks you to approve (Touch ID on a Mac).
+    let harar = vault();
 
-    // Where a secret may go, and the secret for that host only.
-    let hosts = v.hosts("prod/shop/STRIPE_KEY").await?; // ["api.stripe.com"]
-    let key = v.send("prod/shop/STRIPE_KEY", "api.stripe.com").await?;
+    // A `harar://` reference names a vault key, as `op://` names a 1Password
+    // field. The value is read now and held only in memory.
+    let key = harar.secrets().resolve("harar://prod/shop/STRIPE_KEY").await?;
+    let both = harar.secrets().resolve_all(&["harar://prod/shop/STRIPE_KEY", "harar://prod/site/DATABASE_URL"]).await?;
+
+    // A primary's socket instead of the agent's.
+    let primary = harar::VaultClient::from_socket_path(harar::DEFAULT_PRIMARY_SOCKET);
+    let database_url = primary.secrets().resolve("harar://prod/site/DATABASE_URL").await?;
     Ok(())
 }
 ```
+
+A gateway that attaches a key on its way out asks where it may go, and for
+it for one host only: `hosts("prod/shop/STRIPE_KEY")` and
+`send("prod/shop/STRIPE_KEY", "api.stripe.com")`.
 
 harar itself is the binary, installed from its releases, not from crates.io:
 
