@@ -65,7 +65,9 @@ export type Action =
   | "token.create"
   | "token.list"
   | "token.revoke"
-  | "log.read";
+  | "log.read"
+  | "recovery.set"
+  | "recovery.read";
 
 // ---------------------------------------------------------------- adapters
 
@@ -114,6 +116,7 @@ export const SCHEMA = [
 const MAX_BODY = 64 * 1024;
 const MAX_VALUE = 32 * 1024;
 const MAX_REFS = 100;
+const MAX_RECOVERY = 8 * 1024;
 const CLOCK_SKEW_S = 300;
 const NONCE_LIFE_MS = 10 * 60 * 1000;
 const PAIRING_LIFE_MS = 10 * 60 * 1000;
@@ -163,6 +166,12 @@ function concat(a: Uint8Array, b: Uint8Array): Bytes {
   out.set(a);
   out.set(b, a.length);
   return out;
+}
+
+/** A key's id: the first 16 hex of sha256("harar-edge-key-id\n" || key). The
+ *  harar CLI computes the same (cli/edge.rs key_id). */
+export async function keyId(raw: Uint8Array): Promise<string> {
+  return (await sha256(concat(utf8.encode("harar-edge-key-id\n"), raw))).slice(0, 16);
 }
 
 // ---------------------------------------------------------------- sealing
@@ -280,6 +289,13 @@ export function edge(config: Config): { fetch(request: Request): Promise<Respons
   }
 
   const iso = (ms = now()) => new Date(ms).toISOString();
+
+  /** Whether the edge key is usable, and its id (docs/edge.md §4). */
+  async function keyStatus(): Promise<{ ready: boolean; id: string | null }> {
+    const raw = unb64(config.key ?? "");
+    if (!raw || raw.length !== 32) return { ready: false, id: null };
+    return { ready: true, id: await keyId(raw) };
+  }
 
   // ---------------------------------------------------------- the log
 
@@ -676,6 +692,37 @@ export function edge(config: Config): { fetch(request: Request): Promise<Respons
       };
     }
 
+    // The edge key, encrypted with the recovery code (age, scrypt), so the
+    // paper code and this database together can restore the key if the
+    // platform loses it. Neither alone opens anything (docs/edge.md §4).
+    if (method === "PUT" && path === "/v1/recovery") {
+      const by = device(actor);
+      const { sealed } = input();
+      if (typeof sealed !== "string" || sealed.length === 0 || sealed.length > MAX_RECOVERY) {
+        throw new Refusal(400, "bad_request", `recovery takes { sealed }, at most ${MAX_RECOVERY} characters`);
+      }
+      return {
+        action: "recovery.set",
+        resource: "",
+        act: async () => {
+          const value = JSON.stringify({ sealed, by, at: iso() });
+          await sql.query(`INSERT INTO harar_meta (k, v) VALUES ('recovery', ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v`, [value]);
+          return { status: 200, body: { stored: true } };
+        },
+      };
+    }
+
+    if (method === "GET" && path === "/v1/recovery") {
+      device(actor);
+      const [row] = await sql.query(`SELECT v FROM harar_meta WHERE k = 'recovery'`);
+      if (!row) throw new Refusal(404, "not_found", "this edge has no recovery copy of its key");
+      return {
+        action: "recovery.read",
+        resource: "",
+        act: async () => ({ status: 200, body: JSON.parse(String(row.v)) }),
+      };
+    }
+
     if (method === "GET" && path === "/v1/log") {
       device(actor);
       const after = url.searchParams.get("after") ?? "0";
@@ -715,6 +762,8 @@ export function edge(config: Config): { fetch(request: Request): Promise<Respons
       ["GET", /^\/v1\/tokens$/, "token.list"],
       ["DELETE", /^\/v1\/tokens\//, "token.revoke"],
       ["GET", /^\/v1\/log$/, "log.read"],
+      ["PUT", /^\/v1\/recovery$/, "recovery.set"],
+      ["GET", /^\/v1\/recovery$/, "recovery.read"],
     ];
     return routes.find(([m, re]) => m === method && re.test(path))?.[2] ?? null;
   }
@@ -730,7 +779,14 @@ export function edge(config: Config): { fetch(request: Request): Promise<Respons
       if (base && !(url.pathname === base || url.pathname.startsWith(base + "/"))) return json(404, { error: "no_route", message: "not here" });
       const path = url.pathname.slice(base.length) || "/";
       if (request.method === "GET" && path === "/v1/health") {
-        return json(200, { version: VERSION, log: { sinks: sinks.length, whenSinksFail: refuseWithoutSinks ? "refuse" : "serve" } });
+        return json(200, {
+          version: VERSION,
+          // Whether the platform gave the edge a usable key, and which one:
+          // `harar edge pair` and `recover` compare the id with the key they
+          // hold. The id is a hash; it can't be turned back into the key.
+          key: await keyStatus(),
+          log: { sinks: sinks.length, whenSinksFail: refuseWithoutSinks ? "refuse" : "serve" },
+        });
       }
       const ip = ipOf(request);
       let actor: Actor = { kind: "anonymous" };

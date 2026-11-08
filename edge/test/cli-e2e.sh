@@ -31,7 +31,11 @@ expect() { # <json> <path> <want>
   ' "$1" "$2" "$3"
 }
 
-"$harar" edge init --vercel --dir "$work/edge" --log-sink "" </dev/null >/dev/null
+init="$("$harar" edge init --vercel --dir "$work/edge" --log-sink "" </dev/null)"
+recovery_code="$(node -e 'console.log(JSON.parse(process.argv[1]).recovery_code)' "$init")"
+cp "$work/edge/.harar-edge.key" "$work/original.key"
+# A second folder, with its own key, to pair against the wrong edge.
+"$harar" edge init --vercel --dir "$work/other" --log-sink "" </dev/null >/dev/null
 node test/serve-node.ts "$work/edge" "$port" >"$work/server.log" 2>&1 &
 server=$!
 i=0
@@ -39,9 +43,20 @@ until curl -fs -o /dev/null "$url/v1/health"; do
   i=$((i + 1)); [ "$i" -lt 50 ] || { cat "$work/server.log"; exit 1; }; sleep 0.2
 done
 
-expect "$("$harar" edge pair "$url" --dir "$work/edge" --file-key --name ci)" ok true
-[ ! -e "$work/edge/.harar-edge.setup" ] || { echo "pair left the used setup code behind"; exit 1; }
-echo "ok  paired with the setup code from init, which is gone now"
+if out="$("$harar" edge pair "$url" --dir "$work/other" --file-key --name wrong 2>&1)"; then
+  echo "pair accepted an edge with a different key: $out"; exit 1
+fi
+case "$out" in *"different edge key"*) ;; *) echo "pair refused for the wrong reason: $out"; exit 1 ;; esac
+[ -e "$work/other/.harar-edge.key" ] || { echo "a refused pair removed its key file"; exit 1; }
+echo "ok  pair refuses an edge whose key isn't the folder's, and keeps the key file"
+
+paired="$("$harar" edge pair "$url" --dir "$work/edge" --file-key --name ci)"
+expect "$paired" ok true
+expect "$paired" edge_key_backup "the recovery code"
+for f in .harar-edge.setup .harar-edge.key .harar-edge.recovery; do
+  [ ! -e "$work/edge/$f" ] || { echo "pair left $f behind"; exit 1; }
+done
+echo "ok  paired with the setup code from init; the key, setup code and recovery copy are gone from disk"
 
 expect "$(printf 'sk_live_ci' | "$harar" edge put prod/shop/STRIPE_KEY --secret-stdin)" version 1
 printf 'postgres://ci' | "$harar" edge put prod/site/DATABASE_URL --secret-stdin >/dev/null
@@ -61,7 +76,18 @@ expect "$("$harar" edge token revoke "$id")" revoked "$id"
 expect "$(resolve prod/shop/STRIPE_KEY)" error revoked
 echo "ok  rotated, then revoked"
 
+# The platform lost the key: the paper code and the edge's copy restore it.
+printf '%s' "$recovery_code" | "$harar" edge recover --with-code --secret-stdin >"$work/recovered.key" 2>"$work/recover.json"
+cmp -s "$work/recovered.key" "$work/original.key" || { echo "recover gave back a different key"; exit 1; }
+expect "$(cat "$work/recover.json")" edge_has "this key: nothing to restore"
+if printf 'abcd-efgh-jkmn-pqrs-tvwx-yz01-2345' | "$harar" edge recover --with-code --secret-stdin >"$work/wrong.key" 2>"$work/wrong.err"; then
+  echo "a wrong recovery code opened the copy"; exit 1
+fi
+[ ! -s "$work/wrong.key" ] || { echo "a wrong code still wrote something"; exit 1; }
+grep -q "doesn't open" "$work/wrong.err" || { echo "a wrong code failed for the wrong reason: $(cat "$work/wrong.err")"; exit 1; }
+echo "ok  recover --with-code gives back exactly init's key, and a wrong code gets nothing"
+
 log="$("$harar" edge log)"
 expect "$log" chain intact
-expect "$log" log.length 11
-echo "ok  the log: 11 rows, the CLI finds its chain intact"
+expect "$log" log.length 14
+echo "ok  the log: 14 rows, the CLI finds its chain intact"
