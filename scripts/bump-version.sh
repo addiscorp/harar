@@ -34,6 +34,7 @@ for path in ("README.md", "client/README.md"):
 bump("js/package.json", r'(^  "version": ")([^"]+)(")')
 bump("python/pyproject.toml", r'(^version = ")([^"]+)(")')
 bump("ruby/lib/harar/version.rb", r'(^  VERSION = ")([^"]+)(")')
+bump("edge/harar-edge.ts", r'(^export const VERSION = ")([^"]+)(")')
 PY
 # Cargo.lock records the workspace's own versions.
 cargo update --workspace --offline --quiet

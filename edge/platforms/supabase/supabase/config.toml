@@ -1,0 +1,5 @@
+# harar edge on Supabase, written by `harar edge init --supabase`.
+# harar authenticates every caller itself (signed devices, service tokens),
+# so Supabase's own JWT check is off for this function.
+[functions.harar-edge]
+verify_jwt = false

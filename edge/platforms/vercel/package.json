@@ -1,0 +1,7 @@
+{
+  "name": "harar-edge",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "dependencies": { "postgres": "3.4.9" }
+}

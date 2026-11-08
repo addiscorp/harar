@@ -1,0 +1,5 @@
+{
+  "cloudflare": { "core": "harar-edge.ts", "entry": "worker.ts" },
+  "vercel": { "core": "harar-edge.ts", "entry": "api/harar.ts" },
+  "supabase": { "core": "supabase/functions/harar-edge/harar-edge.ts", "entry": "supabase/functions/harar-edge/index.ts" }
+}

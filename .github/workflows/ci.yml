@@ -92,6 +92,37 @@ jobs:
       - run: |
           php -r 'require "vendor/autoload.php"; exit(Harar\vault(socket: "/run/harar.sock") instanceof Harar\Vault ? 0 : 1);'
 
+  # harar edge (edge/, docs/edge.md): the one-file API's tests on SQLite and
+  # on Postgres, its types, and each platform's entry file typechecked
+  # against it (tsc for Cloudflare and Vercel, deno check for Supabase).
+  edge:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: edge-test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 15
+    defaults:
+      run:
+        working-directory: edge
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: v2.x
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+        env:
+          HARAR_TEST_POSTGRES: postgres://postgres:edge-test@127.0.0.1:5432/postgres
+      - run: test/check-platforms.sh
+
   # The Go module github.com/addiscorp/harar/go: its tests on the oldest Go
   # it supports and the newest, and gofmt and vet clean.
   go:

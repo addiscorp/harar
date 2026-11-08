@@ -18,11 +18,12 @@ got = {
     "js/package.json": json.load(open("js/package.json"))["version"],
     "python/pyproject.toml": one("python/pyproject.toml", r'^version = "([^"]+)"$'),
     "ruby/lib/harar/version.rb": one("ruby/lib/harar/version.rb", r'^  VERSION = "([^"]+)"$'),
+    "edge/harar-edge.ts": one("edge/harar-edge.ts", r'^export const VERSION = "([^"]+)";$'),
 }
 wrong = {path: v for path, v in got.items() if v != version}
 if wrong:
     sys.exit("harar's release version is %s, but %s" % (version, ", ".join("%s says %s" % kv for kv in wrong.items())))
 if "version" in json.load(open("composer.json")):
     sys.exit("composer.json names a version; Packagist takes it from the vX.Y.Z tag")
-print("clients: npm harar %s, pypi harar %s, rubygems harar %s, packagist addis/harar from v%s" % (version, version, version, version))
+print("clients: npm harar %s, pypi harar %s, rubygems harar %s, packagist addis/harar from v%s, go from go/v%s, edge %s" % ((version,) * 6))
 PY
