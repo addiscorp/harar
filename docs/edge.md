@@ -66,11 +66,13 @@ answer also has a flag, so CI can run it, except a secret: those are asked for
 with a no-echo prompt and never taken as an argument. The written files carry
 harar's version; `harar edge update` (later) refreshes the core file.
 
-`init` never replaces a file. It also writes two 0600 files, which git
-ignores: `.harar-edge.key` (the edge key, for the platform's secret store) and
-`.harar-edge.setup` (the setup code; Supabase also gets `.harar-edge.env`).
-For Supabase it adds the function's section to an existing
-`supabase/config.toml`. It prints the steps that are left. On Cloudflare:
+`init` never replaces a file. It also writes three 0600 files, which git
+ignores: `.harar-edge.key` (the edge key, for the platform's secret store),
+`.harar-edge.setup` (the setup code) and `.harar-edge.recovery` (the edge key
+encrypted with the recovery code); Supabase also gets `.harar-edge.env`. It
+shows the **recovery code** once (section 4a). For Supabase it adds the
+function's section to an existing `supabase/config.toml`. It prints the steps
+that are left. On Cloudflare:
 
 ```sh
 cd harar-edge
@@ -89,7 +91,8 @@ next to the agent's state.
 | Command | Does |
 |---|---|
 | `harar edge init --cloudflare\|--vercel\|--supabase [--dir] [--log-sink]` | writes the folder (above) |
-| `harar edge pair <url> [--dir] [--name] [--file-key]` | pairs with the setup code from `--dir` (then removes it), or a code typed at a no-echo prompt |
+| `harar edge pair <url> [--dir] [--name] [--file-key]` | pairs with the setup code from `--dir`, or a code typed at a no-echo prompt. With `--dir`, it first checks the edge has the folder's key (section 4a), and afterwards removes the key, setup code and recovery copy from disk |
+| `harar edge recover [--with-code] [--out <file>] [--env]` | restores the edge key (section 4a), to stdout for piping into the platform, never to a terminal |
 | `harar edge pairing` | a one-time code for another device (10 minutes) |
 | `harar edge devices`, `harar edge unpair <id>` | the paired devices |
 | `harar edge put <path> [--rotate]`, `harar edge delete <path>`, `harar edge secrets` | secrets; the value is typed twice at a no-echo prompt, or `--secret-stdin` |
@@ -156,6 +159,57 @@ wrapped by the edge key. The associated data is `path | version`, so a
 ciphertext moved to another row fails to decrypt. This mirrors harar's own key
 ladder.
 
+## 4a. The edge key: where it comes from, and its backups
+
+**Where it comes from.** `harar edge init` takes 32 bytes from the operating
+system's random generator. It is never printed, logged or passed as an
+argument: it goes into `.harar-edge.key` (0600), and from there to the
+platform over stdin (`npx wrangler secret put HARAR_EDGE_KEY <
+.harar-edge.key`). The platform then holds it where nobody can read it back,
+and the edge reads it per request.
+
+**Its id.** `/v1/health` reports `key: { ready, id }`, where `id` is the first
+16 hex of `sha256("harar-edge-key-id\n" || key)`. It says *which* key the edge
+has without revealing it.
+
+**Nothing readable stays on disk.** `harar edge pair --dir` refuses until the
+edge reports the folder key's id, so the platform certainly has it. Then:
+
+1. **On a Mac**, it seals the key to this Mac's Secure Enclave key (Apple's
+   ECIES, as harar's master key) and keeps that in `edges.json`. Only this
+   Mac can open it, with Touch ID.
+2. It stores the **recovery copy** on the edge (`PUT /v1/recovery`).
+3. It removes `.harar-edge.key`, `.harar-edge.env`, `.harar-edge.recovery`
+   and `.harar-edge.setup`.
+
+**The recovery code** is for people without the app, and a backup for those
+with it.
+- `init` shows it once: 28 Crockford base32 characters (140 bits) in groups
+  of four, read the way harar's recovery codes are (`o` as `0`, `i` and `l`
+  as `1`, any case, dashes optional).
+- The key is encrypted with it using age with scrypt (slow to guess), and
+  that copy lives on the edge.
+- So restoring needs **both the paper and the edge's database**; neither
+  alone opens anything.
+
+**If the platform loses the key**, any of these restores it, with nothing
+re-entered, because the sealed rows are intact:
+
+```sh
+harar edge recover | npx wrangler secret put HARAR_EDGE_KEY               # this Mac: Touch ID
+harar edge recover --with-code | npx wrangler secret put HARAR_EDGE_KEY   # the recovery code
+```
+
+`recover` refuses to print the key to a terminal. It says whether the edge
+has no key, this one, or a different one. Device requests don't use the edge
+key, so they work while it is missing.
+
+**The phone (phase 3)** pairs with a Secure Enclave key-agreement key, and the
+edge seals its key to it, so every phone holds a copy only it can open.
+`/v1/recovery` is for devices only, and every read of it is logged.
+
+**Not yet:** `harar edge rekey`, to move every data key to a new edge key.
+
 ## 5. The API (phase 1)
 
 All bodies are JSON. Errors are `{ "error": "<code>", "message": "…" }` with a
@@ -163,7 +217,7 @@ All bodies are JSON. Errors are `{ "error": "<code>", "message": "…" }` with a
 
 | Endpoint | Caller | Does |
 |---|---|---|
-| `GET /v1/health` | anyone | `{ version }` |
+| `GET /v1/health` | anyone | `{ version, key: { ready, id }, log }` |
 | `POST /v1/pair` | a new device | `{ code, name, public_key }` → `{ device }`. `public_key` is the raw P-256 point, base64url. |
 | `POST /v1/pairings` | device | → `{ code, expires_at }` |
 | `GET /v1/devices` | device | the paired devices |
@@ -176,6 +230,7 @@ All bodies are JSON. Errors are `{ "error": "<code>", "message": "…" }` with a
 | `GET /v1/tokens` | device | the tokens, never their secrets |
 | `DELETE /v1/tokens/{id}` | device | revokes it |
 | `GET /v1/log?after={seq}` | device | log rows after `seq` |
+| `PUT /v1/recovery`, `GET /v1/recovery` | device | the edge key encrypted with the recovery code (section 4a) |
 
 `resolve` takes the same `harar://` references as the clients'
 `secrets.resolve`, so a service moves between the local agent and the edge by
@@ -192,7 +247,7 @@ seq, at, actor, action, resource, decision, reason, ip, prev_hash, hash
 - `actor` is `device:<id>`, `token:<id>` or `anonymous`. `action` is one of
   `pair`, `pairing.create`, `device.remove`, `secret.put`, `secret.rotate`,
   `secret.delete`, `secret.list`, `resolve`, `token.create`, `token.revoke`,
-  `token.list`, `device.list`, `log.read`.
+  `token.list`, `device.list`, `log.read`, `recovery.set`, `recovery.read`.
 - **Values are never logged**, nor tokens or codes.
 - `hash = sha256(prev_hash || canonical row)`: changing or deleting a row
   breaks every later hash, as in harar's own audit (architecture §8).

@@ -59,6 +59,12 @@ pub struct StoredCode {
 /// Crockford's look-alikes read as what they look like (o as 0, i and l as 1).
 /// None if it can't be a code.
 fn normalize(code: &str) -> Option<String> {
+    normalize_code(code, 16)
+}
+
+/// A code of `len` characters as typed or pasted, read the way `normalize`
+/// reads a recovery code. None if it can't be one.
+pub fn normalize_code(code: &str, len: usize) -> Option<String> {
     if code.len() > MAX_INPUT {
         return None;
     }
@@ -71,7 +77,18 @@ fn normalize(code: &str) -> Option<String> {
             c => c,
         })
         .collect();
-    (out.len() == 16).then_some(out)
+    (out.len() == len).then_some(out)
+}
+
+/// A fresh code of `len` Crockford characters (5 bits each), in groups of
+/// four: `xxxx-xxxx-…`. Recovery codes are 16 (80 bits); the code that
+/// opens an edge key's recovery copy is 28 (140 bits).
+pub fn new_code(len: usize) -> String {
+    let mut bytes = vec![0_u8; len];
+    OsRng.fill_bytes(&mut bytes);
+    // 256 is a multiple of 32, so each character is uniform.
+    let chars: Vec<char> = bytes.iter().map(|b| ALPHABET[usize::from(*b) % 32] as char).collect();
+    chars.chunks(4).map(|group| group.iter().collect::<String>()).collect::<Vec<_>>().join("-")
 }
 
 /// A fresh set of codes for `human` (`xxxx-xxxx-xxxx-xxxx`, 80 bits each),
@@ -81,11 +98,7 @@ pub fn replace_recovery_codes(stored: &mut Vec<StoredCode>, human: &Name) -> Vec
     stored.retain(|code| &code.human != human);
     let mut codes = Vec::with_capacity(RECOVERY_CODES);
     for _ in 0..RECOVERY_CODES {
-        let mut bytes = [0_u8; 16];
-        OsRng.fill_bytes(&mut bytes);
-        // 256 is a multiple of 32, so each character is uniform.
-        let chars: Vec<char> = bytes.iter().map(|b| ALPHABET[usize::from(*b) % 32] as char).collect();
-        let code = chars.chunks(4).map(|group| group.iter().collect::<String>()).collect::<Vec<_>>().join("-");
+        let code = new_code(16);
         let normal = normalize(&code).expect("a fresh code is well formed");
         stored.push(StoredCode { human: human.clone(), hash: hash(CODE_CONTEXT, &normal) });
         codes.push(code);

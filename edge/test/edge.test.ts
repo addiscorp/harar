@@ -6,7 +6,7 @@ import { createHash, webcrypto } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { after, describe, test } from "node:test";
 
-import { VERSION, edge, postgres, type Config, type Row, type Sql } from "../harar-edge.ts";
+import { VERSION, edge, keyId, postgres, type Config, type Row, type Sql } from "../harar-edge.ts";
 
 const SETUP = "the-setup-code-from-init";
 const setupHash = createHash("sha256").update(SETUP).digest("hex");
@@ -397,8 +397,48 @@ for (const backend of backends) {
     test("health says the version and the logging, and a base path mounts the API", async () => {
       const { api } = await setup(backend, { basePath: "/harar-edge" });
       const health = await api.fetch(new Request("https://x.supabase.co/harar-edge/v1/health"));
-      assert.deepEqual(await health.json(), { version: VERSION, log: { sinks: 0, whenSinksFail: "serve" } });
+      const id = createHash("sha256").update(Buffer.concat([Buffer.from("harar-edge-key-id\n"), Buffer.from(KEY, "base64")])).digest("hex").slice(0, 16);
+      assert.deepEqual(await health.json(), { version: VERSION, key: { ready: true, id }, log: { sinks: 0, whenSinksFail: "serve" } });
+      assert.equal(await keyId(Buffer.from(KEY, "base64")), id);
       assert.equal((await api.fetch(new Request("https://x.supabase.co/v1/health"))).status, 404);
+    });
+
+    test("health says when the platform gave the edge no usable key, and the edge serves nothing sealed", async () => {
+      const { call, clock } = await setup(backend, { key: "" });
+      assert.deepEqual((await call("GET", "/v1/health")).body.key, { ready: false, id: null });
+      const mac = await device(call, clock);
+      const put = await mac.as("PUT", "/v1/secrets/k", { value: "v" });
+      assert.deepEqual([put.status, put.body.error], [500, "edge_key"]);
+    });
+
+    test("the recovery copy is kept for devices only, replaced by the newest, and every read is logged", async () => {
+      const { call, clock } = await setup(backend);
+      const mac = await device(call, clock);
+      assert.deepEqual((await mac.as("GET", "/v1/recovery")).body.error, "not_found");
+      assert.equal((await mac.as("PUT", "/v1/recovery", { sealed: "age-encrypted-1" })).status, 200);
+      assert.equal((await mac.as("PUT", "/v1/recovery", { sealed: "age-encrypted-2" })).status, 200);
+      const got = await mac.as("GET", "/v1/recovery");
+      assert.deepEqual([got.status, got.body.sealed, got.body.by], [200, "age-encrypted-2", mac.id]);
+
+      const made = await mac.as("POST", "/v1/tokens", { name: "svc", read: ["*"], write: ["*"] });
+      const bearer = { authorization: `Bearer ${made.body.token}` };
+      assert.equal((await call("GET", "/v1/recovery", { headers: bearer })).body.error, "devices_only");
+      assert.equal((await call("PUT", "/v1/recovery", { body: { sealed: "evil" }, headers: bearer })).body.error, "devices_only");
+      assert.equal((await mac.as("GET", "/v1/recovery")).body.sealed, "age-encrypted-2");
+
+      const log = (await mac.as("GET", "/v1/log")).body.log.filter((r: Row) => String(r.action).startsWith("recovery"));
+      assert.deepEqual(
+        log.map((r: Row) => [r.action, r.decision, r.reason]),
+        [
+          ["recovery.read", "deny", "not_found"],
+          ["recovery.set", "allow", ""],
+          ["recovery.set", "allow", ""],
+          ["recovery.read", "allow", ""],
+          ["recovery.read", "deny", "devices_only"],
+          ["recovery.set", "deny", "devices_only"],
+          ["recovery.read", "allow", ""],
+        ],
+      );
     });
   });
 }

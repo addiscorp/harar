@@ -34,6 +34,11 @@ const KEY_FILE: &str = ".harar-edge.key";
 const ENV_FILE: &str = ".harar-edge.env";
 /// The setup code, until `harar edge pair --dir` uses it and removes it.
 const SETUP_FILE: &str = ".harar-edge.setup";
+/// The edge key encrypted with the recovery code (age, scrypt), until
+/// `harar edge pair --dir` stores it on the edge and removes it.
+const RECOVERY_FILE: &str = ".harar-edge.recovery";
+/// Characters in the recovery code: 28 Crockford characters, 140 bits.
+const RECOVERY_CODE_LEN: usize = 28;
 
 #[derive(Debug, Args)]
 pub struct Edge {
@@ -64,6 +69,11 @@ enum EdgeCmd {
     Token(TokenCmd),
     /// The edge's log, with its hash chain checked.
     Log(Log),
+    /// Restore the edge key if the platform lost it: from this Mac's sealed
+    /// copy (Touch ID), or with --with-code from the recovery code and the
+    /// copy on the edge. Pipe it to the platform:
+    /// harar edge recover | npx wrangler secret put HARAR_EDGE_KEY
+    Recover(Recover),
 }
 
 #[derive(Debug, Args)]
@@ -216,6 +226,7 @@ fn run_blocking(cmd: Edge) -> Result<()> {
         EdgeCmd::Token(TokenCmd::List(t)) => print_json(&Paired::find(&t)?.call("GET", "/v1/tokens", None)?),
         EdgeCmd::Token(TokenCmd::Revoke(cmd)) => print_json(&Paired::find(&cmd.target)?.call("DELETE", &format!("/v1/tokens/{}", cmd.id), None)?),
         EdgeCmd::Log(cmd) => log(cmd),
+        EdgeCmd::Recover(cmd) => recover(cmd),
     }
 }
 
@@ -278,9 +289,13 @@ fn init(cmd: Init) -> Result<()> {
     let mut code = [0u8; 16];
     OsRng.fill_bytes(&mut code);
     let code = URL_SAFE_NO_PAD.encode(code);
-    let mut key = zeroize::Zeroizing::new([0u8; 32]);
-    OsRng.fill_bytes(&mut *key);
-    let key = zeroize::Zeroizing::new(STANDARD.encode(*key));
+    let mut raw_key = zeroize::Zeroizing::new([0u8; 32]);
+    OsRng.fill_bytes(&mut *raw_key);
+    let key = zeroize::Zeroizing::new(STANDARD.encode(*raw_key));
+    // The key's paper backup: a code shown once, and the key encrypted with
+    // it, which `pair` stores on the edge. Each alone opens nothing.
+    let recovery_code = harar::recovery::new_code(RECOVERY_CODE_LEN);
+    let recovery_copy = seal_with_code(&recovery_code, &*raw_key)?;
     let hash = hex(&Sha256::digest(code.as_bytes()));
     let files = edge_files(platform, &[("HARAR_SETUP_CODE_HASH", &hash), ("HARAR_LOG_SINK", &sink)])?;
 
@@ -303,6 +318,7 @@ fn init(cmd: Init) -> Result<()> {
     let secrets = [
         (dir.join(KEY_FILE), key.to_string()),
         (dir.join(SETUP_FILE), code.clone()),
+        (dir.join(RECOVERY_FILE), recovery_copy),
     ];
     let env = (platform == Platform::Supabase).then(|| (dir.join(ENV_FILE), format!("HARAR_EDGE_KEY={}\n", *key)));
     let existing: Vec<_> = writes
@@ -330,7 +346,7 @@ fn init(cmd: Init) -> Result<()> {
     for (path, text) in secrets.iter().chain(env.iter()) {
         write_private(path, text)?;
     }
-    ignore(&dir.join(".gitignore"), &[KEY_FILE, ENV_FILE, SETUP_FILE, ".dev.vars"])?;
+    ignore(&dir.join(".gitignore"), &[KEY_FILE, ENV_FILE, SETUP_FILE, RECOVERY_FILE, ".dev.vars"])?;
 
     let d = dir.display();
     let next: Vec<String> = match platform {
@@ -364,8 +380,9 @@ fn init(cmd: Init) -> Result<()> {
             "setup_code": dir.join(SETUP_FILE),
         },
         "log_sink": if sink.is_empty() { Value::Null } else { json!(sink) },
+        "recovery_code": recovery_code,
         "next": next,
-        "note": "The edge key and setup code are in 0600 files, ignored by git. Delete the key file once the platform has it; `harar edge pair --dir` removes the setup code when it pairs.",
+        "note": "Write the recovery code down now: it is shown this once. With it, the edge key can be restored if the platform loses it (harar edge recover --with-code). The edge key, setup code and recovery copy are in 0600 files, ignored by git; `harar edge pair --dir` checks the edge has the key, keeps a copy sealed to this Mac's Secure Enclave, stores the recovery copy on the edge, and removes all three.",
     }))
 }
 
@@ -475,6 +492,11 @@ struct Paired {
     device: String,
     name: String,
     key: StoredKey,
+    /// The edge key, sealed to this Mac's Secure Enclave (base64), when
+    /// this machine paired with the folder init wrote. Only this Mac can
+    /// open it, with Touch ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    edge_key: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -513,6 +535,20 @@ fn pair(cmd: Pair) -> Result<()> {
         bail!("this machine is already paired with {url}");
     }
     let setup = cmd.dir.as_ref().map(|d| d.join(SETUP_FILE)).filter(|p| p.exists());
+    // With init's folder, the edge must already have init's key: only then
+    // can the plaintext copy here be removed.
+    let init_key = match cmd.dir.as_ref().map(|d| d.join(KEY_FILE)).filter(|p| p.exists()) {
+        Some(path) => {
+            let raw = read_key_file(&path)?;
+            match edge_key_status(&url)? {
+                Some(id) if id == key_id(&raw) => {}
+                Some(_) => bail!("{url} has a different edge key than {}; set it with the platform (npx wrangler secret put HARAR_EDGE_KEY < {KEY_FILE}) and pair again", path.display()),
+                None => bail!("{url} has no edge key yet; set it with the platform first (npx wrangler secret put HARAR_EDGE_KEY < {KEY_FILE}), then pair"),
+            }
+            Some((path, raw))
+        }
+        None => None,
+    };
     let code = zeroize::Zeroizing::new(match &setup {
         Some(path) => fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?.trim().to_owned(),
         None => cmd.code.read("Pairing code")?,
@@ -535,10 +571,36 @@ fn pair(cmd: Pair) -> Result<()> {
         }
     };
     let device = answer["device"].as_str().ok_or_else(|| anyhow!("{url} paired, but named no device"))?.to_owned();
-    edges.edges.push(Paired { url: url.clone(), device: device.clone(), name: name.clone(), key: stored.clone() });
+    let edge_key = match (&init_key, &key) {
+        #[cfg(target_os = "macos")]
+        (Some((_, raw)), DeviceKey::Enclave(enclave)) => Some(STANDARD.encode(enclave.seal(&raw[..])?)),
+        _ => None,
+    };
+    let paired = Paired { url: url.clone(), device: device.clone(), name: name.clone(), key: stored.clone(), edge_key: edge_key.clone() };
+    edges.edges.push(paired.clone());
     write_edges(&edges)?;
+
+    let mut removed = Vec::new();
+    if let Some(dir) = &cmd.dir {
+        let recovery = dir.join(RECOVERY_FILE);
+        if recovery.exists() {
+            let sealed = fs::read_to_string(&recovery).with_context(|| format!("read {}", recovery.display()))?;
+            paired.call("PUT", "/v1/recovery", Some(&json!({ "sealed": sealed.trim() })))?;
+            fs::remove_file(&recovery)?;
+            removed.push(recovery.display().to_string());
+        }
+    }
+    if let Some((path, _)) = &init_key {
+        for file in [path.clone(), path.with_file_name(ENV_FILE)] {
+            if file.exists() {
+                fs::remove_file(&file).with_context(|| format!("remove {}", file.display()))?;
+                removed.push(file.display().to_string());
+            }
+        }
+    }
     if let Some(path) = setup {
         fs::remove_file(&path).with_context(|| format!("remove the used setup code {}", path.display()))?;
+        removed.push(path.display().to_string());
     }
     print_json(&json!({
         "ok": true,
@@ -546,6 +608,12 @@ fn pair(cmd: Pair) -> Result<()> {
         "device": device,
         "name": name,
         "key": match stored { StoredKey::SecureEnclave { .. } => "secure-enclave", StoredKey::File { .. } => "file" },
+        "edge_key_backup": match (&init_key, &edge_key) {
+            (None, _) => "none here (this machine didn't run init)",
+            (Some(_), Some(_)) => "sealed to this Mac's Secure Enclave, and the recovery code",
+            (Some(_), None) => "the recovery code",
+        },
+        "removed": removed,
     }))
 }
 
@@ -702,6 +770,126 @@ fn check_chain(rows: &[Value]) -> std::result::Result<(), u64> {
     Ok(())
 }
 
+// ------------------------------------------------------------------ the edge key
+
+#[derive(Debug, Args)]
+struct Recover {
+    /// Use the recovery code (asked for, never an argument) and the copy on
+    /// the edge, instead of this Mac's sealed copy.
+    #[arg(long)]
+    with_code: bool,
+    /// Write the key to this new 0600 file instead of stdout.
+    #[arg(long)]
+    out: Option<PathBuf>,
+    /// Write HARAR_EDGE_KEY=<key>, for `supabase secrets set --env-file`.
+    #[arg(long)]
+    env: bool,
+    /// The recovery code, with --with-code: a no-echo prompt, or stdin.
+    #[command(flatten)]
+    code: SecretInput,
+    #[command(flatten)]
+    target: Target,
+}
+
+/// A key's id, as the edge's /v1/health reports it: the first 16 hex of
+/// sha256("harar-edge-key-id\n" || key) (edge/harar-edge.ts keyId).
+fn key_id(raw: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"harar-edge-key-id\n");
+    hasher.update(raw);
+    hex(&hasher.finalize())[..16].to_owned()
+}
+
+/// The id of the key the edge has, or None when it has no usable key.
+fn edge_key_status(url: &str) -> Result<Option<String>> {
+    let health = send(url, "GET", "/v1/health", None, None)?;
+    Ok(match (health["key"]["ready"].as_bool(), health["key"]["id"].as_str()) {
+        (Some(true), Some(id)) => Some(id.to_owned()),
+        _ => None,
+    })
+}
+
+fn read_key_file(path: &Path) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    let text = zeroize::Zeroizing::new(fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?);
+    let raw = zeroize::Zeroizing::new(STANDARD.decode(text.trim()).with_context(|| format!("{} is not base64", path.display()))?);
+    if raw.len() != 32 {
+        bail!("{} is not a 32-byte edge key", path.display());
+    }
+    Ok(raw)
+}
+
+/// `raw` encrypted with the recovery code (age, scrypt), base64.
+fn seal_with_code(code: &str, raw: &[u8]) -> Result<String> {
+    let normal = harar::recovery::normalize_code(code, RECOVERY_CODE_LEN).ok_or_else(|| anyhow!("not a recovery code"))?;
+    let recipient = age::scrypt::Recipient::new(age::secrecy::SecretString::from(normal));
+    let sealed = age::encrypt(&recipient, raw).map_err(|err| anyhow!("encrypt the edge key's recovery copy: {err}"))?;
+    Ok(STANDARD.encode(sealed))
+}
+
+fn open_with_code(code: &str, sealed: &str) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    let normal = harar::recovery::normalize_code(code, RECOVERY_CODE_LEN)
+        .ok_or_else(|| anyhow!("that isn't a recovery code: it has {RECOVERY_CODE_LEN} letters and digits, in groups of four"))?;
+    let identity = age::scrypt::Identity::new(age::secrecy::SecretString::from(normal));
+    let bytes = STANDARD.decode(sealed.trim()).context("the edge's recovery copy is not base64")?;
+    let raw = zeroize::Zeroizing::new(age::decrypt(&identity, &bytes).map_err(|_| anyhow!("the recovery code doesn't open this edge's recovery copy"))?);
+    if raw.len() != 32 {
+        bail!("the recovery copy doesn't hold a 32-byte edge key");
+    }
+    Ok(raw)
+}
+
+fn recover(cmd: Recover) -> Result<()> {
+    let edge = Paired::find(&cmd.target)?;
+    let (raw, from) = match (&edge.edge_key, cmd.with_code) {
+        (Some(sealed), false) => (open_sealed_here(&edge, sealed)?, "this Mac's Secure Enclave"),
+        _ => {
+            let copy = edge.call("GET", "/v1/recovery", None)?;
+            let sealed = copy["sealed"].as_str().ok_or_else(|| anyhow!("{} sent no recovery copy", edge.url))?.to_owned();
+            let code = zeroize::Zeroizing::new(cmd.code.read("Recovery code")?);
+            (open_with_code(&code, &sealed)?, "the recovery code and the edge's copy")
+        }
+    };
+    let id = key_id(&raw);
+    let edge_has = match edge_key_status(&edge.url)? {
+        Some(theirs) if theirs == id => "this key: nothing to restore",
+        Some(_) => "a different key: setting this one makes its secrets readable again",
+        None => "no key: set this one",
+    };
+    let key = zeroize::Zeroizing::new(STANDARD.encode(&raw[..]));
+    let text = zeroize::Zeroizing::new(if cmd.env { format!("HARAR_EDGE_KEY={}\n", *key) } else { key.to_string() });
+    let report = json!({ "ok": true, "edge": edge.url, "from": from, "key_id": id, "edge_has": edge_has });
+    match &cmd.out {
+        Some(path) => {
+            write_private(path, &text)?;
+            let mut report = report;
+            report["written"] = json!(path);
+            print_json(&report)
+        }
+        None if std::io::stdout().is_terminal() => {
+            bail!("refusing to print the edge key to a terminal; pipe it (harar edge recover | npx wrangler secret put HARAR_EDGE_KEY) or use --out <file>")
+        }
+        None => {
+            std::io::stdout().write_all(text.as_bytes())?;
+            std::io::stdout().flush()?;
+            eprintln!("{report}");
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_sealed_here(edge: &Paired, sealed: &str) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    match edge.key()? {
+        DeviceKey::Enclave(key) => key.open(&STANDARD.decode(sealed)?),
+        DeviceKey::File(_) => bail!("this edge's sealed key copy needs its Secure Enclave key"),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_sealed_here(_: &Paired, _: &str) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    bail!("this edge's key copy is sealed to a Mac's Secure Enclave; use --with-code")
+}
+
 // ------------------------------------------------------------------ bits
 
 fn hex(bytes: &[u8]) -> String {
@@ -766,6 +954,34 @@ mod tests {
         assert_eq!(check_chain(&rows), Ok(()));
         rows[1]["resource"] = json!("other");
         assert_eq!(check_chain(&rows), Err(2));
+    }
+
+    #[test]
+    fn the_recovery_code_opens_its_copy_of_the_edge_key_and_nothing_else_does() {
+        let raw = [7u8; 32];
+        let code = harar::recovery::new_code(RECOVERY_CODE_LEN);
+        assert_eq!(code.len(), RECOVERY_CODE_LEN + RECOVERY_CODE_LEN / 4 - 1, "groups of four: {code}");
+        let sealed = seal_with_code(&code, &raw).unwrap();
+        assert!(!sealed.contains(&STANDARD.encode(raw)), "the copy isn't the key");
+        assert_eq!(&open_with_code(&code, &sealed).unwrap()[..], &raw[..]);
+        // As typed from paper: no dashes, upper case, O for 0, L for 1.
+        let typed: String = code.chars().filter(|c| *c != '-').map(|c| match c {
+            '0' => 'O',
+            '1' => 'L',
+            c => c.to_ascii_uppercase(),
+        }).collect();
+        assert_eq!(&open_with_code(&typed, &sealed).unwrap()[..], &raw[..]);
+        let other = harar::recovery::new_code(RECOVERY_CODE_LEN);
+        assert!(open_with_code(&other, &sealed).unwrap_err().to_string().contains("doesn't open"));
+        assert!(open_with_code("abcd-efgh", &sealed).unwrap_err().to_string().contains("isn't a recovery code"));
+    }
+
+    #[test]
+    fn the_key_id_is_the_edges() {
+        // Known answer, computed with Node's crypto the way edge/harar-edge.ts
+        // keyId does, for 32 zero bytes. pair compares these two ids.
+        assert_eq!(key_id(&[0u8; 32]), "826f32b3bdadd362");
+        assert_ne!(key_id(&[0u8; 32]), key_id(&[1u8; 32]));
     }
 
     #[test]
