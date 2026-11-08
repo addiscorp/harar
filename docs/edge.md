@@ -66,6 +66,40 @@ answer also has a flag, so CI can run it, except a secret: those are asked for
 with a no-echo prompt and never taken as an argument. The written files carry
 harar's version; `harar edge update` (later) refreshes the core file.
 
+`init` never replaces a file. It also writes two 0600 files, which git
+ignores: `.harar-edge.key` (the edge key, for the platform's secret store) and
+`.harar-edge.setup` (the setup code; Supabase also gets `.harar-edge.env`).
+For Supabase it adds the function's section to an existing
+`supabase/config.toml`. It prints the steps that are left. On Cloudflare:
+
+```sh
+cd harar-edge
+npx wrangler deploy                                  # the first deploy also creates the D1 database
+npx wrangler secret put HARAR_EDGE_KEY < .harar-edge.key
+harar edge pair https://harar-edge.<you>.workers.dev --dir .
+```
+
+### The CLI
+
+This machine is a device of the edges it pairs with. Its key is in the Secure
+Enclave on a Mac, so each signed request asks for Touch ID; elsewhere, or with
+`--file-key`, it's a 0600 file. Paired edges are listed in `edges.json`,
+next to the agent's state.
+
+| Command | Does |
+|---|---|
+| `harar edge init --cloudflare\|--vercel\|--supabase [--dir] [--log-sink]` | writes the folder (above) |
+| `harar edge pair <url> [--dir] [--name] [--file-key]` | pairs with the setup code from `--dir` (then removes it), or a code typed at a no-echo prompt |
+| `harar edge pairing` | a one-time code for another device (10 minutes) |
+| `harar edge devices`, `harar edge unpair <id>` | the paired devices |
+| `harar edge put <path> [--rotate]`, `harar edge delete <path>`, `harar edge secrets` | secrets; the value is typed twice at a no-echo prompt, or `--secret-stdin` |
+| `harar edge token create <name> --read <pattern> --write <pattern> [--expires-in <s>]` | a service token, shown once |
+| `harar edge token list`, `harar edge token revoke <id>` | the tokens |
+| `harar edge log [--after <seq>]` | the log, with its hash chain checked here |
+
+With more than one edge paired, `--edge <url>` says which. Every command
+answers in JSON.
+
 ## 3. Who may call what
 
 **Devices** are members paired with the edge. Each has a P-256 key: the Secure
@@ -77,8 +111,13 @@ Harar-Device:    <device id>
 Harar-Time:      <unix seconds>
 Harar-Nonce:     <16 random bytes, base64url>
 Harar-Signature: base64url( ECDSA-P256-SHA256 over
-                   "harar-edge-v1\n" method "\n" path-and-query "\n" time "\n" nonce "\n" hex(sha256(body)) )
+                   "harar-edge-v1\n" method "\n" api-path-and-query "\n" time "\n" nonce "\n" hex(sha256(body)) )
 ```
+
+`api-path-and-query` is the path from `/v1/` on, plus the query, without any
+prefix the platform mounts the edge under. On Supabase the caller sends
+`/functions/v1/harar-edge/v1/secrets` and the function sees
+`/harar-edge/v1/secrets`, but both sign `/v1/secrets`.
 
 The signature is raw `r || s` (64 bytes). The edge refuses a time more than 5
 minutes off and a nonce it has seen, and keeps nonces for 10 minutes.

@@ -48,6 +48,20 @@ const key = await vault().secrets.resolve('harar://prod/shop/STRIPE_KEY')
 
 All of them publish from a stable release, at its version.
 
+## An edge, for services off your network
+
+`harar edge` puts an always-on harar API in **your own** Cloudflare, Vercel or
+Supabase account, so a service on Railway or Vercel can resolve `harar://`
+references with a narrow service token. Every request is logged to a sink
+you choose, best in another account. See [docs/edge.md](docs/edge.md).
+
+```sh
+harar edge init --cloudflare        # writes ./harar-edge; deploy it with wrangler
+harar edge pair https://harar-edge.<you>.workers.dev --dir harar-edge
+harar edge put prod/shop/STRIPE_KEY
+harar edge token create railway-shop --read 'prod/shop/*'
+```
+
 ## Build
 
 ```sh

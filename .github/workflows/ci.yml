@@ -191,6 +191,13 @@ jobs:
       # and it builds from what it would upload, with crates.io dependencies alone.
       - run: scripts/check-crates.sh
       - run: cargo publish --dry-run --locked -p harar
+      # harar edge: the CLI against a running edge (Node, node:sqlite), so the
+      # Rust and TypeScript sides can't drift apart on the signature or the log.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: cargo build --locked -p harar-server --bin harar
+      - run: edge/test/cli-e2e.sh target/debug/harar
       - run: sccache --show-stats
 
   macos:

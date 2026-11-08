@@ -78,7 +78,7 @@ async function setup(backend: Backend, extra: Partial<Config> = {}) {
   });
   const call = async (method: string, path: string, init: { body?: unknown; headers?: Record<string, string> } = {}) => {
     const res = await api.fetch(
-      new Request(`https://edge.example${path}`, {
+      new Request(`https://edge.example${extra.basePath ?? ""}${path}`, {
         method,
         headers: { "content-type": "application/json", "x-real-ip": "203.0.113.7", ...init.headers },
         body: init.body === undefined ? undefined : JSON.stringify(init.body),
@@ -384,6 +384,14 @@ for (const backend of backends) {
       await mac.as("POST", "/v1/resolve", { refs: ["harar://k"] });
       const log = await mac.as("GET", "/v1/log");
       assert.deepEqual(log.body.log.map((r: Row) => [r.action, r.decision]), [["secret.put", "allow"], ["secret.list", "deny"], ["resolve", "allow"]]);
+    });
+
+    test("behind a mount (Supabase's /harar-edge), a device signs the API path and is let in", async () => {
+      const { call, clock } = await setup(backend, { basePath: "/harar-edge" });
+      const mac = await device(call, clock);
+      assert.equal(mac.paired.status, 201);
+      assert.equal((await mac.as("PUT", "/v1/secrets/k", { value: "v" })).status, 200);
+      assert.deepEqual((await mac.as("POST", "/v1/resolve", { refs: ["harar://k"] })).body.values, ["v"]);
     });
 
     test("health says the version and the logging, and a base path mounts the API", async () => {
