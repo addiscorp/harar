@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 pub mod agent;
 pub mod approve;
+pub mod edge;
 pub mod get;
 pub mod hosts;
 pub mod identity;
@@ -49,6 +50,8 @@ enum Command {
     Deny(approve::Deny),
     RecoveryCodes(approve::RecoveryCodes),
     Key(key::Key),
+    /// harar edge: an optional, always-on member in your own Cloudflare, Vercel or Supabase account.
+    Edge(edge::Edge),
     Version(version::Version),
 }
 
@@ -91,6 +94,7 @@ pub async fn run() -> anyhow::Result<()> {
         Command::Deny(cmd) => approve::deny(cmd).await,
         Command::RecoveryCodes(cmd) => approve::recovery_codes(cmd).await,
         Command::Key(cmd) => key::run(cmd).await,
+        Command::Edge(cmd) => edge::run(cmd).await,
         Command::Version(cmd) => version::run(cmd),
     }
 }

@@ -830,6 +830,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-postgres",
+ "ureq",
  "zeroize",
 ]
 

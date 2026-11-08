@@ -3,8 +3,7 @@ name = "harar-edge"
 main = "worker.ts"
 compatibility_date = "2026-10-01"
 
+# The first `npx wrangler deploy` creates this D1 database.
 [[d1_databases]]
 binding = "DB"
 database_name = "harar-edge"
-# From `npx wrangler d1 create harar-edge`.
-database_id = "__HARAR_D1_ID__"

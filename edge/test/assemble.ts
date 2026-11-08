@@ -30,5 +30,5 @@ export function assemble(platform: string, dir: string, fill: Record<string, str
 
 if (process.argv[1] === new URL(import.meta.url).pathname) {
   const [platform, dir, hash, sink = ""] = process.argv.slice(2);
-  assemble(platform, dir, { HARAR_SETUP_CODE_HASH: hash, HARAR_LOG_SINK: sink, HARAR_D1_ID: "00000000-0000-0000-0000-000000000000" });
+  assemble(platform, dir, { HARAR_SETUP_CODE_HASH: hash, HARAR_LOG_SINK: sink });
 }
