@@ -3,6 +3,7 @@
 // sink: every test asserts what a caller or the database would see.
 import assert from "node:assert/strict";
 import { createCipheriv, createDecipheriv, createHash, createHmac, webcrypto } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { after, describe, test } from "node:test";
 
@@ -91,8 +92,8 @@ async function setup(backend: Backend, extra: Partial<Config> = {}) {
 }
 
 /** A device: a P-256 key that signs requests the way docs/edge.md says. */
-async function device(call: Awaited<ReturnType<typeof setup>>["call"], clock: { ms: number }, code = SETUP, name = "mac") {
-  const keys = await webcrypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign", "verify"]);
+async function device(call: Awaited<ReturnType<typeof setup>>["call"], clock: { ms: number }, code = SETUP, name = "mac", given?: webcrypto.CryptoKeyPair) {
+  const keys = given ?? (await webcrypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign", "verify"]));
   const raw = new Uint8Array(await webcrypto.subtle.exportKey("raw", keys.publicKey));
   const paired = await call("POST", "/v1/pair", { body: { code, name, public_key: Buffer.from(raw).toString("base64url") } });
   const sign = async (method: string, path: string, body?: unknown, tweak: { time?: number; nonce?: string; bodyOverride?: string } = {}) => {
@@ -818,6 +819,40 @@ for (const backend of backends) {
 
       // A member who lost the ring's history still learns the latest of each key.
       assert.deepEqual(kept.filter((o) => o.kind !== "member.add").map((o) => open(o, macM.ring).value).sort(), ["mac wins: later at", "new", "only", null, tieWinner === tie ? "mac" : "phone"].sort());
+    });
+
+    test("sync: harar's own ops (test/sync-vectors.json, made by the Rust member) are what docs/edge.md says, and the edge takes them as they are", async () => {
+      const env = await setup(backend);
+      const v = JSON.parse(readFileSync(new URL("./sync-vectors.json", import.meta.url), "utf8"));
+      const pub = Buffer.from(v.device.sign_pub, "base64url");
+      const curve = { name: "ECDSA", namedCurve: "P-256" };
+      const jwk = { kty: "EC", crv: "P-256", x: pub.subarray(1, 33).toString("base64url"), y: pub.subarray(33).toString("base64url"), d: v.device.sign_d };
+      const keys = { privateKey: await webcrypto.subtle.importKey("jwk", jwk, curve, false, ["sign"]), publicKey: await webcrypto.subtle.importKey("raw", pub, curve, true, ["verify"]) };
+      const ring = Buffer.from(v.ring, "base64url");
+
+      // Read the way this file reads docs/edge.md, not the way harar does.
+      for (const [i, { op, canonical, hash, opens }] of v.ops.entries()) {
+        assert.equal(canonicalOp(op, sha(op.sealed), sha(op.wrapped_key)), canonical, `op ${op.seq}'s canonical encoding`);
+        assert.equal(sha(canonical), hash, `op ${op.seq}'s hash`);
+        assert.equal(op.prev, i === 0 ? "" : v.ops[i - 1].hash, `op ${op.seq}'s prev`);
+        const sig = Buffer.from(op.sig, "base64url");
+        assert.ok(await webcrypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, keys.publicKey, sig, new TextEncoder().encode(canonical)), `op ${op.seq}'s signature`);
+        if (opens) {
+          assert.deepEqual(open(op, ring), opens, `op ${op.seq} opens with the ring key`);
+          assert.equal(createHmac("sha256", ring).update(opens.path).digest("base64url"), op.key, `op ${op.seq}'s key is the HMAC of its path`);
+        }
+      }
+
+      // The edge: a device with the vectors' key, under the vectors' id.
+      const dev = await device(env.call, env.clock, SETUP, "vector", keys);
+      await env.sql.query(`UPDATE harar_devices SET id = ? WHERE id = ?`, [v.device.id, dev.id]);
+      const as = async (method: string, path: string, body?: unknown) =>
+        env.call(method, path, { body, headers: { ...(await dev.sign(method, path, body)).headers, "harar-device": v.device.id } });
+      const ops = v.ops.map((o: Row) => o.op);
+      assert.deepEqual(await as("PUT", "/v1/sync", { ops }), { status: 200, body: { stored: 4, duplicates: 0 } });
+      const got = await as("POST", "/v1/sync", { since: {} });
+      assert.deepEqual(got.body.ops.map((o: Row) => o.hash), v.ops.map((o: Row) => o.hash), "the edge hashes them as harar does");
+      assert.deepEqual(got.body.ops.map(sent), ops);
     });
   });
 }
