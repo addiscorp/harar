@@ -34,6 +34,23 @@ A gateway that attaches a key on its way out asks where it may go, and for
 it for one host only: `hosts("prod/shop/STRIPE_KEY")` and
 `send("prod/shop/STRIPE_KEY", "api.stripe.com")`.
 
+## At a harar edge
+
+A service off your network (Railway, Vercel, CI) resolves the same references at
+a [harar edge](https://github.com/addiscorp/harar/blob/main/docs/edge.md) in your own
+Cloudflare, Vercel or Supabase account, with a service token from
+`harar edge token create`. The token comes from the platform's secrets; pass it in.
+It reads only what its token allows, and every read is in the edge's log.
+
+With the `edge` feature (`cargo add harar --features edge`):
+
+```rust,ignore
+let harar = harar::edge("https://harar-edge.you.workers.dev", &token)?;
+let key = harar.secrets().resolve("harar://prod/shop/STRIPE_KEY").await?;
+```
+
+hosts and send stay on the local socket: they are for gateways.
+
 harar itself is the binary, installed from its releases, not from crates.io:
 
 ```sh

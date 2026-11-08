@@ -72,6 +72,7 @@ jobs:
         with:
           ruby-version: ${{ matrix.ruby }}
       - run: ruby -Ilib test/vault_test.rb
+      - run: ruby -Ilib test/edge_test.rb
       - run: gem build harar.gemspec
 
   php:
@@ -87,6 +88,7 @@ jobs:
           tools: composer
       - run: composer validate --strict
       - run: php php/tests/vault_test.php
+      - run: php php/tests/edge_test.php
       # What a user's Composer autoloads: Harar\vault and Harar\Vault, from the root composer.json.
       - run: composer dump-autoload
       - run: |
@@ -187,6 +189,8 @@ jobs:
       - run: cargo check --locked --workspace --all-targets
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --locked --workspace
+      # The harar crate's edge feature (harar::edge), off by default.
+      - run: cargo test --locked -p harar --features edge
       # The `harar` crate is the only publishable one, at the release version,
       # and it builds from what it would upload, with crates.io dependencies alone.
       - run: scripts/check-crates.sh

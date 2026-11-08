@@ -9,10 +9,19 @@ const REFERENCE_PREFIX = 'harar://';
 
 /**
  * harar at `$socket`: by default the per-user agent on this machine
- * (`harar agent`), else a primary (/run/harar.sock).
+ * (`harar agent`), else a primary (/run/harar.sock). Or, with `$edge` and
+ * `$token`, a harar edge, for a service off your network: its URL and a
+ * service token from `harar edge token create`, read from the platform's
+ * secrets.
  */
-function vault(?string $socket = null): Vault
+function vault(?string $socket = null, ?string $edge = null, ?string $token = null): Vault|EdgeVault
 {
+    if ($edge !== null || $token !== null) {
+        if ($socket !== null) {
+            throw new \InvalidArgumentException('Harar\vault(): a socket or an edge, not both');
+        }
+        return new EdgeVault($edge ?? '', $token ?? '');
+    }
     return new Vault($socket ?? agent_socket());
 }
 

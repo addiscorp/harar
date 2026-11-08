@@ -14,6 +14,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 pub mod approvals;
+#[cfg(feature = "edge")]
+pub mod edge;
 pub mod model;
 pub mod oidc;
 pub mod primary;
@@ -27,6 +29,9 @@ pub const DEFAULT_PRIMARY_SOCKET: &str = "/run/harar.sock";
 /// What a reference to a vault key starts with: `harar://prod/shop/STRIPE_KEY`
 /// names the key `prod/shop/STRIPE_KEY`, as `op://` names a 1Password field.
 pub const REFERENCE_PREFIX: &str = "harar://";
+
+#[cfg(feature = "edge")]
+pub use edge::{edge, EdgeSecrets, EdgeVault};
 
 /// The vault key a value refers to, if the whole value is a reference.
 pub fn reference(value: &str) -> Option<&str> {
@@ -60,7 +65,7 @@ pub fn default_agent_socket() -> PathBuf {
 pub fn vault() -> VaultClient {
     VaultClient::from_socket_path(default_agent_socket())
 }
-const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 fn b64_url(bytes: impl AsRef<[u8]>) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)

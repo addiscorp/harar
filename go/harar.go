@@ -14,14 +14,18 @@
 package harar
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	neturl "net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -241,4 +245,153 @@ func (c *Client) unreachable(ctx context.Context, err error) error {
 		err = op.Err
 	}
 	return fail("harar at %s: %v", c.socket, err)
+}
+
+// Resolver resolves harar:// references: [Client.Secrets] on harar's local
+// socket and [EdgeVault.Secrets] at a harar edge both are one, so code that
+// only resolves takes either.
+type Resolver interface {
+	Resolve(ctx context.Context, ref string) (string, error)
+	ResolveAll(ctx context.Context, refs []string) ([]string, error)
+}
+
+var (
+	_ Resolver = (*Secrets)(nil)
+	_ Resolver = (*EdgeSecrets)(nil)
+)
+
+// edgeToken is a harar edge service token, as `harar edge token create` makes it.
+var edgeToken = regexp.MustCompile(`\Aharar_edge_[0-9a-f]{16}_[A-Za-z0-9_-]{43}\z`)
+
+// edgeURL is https://, or http:// to this machine only.
+var edgeURL = regexp.MustCompile(`\A(https://[^/]|http://(127\.0\.0\.1|localhost|\[::1\])([:/]|\z))`)
+
+// EdgeVault is a vault at a harar edge (docs/edge.md): it resolves
+// references, and only those its service token may read. Hosts and Send are
+// for gateways on harar's local socket.
+type EdgeVault struct {
+	Secrets *EdgeSecrets
+}
+
+// Edge is a harar edge, for a service off your network: its URL
+// (https://harar-edge.<you>.workers.dev) and a service token from
+// `harar edge token create`, read from the platform's secrets.
+func Edge(url, token string) (*EdgeVault, error) {
+	if !edgeURL.MatchString(url) {
+		return nil, fail("harar.Edge: the edge is an https:// URL")
+	}
+	if !edgeToken.MatchString(token) {
+		return nil, fail("harar.Edge: the token is a harar edge service token (harar edge token create)")
+	}
+	return &EdgeVault{Secrets: &EdgeSecrets{edge: strings.TrimRight(url, "/"), token: token}}, nil
+}
+
+// EdgeSecrets resolves harar:// references at a harar edge, with a service token.
+type EdgeSecrets struct {
+	edge, token string
+}
+
+// Resolve returns the value ref names.
+func (s *EdgeSecrets) Resolve(ctx context.Context, ref string) (string, error) {
+	values, err := s.ResolveAll(ctx, []string{ref})
+	if err != nil {
+		return "", err
+	}
+	return values[0], nil
+}
+
+// ResolveAll returns each reference's value, in order, from one request:
+// all or nothing.
+func (s *EdgeSecrets) ResolveAll(ctx context.Context, refs []string) ([]string, error) {
+	if len(refs) == 0 {
+		return []string{}, nil
+	}
+	for _, ref := range refs {
+		if _, ok := Reference(ref); !ok {
+			return nil, fail("not a harar:// reference: %q", ref)
+		}
+	}
+	what := refs[0]
+	if len(refs) > 1 {
+		what = fmt.Sprintf("%d references", len(refs))
+	}
+	status, body, err := s.post(ctx, refs)
+	if err != nil {
+		return nil, err
+	}
+	var parsed any
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fail("harar at %s did not answer with JSON (%d)", s.edge, status)
+	}
+	answer, ok := parsed.(map[string]any)
+	if !ok {
+		return nil, fail("harar at %s did not answer with an object", s.edge)
+	}
+	if status < 200 || status > 299 {
+		code, ok := answer["error"].(string)
+		if !ok {
+			code = fmt.Sprint(status)
+		}
+		if message, ok := answer["message"].(string); ok {
+			code += ": " + message
+		}
+		return nil, fail("harar refused %s: %s", what, code)
+	}
+	list, ok := answer["values"].([]any)
+	if !ok || len(list) != len(refs) {
+		return nil, fail("harar sent no value for %s", what)
+	}
+	values := make([]string, len(list))
+	for i, v := range list {
+		if values[i], ok = v.(string); !ok {
+			return nil, fail("harar sent no value for %s", what)
+		}
+	}
+	return values, nil
+}
+
+// post sends one POST of /v1/resolve, and returns the status and the body,
+// refused past MaxAnswer bytes.
+func (s *EdgeSecrets) post(ctx context.Context, refs []string) (int, []byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, Timeout)
+	defer cancel()
+	body, err := json.Marshal(map[string][]string{"refs": refs})
+	if err != nil {
+		return 0, nil, fail("harar request: %v", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.edge+"/v1/resolve", bytes.NewReader(body))
+	if err != nil {
+		return 0, nil, fail("harar at %s: %v", s.edge, err)
+	}
+	req.Header.Set("content-type", "application/json")
+	req.Header.Set("authorization", "Bearer "+s.token)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, nil, s.unreachable(ctx, err)
+	}
+	defer res.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(res.Body, MaxAnswer+1))
+	if err != nil {
+		return 0, nil, s.unreachable(ctx, err)
+	}
+	if len(raw) > MaxAnswer {
+		return 0, nil, fail("harar sent too long an answer")
+	}
+	return res.StatusCode, raw, nil
+}
+
+// unreachable names why the edge could not be asked, without the URL's
+// own error text, which repeats the request.
+func (s *EdgeSecrets) unreachable(ctx context.Context, err error) error {
+	switch {
+	case errors.Is(ctx.Err(), context.Canceled):
+		return fail("harar at %s: cancelled", s.edge)
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return fail("harar at %s: did not answer in time (%s at most)", s.edge, Timeout)
+	}
+	var urlErr *neturl.Error
+	if errors.As(err, &urlErr) {
+		err = urlErr.Err
+	}
+	return fail("harar at %s: %v", s.edge, err)
 }

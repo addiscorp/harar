@@ -16,9 +16,19 @@ export interface Vault {
   send(secret: string, host: string): Promise<string>
 }
 
+/** A vault at a harar edge (docs/edge.md): it resolves references, and only
+ *  those its service token may read. */
+export interface EdgeVault {
+  secrets: Vault['secrets']
+}
+
 /** harar at `socket`: by default the per-user agent on this machine
  *  (`harar agent`), else a primary (`/run/harar.sock`). */
 export function vault(options?: { socket?: string }): Vault
+/** A harar edge, for a service off your network: its URL
+ *  (`https://harar-edge.<you>.workers.dev`) and a service token from
+ *  `harar edge token create`, read from the platform's secrets. */
+export function vault(options: { edge: string; token: string }): EdgeVault
 
 /** What a reference to a vault key starts with. */
 export const REFERENCE_PREFIX: 'harar://'
