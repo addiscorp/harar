@@ -133,6 +133,8 @@ pub(crate) struct Vault {
     sync: Option<crate::sync::member::Member>,
     /// Wakes the sync worker: after a local change, to push it.
     wake: Option<std::sync::mpsc::Sender<()>>,
+    /// Syncs in a row that had more to pull: the next waits longer.
+    more_streak: u32,
 }
 
 impl Vault {
@@ -150,6 +152,7 @@ impl Vault {
             last_use: now,
             sync: None,
             wake: None,
+            more_streak: 0,
         }
     }
 
@@ -654,6 +657,7 @@ pub(crate) fn sync_cycle(vault: &Mutex<Vault>) -> Result<serde_json::Value> {
             }
         };
         member.ingest(pulled.ops);
+        member.pull_complete = pulled.complete;
         if pulled.complete {
             member.rebase();
         }
@@ -675,9 +679,18 @@ pub(crate) fn sync_cycle(vault: &Mutex<Vault>) -> Result<serde_json::Value> {
     };
     let (sent, pushed) = Member::push(&edge, &device, &ready);
     let mut v = lock_vault(vault);
-    if more && let Some(wake) = &v.wake {
-        // There was more to pull than one sync takes: another follows.
-        let _ = wake.send(());
+    // There was more to pull than one sync takes: another follows, but only
+    // if this one moved the cursor on, and later each time it repeats.
+    let advanced = v.sync.as_ref().is_some_and(|m| m.state.next != since);
+    v.more_streak = if more && advanced { v.more_streak.saturating_add(1) } else { 0 };
+    if v.more_streak > 0
+        && let Some(wake) = v.wake.clone()
+    {
+        let delay = Duration::from_millis(100u64.saturating_mul(1 << v.more_streak.min(9)));
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            let _ = wake.send(());
+        });
     }
     let Some(member) = v.sync.as_mut().filter(|m| m.edge.url == edge.url) else { return Ok(serde_json::json!({ "on": false })) };
     member.sent(&ready[..sent], pushed.as_ref().err());

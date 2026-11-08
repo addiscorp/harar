@@ -17,7 +17,7 @@ use super::crypto::{
     b64, device_fingerprint, gcm_seal, member_mac, name_mac, normal_fingerprint, public_key, random_iv, random_key, ring_fingerprint, seal_value, sha256_hex,
     unb64, unwrapped_ring, wrap_key, wrap_ring,
 };
-use super::ledger::{self, Author, Rejected, RingKey, Roster};
+use super::ledger::{self, Author, Fork, Rejected, RingKey, Roster, ring_id};
 use super::op::{self, Kind, MemberBody, Op, Rank, RekeyBody, RemoveBody, Served, ValueBody};
 use crate::cli::edge::{AgreementKey, DeviceKey, Paired};
 use anyhow::{Context, Result, anyhow, bail};
@@ -39,9 +39,11 @@ const PUSH_BYTES: usize = 56 * 1024;
 const MAX_SEALED: usize = 48 * 1024;
 /// One sync pulls at most this many pages; the rest waits for the next.
 const PULL_PAGES: usize = 20;
-/// Secret ops kept waiting at most; past it, the oldest from devices that
-/// aren't members go first.
-const MAX_PENDING: usize = 5000;
+/// Ops kept waiting per author that isn't a member, at most (secret ops, and
+/// ring ops); past it, its newest are let go and pulled again later.
+const PER_AUTHOR: usize = if cfg!(test) { 20 } else { 2000 };
+/// Refusals kept per author.
+const REJECTED_PER_AUTHOR: usize = 20;
 /// Changes remembered, so one recorded again after a crash isn't a new op.
 const OWN_CHANGES: usize = 512;
 
@@ -58,9 +60,12 @@ pub(crate) struct State {
     /// Whether this member founded its ring.
     #[serde(default)]
     pub founded: bool,
-    /// The founder of an earlier ring this member gave its own up for.
+    /// The ring this member gave its own up for, when the person pinned it.
     #[serde(default)]
     pub fell_back: Option<String>,
+    /// Forks the edge served (two ops at one place in a chain).
+    #[serde(default)]
+    pub forks: Vec<Fork>,
     /// Whether this member has asked to join (and is waiting for approval).
     #[serde(default)]
     pub requested: bool,
@@ -77,7 +82,7 @@ pub(crate) struct State {
     /// nothing later on its key).
     #[serde(default)]
     pub pending: Vec<Served>,
-    /// Waiting ops dropped past MAX_PENDING.
+    /// Ops let go past PER_AUTHOR (to be pulled again).
     #[serde(default)]
     pub dropped: u64,
     /// Each secret key's highest-ranked op held with its ciphertext.
@@ -95,10 +100,10 @@ pub(crate) struct State {
     /// Changes already written as ops: (tag, op hash, rank).
     #[serde(default)]
     pub own_changes: Vec<(String, String, Rank)>,
-    /// Ops signed again after the chain diverged: old hash to new, until the
-    /// vault's record of them is updated.
+    /// Ops signed again after the chain diverged: old hash to (new hash, new
+    /// seq), until the vault's record of them is updated.
     #[serde(default)]
-    pub renamed: BTreeMap<String, String>,
+    pub renamed: BTreeMap<String, (String, u64)>,
     /// The edge refused a push for this member's chain (fork, wrong seq or
     /// prev): the queued ops are signed again after the next full pull.
     #[serde(default)]
@@ -122,11 +127,15 @@ pub(crate) struct Tip {
 pub(crate) struct RingEntry {
     pub epoch: u32,
     pub wrapped: String,
-    pub rank: Option<Rank>,
 }
 
 pub(crate) fn state_path(url: &str) -> Result<PathBuf> {
     Ok(crate::common::ensure_state_subdir("sync")?.join(format!("{}.json", &super::crypto::hex(Sha256::digest(url.as_bytes()))[..16])))
+}
+
+/// The epoch after `epoch`, or an error at the last one.
+pub(crate) fn next_epoch(epoch: u32) -> Result<u32> {
+    epoch.checked_add(1).ok_or_else(|| anyhow!("the ring is at its last epoch; it can't be rekeyed"))
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -142,6 +151,9 @@ pub(crate) struct Member {
     sign_pub: Vec<u8>,
     /// The ring keys, opened: only while the vault is unlocked.
     keys: Option<Vec<RingKey>>,
+    /// Whether the last pull reached the end: a joiner's first step waits
+    /// for one.
+    pub pull_complete: bool,
 }
 
 /// What one step did to the vault.
@@ -176,7 +188,7 @@ impl Member {
         }
         let agree_pub = AgreementKey::load(&config.agreement)?.public_key()?;
         let sign_pub = edge.key()?.public_key()?;
-        Ok(Member { edge, state, path, agree_pub, sign_pub, keys: None })
+        Ok(Member { edge, state, path, agree_pub, sign_pub, keys: None, pull_complete: false })
     }
 
     pub(crate) fn me(&self) -> &str {
@@ -212,14 +224,18 @@ impl Member {
     /// ring's ops kept, and secret ops queued until they can be applied.
     pub(crate) fn ingest(&mut self, ops: Vec<Served>) {
         let me = self.edge.device.clone();
-        let mut rejected = Vec::new();
-        let good = ledger::verify_chains(&mut self.state.authors, &me, ops, &mut rejected);
-        for r in rejected {
+        let verified = ledger::verify_chains(&mut self.state.authors, &me, ops);
+        for r in verified.rejected {
             if !self.state.rejected.iter().any(|x| x.author == r.author && x.seq == r.seq) {
                 self.state.rejected.push(r);
             }
         }
-        for op in good {
+        for fork in verified.forks {
+            if !self.state.forks.iter().any(|f| f.author == fork.author && f.seq == fork.seq) {
+                self.state.forks.push(fork);
+            }
+        }
+        for op in verified.good {
             let at = self.state.next.entry(op.author.clone()).or_insert(0);
             *at = (*at).max(op.seq);
             if op.author == me {
@@ -244,20 +260,70 @@ impl Member {
                 self.state.pending.push(op);
             }
         }
-        self.bound_pending();
+        self.bound();
     }
 
-    /// Keeps `pending` under MAX_PENDING: the oldest ops from devices that
-    /// aren't members go first, counted in `dropped`.
-    fn bound_pending(&mut self) {
-        if self.state.pending.len() <= MAX_PENDING {
+    /// Keeps what an author that isn't a member can make this member hold
+    /// under PER_AUTHOR ops (secret ops and ring ops each), and its refusals
+    /// under REJECTED_PER_AUTHOR. Past the cap its newest ops are let go and
+    /// its chain and cursor go back to before them, so they are pulled again,
+    /// never lost. Nothing is let go while no ring key is open: without one,
+    /// nobody can be told from a member.
+    fn bound(&mut self) {
+        let mut by_author: BTreeMap<String, usize> = BTreeMap::new();
+        for r in self.state.rejected.iter().rev() {
+            *by_author.entry(r.author.clone()).or_default() += 1;
+        }
+        if by_author.values().any(|n| *n > REJECTED_PER_AUTHOR) {
+            let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+            let mut keep = Vec::new();
+            for r in self.state.rejected.drain(..).rev() {
+                let n = seen.entry(r.author.clone()).or_default();
+                *n += 1;
+                if *n <= REJECTED_PER_AUTHOR {
+                    keep.push(r);
+                }
+            }
+            keep.reverse();
+            self.state.rejected = keep;
+        }
+        if self.keys.as_ref().is_none_or(Vec::is_empty) {
             return;
         }
-        let members: BTreeSet<String> = self.roster_now().map(|r| r.members.keys().cloned().collect()).unwrap_or_default();
-        while self.state.pending.len() > MAX_PENDING {
-            let Some(i) = self.state.pending.iter().position(|op| !members.contains(&op.author)) else { break };
-            self.state.pending.remove(i);
-            self.state.dropped += 1;
+        let Ok(roster) = self.roster_now() else { return };
+        let mut counts: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        for op in &self.state.pending {
+            counts.entry(op.author.clone()).or_default().0 += 1;
+        }
+        for op in &self.state.member_ops {
+            counts.entry(op.author.clone()).or_default().1 += 1;
+        }
+        let over: Vec<String> = counts.into_iter().filter(|(a, (p, m))| !roster.members.contains_key(a) && *a != self.edge.device && (*p > PER_AUTHOR || *m > PER_AUTHOR)).map(|(a, _)| a).collect();
+        for author in over {
+            let mut theirs: Vec<&Served> = self.state.pending.iter().chain(self.state.member_ops.iter()).filter(|o| o.author == author).collect();
+            theirs.sort_by_key(|o| o.seq);
+            let pending_seqs: Vec<u64> = self.state.pending.iter().filter(|o| o.author == author).map(|o| o.seq).collect();
+            let member_seqs: Vec<u64> = self.state.member_ops.iter().filter(|o| o.author == author).map(|o| o.seq).collect();
+            // The first seq past which either kind is over its cap.
+            let cut = [pending_seqs, member_seqs]
+                .into_iter()
+                .filter_map(|mut seqs| {
+                    seqs.sort_unstable();
+                    seqs.get(PER_AUTHOR).copied()
+                })
+                .min()
+                .expect("over a cap");
+            let Some(first) = theirs.iter().find(|o| o.seq == cut).map(|o| (*o).clone()) else { continue };
+            let before = self.state.pending.len() + self.state.member_ops.len();
+            self.state.pending.retain(|o| o.author != author || o.seq < cut);
+            self.state.member_ops.retain(|o| o.author != author || o.seq < cut);
+            self.state.dropped += (before - self.state.pending.len() - self.state.member_ops.len()) as u64;
+            if let Some(a) = self.state.authors.get_mut(&author) {
+                a.seq = cut - 1;
+                a.hash = first.prev.clone();
+                a.recent.retain(|seq, _| *seq < cut);
+            }
+            self.state.next.insert(author, cut - 1);
         }
     }
 
@@ -296,7 +362,7 @@ impl Member {
                     r.seq = op.seq;
                 }
             }
-            self.state.renamed.insert(old, new);
+            self.state.renamed.insert(old, (new, op.seq));
             self.state.rebased += 1;
         }
         let last = self.state.outbox.last().expect("not empty");
@@ -320,7 +386,7 @@ impl Member {
                 for entry in &self.state.ring {
                     let plain = unwrap(&unb64(&entry.wrapped)?).context("open this member's ring key")?;
                     let key = unwrapped_ring(&plain, entry.epoch, &me).ok_or_else(|| anyhow!("this member's ring key file is not for this device"))?;
-                    keys.push(RingKey { epoch: entry.epoch, key, rank: entry.rank.clone() });
+                    keys.push(RingKey { epoch: entry.epoch, key });
                 }
                 keys
             }
@@ -333,13 +399,29 @@ impl Member {
         {
             for (epoch, wrapped, grant) in ledger::grants_to(&me, &self.state.member_ops) {
                 let Some(key) = unb64(&wrapped).ok().and_then(|w| unwrap(&w).ok()).and_then(|plain| unwrapped_ring(&plain, epoch, &me)) else { continue };
-                let mut candidate = vec![RingKey { epoch, key, rank: None }];
+                let mut candidate = vec![RingKey { epoch, key }];
                 ledger::reach_back(&self.state.member_ops, &mut candidate);
                 let roster = ledger::roster(&self.state.member_ops, &candidate, &self.state.authors, Some(&trusted));
                 if roster.founder.is_some() && roster.counts(&grant.author, grant.seq) && roster.members.contains_key(&me) {
                     keys = candidate;
                     changed = true;
                     break;
+                }
+            }
+        }
+        // A member takes a grant of an epoch it doesn't hold (a re-grant after
+        // a rekey crossed its approval) when a counting member made that key.
+        if !keys.is_empty() {
+            let roster = ledger::roster(&self.state.member_ops, &keys, &self.state.authors, self.state.trusted.as_deref());
+            for (epoch, wrapped, grant) in ledger::grants_to(&me, &self.state.member_ops) {
+                if keys.iter().any(|k| k.epoch == epoch) || !roster.counts(&grant.author, grant.seq) {
+                    continue;
+                }
+                let Some(key) = unb64(&wrapped).ok().and_then(|w| unwrap(&w).ok()).and_then(|plain| unwrapped_ring(&plain, epoch, &me)) else { continue };
+                let candidate = RingKey { epoch, key };
+                if ledger::given_to(&candidate, &self.state.member_ops, &roster).is_some() {
+                    keys.push(candidate);
+                    changed = true;
                 }
             }
         }
@@ -363,7 +445,7 @@ impl Member {
     fn keep_keys(&mut self, keys: &[RingKey]) -> Result<()> {
         let mine = public_key(&self.agree_pub)?;
         let me = self.edge.device.clone();
-        self.state.ring = keys.iter().map(|k| RingEntry { epoch: k.epoch, wrapped: b64(wrap_ring(&mine, k.epoch, &me, &k.key)), rank: k.rank.clone() }).collect();
+        self.state.ring = keys.iter().map(|k| RingEntry { epoch: k.epoch, wrapped: b64(wrap_ring(&mine, k.epoch, &me, &k.key)) }).collect();
         if !keys.is_empty() {
             self.state.requested = false;
         }
@@ -403,11 +485,17 @@ impl Member {
     /// `min_at` nor this member's last op.
     pub(crate) fn write(&mut self, kind: Kind, key: String, version: u64, sealed: String, wrapped_key: String, min_at: u64) -> Op {
         let at = now_ms().max(self.state.tip.at).max(min_at);
+        self.write_at(kind, key, version, sealed, wrapped_key, at)
+    }
+
+    /// The same, at exactly `at` (a joiner's own older values: 0, the lowest).
+    fn write_at(&mut self, kind: Kind, key: String, version: u64, sealed: String, wrapped_key: String, at: u64) -> Op {
         let me = self.edge.device.clone();
         let op = Op { author: me.clone(), seq: self.state.tip.seq + 1, prev: self.state.tip.hash.clone(), kind, key, version, sealed, wrapped_key, at, sig: String::new() };
         let hash = op.hash();
-        self.state.tip = Tip { seq: op.seq, hash, at };
-        self.state.authors.entry(me).or_insert(Author { sign_pub: b64(&self.sign_pub), agree_pub: b64(&self.agree_pub), seq: 0, hash: String::new() });
+        self.state.tip = Tip { seq: op.seq, hash, at: self.state.tip.at.max(at) };
+        let (sign_pub, agree_pub) = (b64(&self.sign_pub), b64(&self.agree_pub));
+        self.state.authors.entry(me).or_insert_with(|| Author { sign_pub, agree_pub, seq: 0, hash: String::new(), recent: BTreeMap::new(), fork_at: None });
         if !kind.is_value() {
             self.state.member_ops.push(Served::from(&op));
         }
@@ -455,28 +543,25 @@ impl Member {
     }
 
     pub(crate) fn own_body(&self, epoch: u32) -> MemberBody {
-        MemberBody { device: self.edge.device.clone(), name: self.edge.name.clone(), sign_pub: b64(&self.sign_pub), agree_pub: b64(&self.agree_pub), epoch }
+        MemberBody { device: self.edge.device.clone(), name: self.edge.name.clone(), sign_pub: b64(&self.sign_pub), agree_pub: b64(&self.agree_pub), epoch, removal: String::new() }
     }
 
     /// Founds the ring when the edge has no ops yet, or asks to join the one
-    /// it has. A founder whose ring an earlier founder's beat, and that has
-    /// no other member yet, gives it up and asks to join. Needs no unlocked
-    /// vault.
+    /// it has. Never gives a ring up by itself (only `trust` does), and
+    /// opens no ring key, so the worker can run it with the vault locked.
     pub(crate) fn found_or_request(&mut self) -> Result<Option<&'static str>> {
-        if self.state.founded && self.fall_back()? {
-            // fall through: ask to join
-        } else if !self.state.ring.is_empty() {
+        if !self.state.ring.is_empty() {
             return Ok(None);
         }
         let others = self.state.authors.keys().any(|a| *a != self.edge.device) || !self.state.rejected.is_empty();
-        if !others && self.state.member_ops.is_empty() && !self.state.founded {
+        if !others && self.state.member_ops.is_empty() && !self.state.founded && self.state.fell_back.is_none() {
             let ring = random_key();
             let mine = public_key(&self.agree_pub)?;
             let body = self.own_body(0);
-            let key = member_mac(&ring, &op::add_mac_text(self.me(), 0));
+            let key = member_mac(&ring, &op::add_mac_text(self.me(), &body));
             let wrap = b64(wrap_ring(&mine, 0, self.me(), &ring));
             self.write(Kind::MemberAdd, key, 0, op::plain_body(&body), wrap, 0);
-            let keys = vec![RingKey { epoch: 0, key: ring, rank: None }];
+            let keys = vec![RingKey { epoch: 0, key: ring }];
             self.keep_keys(&keys)?;
             self.keys = Some(keys);
             self.state.founded = true;
@@ -492,32 +577,22 @@ impl Member {
         Ok(Some("requested"))
     }
 
-    /// Two devices founded a ring at once: the one that founded first (by at,
-    /// then device id) keeps it. Returns whether this member gave its ring up.
-    fn fall_back(&mut self) -> Result<bool> {
-        let shaped = ledger::founder_shaped(&self.state.member_ops);
-        let Some(mine) = shaped.iter().find(|(op, _)| op.author == self.edge.device).map(|(op, _)| (op.at, op.author.clone())) else { return Ok(false) };
-        let Some(earlier) = shaped.iter().filter(|(op, _)| (op.at, op.author.clone()) < mine).map(|(op, _)| op.author.clone()).next() else { return Ok(false) };
-        let roster = self.roster()?;
-        if roster.members.keys().any(|id| *id != self.edge.device) {
-            // Ours already has members: keep it; status shows the conflict.
-            return Ok(false);
-        }
-        self.state.ring.clear();
-        self.keys = None;
-        self.state.trusted = None;
-        self.state.founded = false;
-        self.state.requested = false;
-        self.state.fell_back = Some(earlier);
-        Ok(true)
-    }
-
     /// Pins the ring to join by its fingerprint (from `harar edge sync
-    /// status` on any member). Until then, no grant is taken.
+    /// status` on any member). Until then, no grant is taken. A founder whose
+    /// ring has no other member yet gives its own up for the one pinned (two
+    /// rings founded at once): only the person decides that, never the code.
     pub(crate) fn trust(&mut self, fingerprint: &str) -> Result<Value> {
         let fp = normal_fingerprint(fingerprint).ok_or_else(|| anyhow!("{fingerprint:?} is not a ring fingerprint: 32 hex, in groups of four"))?;
         if !self.state.ring.is_empty() && self.state.trusted.as_deref() != Some(fp.as_str()) {
-            bail!("this machine is already a member of the ring {}", self.state.trusted.as_deref().unwrap_or("?"));
+            let roster = self.roster()?;
+            if !self.state.founded || roster.members.keys().any(|id| *id != self.edge.device) {
+                bail!("this machine is already a member of the ring {}", self.state.trusted.as_deref().unwrap_or("?"));
+            }
+            self.state.ring.clear();
+            self.keys = None;
+            self.state.founded = false;
+            self.state.requested = false;
+            self.state.fell_back = Some(fp.clone());
         }
         self.state.trusted = Some(fp.clone());
         Ok(json!({ "trusted": fp }))
@@ -545,41 +620,104 @@ impl Member {
         }
         let current = self.current(&roster).ok_or_else(|| anyhow!("this machine isn't a member of the ring, so it can't add one"))?;
         let (epoch, ring) = (current.epoch, current.key.clone());
-        let recipient = public_key(&unb64(&request.agree_pub)?)?;
-        let body = MemberBody { epoch, ..request.clone() };
-        let key = member_mac(&ring, &op::add_mac_text(device, epoch));
-        let wrap = b64(wrap_ring(&recipient, epoch, device, &ring));
-        self.write(Kind::MemberAdd, key, u64::from(epoch), op::plain_body(&body), wrap, 0);
+        let removal = ledger::latest_removal(&self.state.member_ops, self.keys.as_deref().unwrap_or_default(), &roster);
+        let body = MemberBody { epoch, removal, ..request.clone() };
+        self.grant(&body, &ring)?;
         Ok(json!({ "approved": device, "name": request.name, "fingerprint": theirs }))
+    }
+
+    /// A member.add of `body.device`, wrapping `ring` (of `body.epoch`) to it.
+    fn grant(&mut self, body: &MemberBody, ring: &[u8; 32]) -> Result<()> {
+        let recipient = public_key(&unb64(&body.agree_pub)?)?;
+        let key = member_mac(ring, &op::add_mac_text(self.me(), body));
+        let wrap = b64(wrap_ring(&recipient, body.epoch, &body.device, ring));
+        self.write(Kind::MemberAdd, key, u64::from(body.epoch), op::plain_body(body), wrap, 0);
+        Ok(())
     }
 
     /// Removes `device` from the ring, then rekeys: a new ring key, wrapped
     /// to every member that remains, used for every write from now on.
-    /// Returns None when it isn't a member.
+    /// Returns None when `device` isn't a member; fails when this machine
+    /// isn't one (so `unpair` never thinks a rekey was done).
     pub(crate) fn remove(&mut self, device: &str) -> Result<Option<Value>> {
         let roster = self.roster()?;
+        let Some(current) = self.current(&roster).filter(|_| roster.counts(self.me(), self.state.tip.seq + 1)) else {
+            bail!("this machine isn't a member of the ring, so it can't remove a device from it");
+        };
+        let (epoch, old) = (current.epoch, current.key.clone());
         if device == self.me() || !roster.active().any(|(id, _)| id == device) {
             return Ok(None);
         }
-        let current = self.current(&roster).ok_or_else(|| anyhow!("this machine isn't a member of the ring, so it can't remove one"))?;
-        let (epoch, old) = (current.epoch, current.key.clone());
-        let next = epoch.checked_add(1).ok_or_else(|| anyhow!("the ring is at its last epoch; it can't be rekeyed"))?;
         let after = self.state.authors.get(device).map_or(0, |a| a.seq);
         let removed = RemoveBody { device: device.to_owned(), after };
-        self.write(Kind::MemberRemove, member_mac(&old, &op::remove_mac_text(device, after)), u64::from(epoch), op::plain_body(&removed), String::new(), 0);
+        let me = self.edge.device.clone();
+        self.write(Kind::MemberRemove, member_mac(&old, &op::remove_mac_text(&me, device, after)), u64::from(epoch), op::plain_body(&removed), String::new(), 0);
+        let remaining: Vec<(String, String)> = roster.active().filter(|(id, _)| *id != device).map(|(id, m)| (id.clone(), m.agree_pub.clone())).collect();
+        let next = self.rekey(epoch, &old, &remaining)?;
+        Ok(Some(json!({ "removed": device, "after": after, "epoch": next })))
+    }
+
+    /// A new ring key for the epoch after `epoch`, wrapped to `to` (device,
+    /// agreement key), backing onto `old`.
+    fn rekey(&mut self, epoch: u32, old: &[u8; 32], to: &[(String, String)]) -> Result<u32> {
+        let next = next_epoch(epoch)?;
         let new = random_key();
         let mut wraps = BTreeMap::new();
-        for (id, member) in roster.active().filter(|(id, _)| *id != device) {
-            wraps.insert(id.clone(), b64(wrap_ring(&public_key(&unb64(&member.agree_pub)?)?, next, id, &new)));
+        for (id, agree) in to {
+            wraps.insert(id.clone(), b64(wrap_ring(&public_key(&unb64(agree)?)?, next, id, &new)));
         }
-        let body = RekeyBody { epoch: next, wraps };
-        let back = b64(gcm_seal(&wrap_key(&new), &*old, op::rekey_ad(next).as_bytes(), random_iv()));
-        let rekey = self.write(Kind::Rekey, member_mac(&old, &op::rekey_mac_text(next)), u64::from(next), op::plain_body(&body), back, 0);
+        let id = ring_id(&new, next);
+        let body = RekeyBody { epoch: next, id: id.clone(), wraps };
+        let back = b64(gcm_seal(&wrap_key(&new), old, op::rekey_ad(next).as_bytes(), random_iv()));
+        let me = self.edge.device.clone();
+        self.write(Kind::Rekey, member_mac(old, &op::rekey_mac_text(&me, next, &id)), u64::from(next), op::plain_body(&body), back, 0);
         let mut keys = self.keys.take().unwrap_or_default();
-        keys.push(RingKey { epoch: next, key: new, rank: Some(Served::from(&rekey).rank()) });
+        keys.push(RingKey { epoch: next, key: new });
         self.keep_keys(&keys)?;
         self.keys = Some(keys);
-        Ok(Some(json!({ "removed": device, "after": after, "epoch": next })))
+        Ok(next)
+    }
+
+    /// Keeps the ring's write key one that only active members hold: when
+    /// the newest key was given to a device since removed (two removals at
+    /// once each wrap their rekey to the other's removed device), it rekeys
+    /// to the next epoch, wrapped only to active members; and an active
+    /// member that never got the write key (approved across a rekey) is
+    /// granted it again.
+    fn maintain(&mut self, roster: &Roster) -> Result<()> {
+        let keys = self.keys.as_deref().unwrap_or_default();
+        let Some(newest) = ledger::newest(keys, &self.state.member_ops, roster) else { return Ok(()) };
+        let current = ledger::current(keys, &self.state.member_ops, roster).map(|k| (k.epoch, k.key.clone()));
+        let active: Vec<(String, String)> = roster.active().map(|(id, m)| (id.clone(), m.agree_pub.clone())).collect();
+        match current {
+            Some((epoch, _)) if epoch >= newest => {}
+            _ => {
+                // Back onto a key of the newest epoch, which every member that
+                // holds any of them can follow.
+                let back = keys
+                    .iter()
+                    .filter(|k| k.epoch == newest && ledger::given_to(k, &self.state.member_ops, roster).is_some())
+                    .max_by_key(|k| ring_id(&k.key, k.epoch))
+                    .map(|k| k.key.clone());
+                if let Some(back) = back {
+                    self.rekey(newest, &back, &active)?;
+                }
+                return Ok(());
+            }
+        }
+        let (epoch, ring) = current.expect("checked above");
+        let held = RingKey { epoch, key: ring.clone() };
+        let given = ledger::given_to(&held, &self.state.member_ops, roster).unwrap_or_default();
+        let removal = ledger::latest_removal(&self.state.member_ops, keys, roster);
+        let lacking: Vec<MemberBody> = roster
+            .active()
+            .filter(|(id, _)| !given.contains(*id))
+            .map(|(id, m)| MemberBody { device: id.clone(), name: m.name.clone(), sign_pub: m.sign_pub.clone(), agree_pub: m.agree_pub.clone(), epoch, removal: removal.clone() })
+            .collect();
+        for body in lacking {
+            self.grant(&body, &ring)?;
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------ the vault
@@ -593,18 +731,27 @@ impl Member {
         if self.keys.as_ref().is_none_or(Vec::is_empty) || !roster.counts(self.me(), self.state.tip.seq + 1) {
             return Ok(Stepped::default());
         }
+        self.maintain(&roster)?;
+        let roster = self.roster()?;
         let mut meta = VaultMeta::read(keys);
         if !self.state.renamed.is_empty() {
             meta.rename(&self.state.renamed);
             self.state.renamed.clear();
         }
-        let incoming = self.open_pending(&roster);
-        let applied: BTreeSet<String> = incoming.iter().map(|i| i.hash.clone()).collect();
         let first = meta.ring != roster.founder;
+        let incoming = self.open_pending(&roster);
+        // A joiner's first step waits for a pull that reached the end, with
+        // nothing from a member left waiting, so it sees the ring whole.
+        let waiting = self.state.pending.iter().any(|op| roster.counts(&op.author, op.seq) && !incoming.iter().any(|i| i.hash == op.hash));
+        if first && !self.state.founded && (!self.pull_complete || waiting) {
+            return Ok(Stepped::default());
+        }
+        let applied: BTreeSet<String> = incoming.iter().map(|i| i.hash.clone()).collect();
         let changed = if first {
             // Joining (or founding): the ring's current value wins. What the
             // vault held that differs goes to history, flagged; what the
-            // ring lacks becomes this member's write.
+            // ring lacks becomes this member's write, at the lowest rank, so
+            // it loses to any ring op on its path that shows up later.
             meta.paths.clear();
             meta.ring = roster.founder.clone();
             let (mut dry, mut view) = (VaultMeta::default(), keys.clone());
@@ -620,7 +767,11 @@ impl Member {
                     meta.conflicts.push(Conflict { path: path.clone(), kept: Side { device: theirs.rank.author.clone(), seq: theirs.rank.seq, at: theirs.rank.at, version: theirs.version }, lost });
                 }
             }
-            meta.apply(keys, incoming)
+            let changed = meta.apply(keys, incoming);
+            if !self.state.founded {
+                self.record_changes_at(&mut meta, keys, &roster, Some(0))?;
+            }
+            changed
         } else {
             // Changes here that no op records yet (sync was off) are
             // concurrent with what arrived: recorded first, so last write wins.
@@ -635,20 +786,25 @@ impl Member {
 
     /// A change's tag: the same change gets the same tag, so after a crash
     /// between saving the ops and saving the vault it isn't written twice.
-    fn change_tag(ring: &[u8; 32], change: &Change) -> String {
+    fn change_tag(ring: &[u8; 32], epoch: u32, change: &Change) -> String {
         let value = change.value.as_deref().map(sha256_hex).unwrap_or_default();
-        member_mac(ring, &format!("harar:change|{}|{}|{}|{value}", change.path, change.version, change.base))
+        member_mac(ring, &format!("harar:change|{epoch}|{}|{}|{}|{value}", change.path, change.version, change.base))
     }
 
     fn record_changes(&mut self, meta: &mut VaultMeta, keys: &HashMap<String, String>, roster: &Roster) -> Result<()> {
+        self.record_changes_at(meta, keys, roster, None)
+    }
+
+    /// Records the vault's changes as ops; with `at`, at exactly that time.
+    fn record_changes_at(&mut self, meta: &mut VaultMeta, keys: &HashMap<String, String>, roster: &Roster, at: Option<u64>) -> Result<()> {
         let changes = meta.changes(keys);
         if changes.is_empty() {
             return Ok(());
         }
         let current = self.current(roster).ok_or_else(|| anyhow!("no ring key to write with"))?;
-        let ring = current.key.clone();
+        let (epoch, ring) = (current.epoch, current.key.clone());
         for change in changes {
-            let tag = Self::change_tag(&ring, &change);
+            let tag = Self::change_tag(&ring, epoch, &change);
             if let Some((_, hash, rank)) = self.state.own_changes.iter().find(|(t, _, _)| *t == tag) {
                 meta.record_own(&change, hash, rank.clone());
                 continue;
@@ -663,8 +819,11 @@ impl Member {
                 continue;
             }
             // Later than what it replaces, so it outranks it everywhere.
-            let min_at = meta.paths.get(&change.path).map_or(0, |m| m.rank.at + 1);
-            let op = self.write(change.kind, key, change.version, sealed, wrapped, min_at);
+            let min_at = meta.paths.get(&change.path).map_or(0, |m| m.rank.at.saturating_add(1));
+            let op = match at {
+                Some(at) => self.write_at(change.kind, key, change.version, sealed, wrapped, at),
+                None => self.write(change.kind, key, change.version, sealed, wrapped, min_at),
+            };
             let rank = Served::from(&op).rank();
             meta.record_own(&change, &op.hash(), rank.clone());
             self.state.own_changes.push((tag, op.hash(), rank));
@@ -798,13 +957,19 @@ impl Member {
         };
         let fp = |sign: &str, agree: &str| device_fingerprint(&unb64(sign).unwrap_or_default(), &unb64(agree).unwrap_or_default());
         let members: Vec<Value> = roster.members.iter().map(|(id, m)| json!({ "device": id, "name": m.name, "fingerprint": fp(&m.sign_pub, &m.agree_pub), "removed_after": m.after })).collect();
-        let requests: Vec<Value> = roster.requests.iter().map(|(id, r)| json!({ "device": id, "name": r.name, "fingerprint": fp(&r.sign_pub, &r.agree_pub) })).collect();
+        // A request shows no fingerprint here: the person reads it on the
+        // joining device, never copies it from the approver's own screen.
+        let requests: Vec<Value> = roster.requests.iter().map(|(id, r)| json!({ "device": id, "name": r.name })).collect();
         let others: Vec<Value> = roster
             .other_founders
             .iter()
-            .filter(|(id, _)| !roster.members.contains_key(id) && *id != self.edge.device)
-            .map(|(id, rank)| json!({ "device": id, "at": rank.at }))
+            .filter(|(id, _, _)| !roster.members.contains_key(id) && *id != self.edge.device)
+            .map(|(id, rank, ring)| json!({ "device": id, "at": rank.at, "ring": ring }))
             .collect();
+        let grant_view = ledger::my_grant_view(self.me(), &self.state.member_ops, &roster).map(|(epoch, removal)| {
+            let known = ledger::latest_removal(&self.state.member_ops, self.keys.as_deref().unwrap_or_default(), &roster);
+            json!({ "epoch": epoch, "removal": removal, "stale": removal != known })
+        });
         let waiting_compacted = self.state.pending.iter().filter(|o| o.compacted).count();
         let next = match role {
             "requested" if self.state.trusted.is_none() => Some("pin the ring: harar edge sync trust <the ring fingerprint harar edge sync status shows on a member>; then a member approves this device with its fingerprint"),
@@ -824,7 +989,15 @@ impl Member {
             "epoch": epoch,
             "members": members,
             "requests": requests,
-            "ring_conflicts": json!({ "unresolved": roster.conflict, "other_founders": others, "gave_up_ours_for": self.state.fell_back }),
+            "ring_conflicts": json!({
+                "unresolved": roster.conflict,
+                "ours": self.state.trusted,
+                "other_founders": others,
+                "gave_up_ours_for": self.state.fell_back,
+                "resolve": if others.is_empty() { Value::Null } else { json!("another ring was founded on this edge: keep this one, or give it up for the other with harar edge sync trust <its ring fingerprint> (only while this ring has no other member)") },
+            }),
+            "forks": self.state.forks,
+            "grant_view": grant_view,
             "queued": self.state.outbox.len(),
             "waiting": self.state.pending.len(),
             "waiting_compacted": if waiting_compacted > 0 { json!(waiting_compacted) } else { Value::Null },

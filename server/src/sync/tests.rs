@@ -66,6 +66,7 @@ impl Edge {
         let mut ops: Vec<Served> = self.ops.iter().filter(|o| o.seq > m.state.next.get(&o.author).copied().unwrap_or(0)).cloned().collect();
         ops.sort_by(|a, b| (&a.author, a.seq).cmp(&(&b.author, b.seq)));
         m.ingest(ops);
+        m.pull_complete = true;
         m.rebase();
     }
 
@@ -149,7 +150,8 @@ fn a_ring_is_founded_joined_on_approval_and_shared_and_the_edge_sees_no_name_or_
     edge.sync(&mut a, &mut a_vault);
     let requests = a.status(None).unwrap()["requests"].clone();
     assert_eq!(requests[0]["device"], "d-bbbbbbbbbbbbbbbb");
-    assert_eq!(requests[0]["fingerprint"], b.fingerprint());
+    assert_eq!(requests[0]["fingerprint"], Value::Null, "the approver reads the fingerprint on B, never copies it from its own screen");
+    assert_eq!(b.status(None).unwrap()["fingerprint"], b.fingerprint());
     assert!(a.approve("d-cccccccccccccccc", &b.fingerprint()).is_err(), "only a device that asked");
     let wrong = super::crypto::device_fingerprint(b"not", b"b");
     assert!(a.approve("d-bbbbbbbbbbbbbbbb", &wrong).unwrap_err().to_string().contains("fingerprint"), "only with B's own fingerprint");
@@ -363,9 +365,9 @@ fn build_vectors() -> Value {
         ops.push(json!({ "op": op, "canonical": op.canonical(), "hash": op.hash(), "opens": opens }));
     };
 
-    let body = MemberBody { device: author.into(), name: "vector".into(), sign_pub: b64(&sign_pub), agree_pub: b64(&agree_pub), epoch: 0 };
+    let body = MemberBody { device: author.into(), name: "vector".into(), sign_pub: b64(&sign_pub), agree_pub: b64(&agree_pub), epoch: 0, removal: String::new() };
     let wrap = wrap_ring_with(&agree.public_key(), 0, author, &ring, &ephemeral);
-    let founder = Op::sign(author, 1, &prev, Kind::MemberAdd, &crypto_member_mac(&ring, &op::add_mac_text(author, 0)), 0, op::plain_body(&body), b64(&wrap), at, &signer).unwrap();
+    let founder = Op::sign(author, 1, &prev, Kind::MemberAdd, &crypto_member_mac(&ring, &op::add_mac_text(author, &body)), 0, op::plain_body(&body), b64(&wrap), at, &signer).unwrap();
     push(founder, Value::Null, &mut prev);
 
     let path = "prod/shop/STRIPE_KEY";
@@ -405,9 +407,8 @@ fn the_test_vectors_are_what_this_code_makes_and_they_verify_and_open() {
     // Read back as a member reads ops from the edge: chain, signatures and seals.
     let ops: Vec<Served> = built["ops"].as_array().unwrap().iter().map(|v| Served::from(&serde_json::from_value::<Op>(v["op"].clone()).unwrap())).collect();
     let mut authors = Default::default();
-    let mut rejected = Vec::new();
-    let good = ledger::verify_chains(&mut authors, "d-someone-else", ops.clone(), &mut rejected);
-    assert_eq!((good.len(), rejected.len()), (4, 0), "{rejected:?}");
+    let verified = ledger::verify_chains(&mut authors, "d-someone-else", ops.clone());
+    assert_eq!((verified.good.len(), verified.rejected.len()), (4, 0), "{:?}", verified.rejected);
     let ring = [4u8; 32];
     for (v, op) in built["ops"].as_array().unwrap().iter().zip(&ops).skip(1) {
         let plain = super::crypto::open_value(&ring, &op.key, op.version, op.sealed.as_deref().unwrap(), op.wrapped_key.as_deref().unwrap()).unwrap();
@@ -423,6 +424,6 @@ fn the_test_vectors_are_what_this_code_makes_and_they_verify_and_open() {
     compacted[1].wrapped_key = None;
     compacted[1].compacted = true;
     let mut authors = Default::default();
-    assert_eq!(ledger::verify_chains(&mut authors, "d-someone-else", compacted, &mut rejected).len(), 4);
-    assert!(rejected.is_empty());
+    let verified = ledger::verify_chains(&mut authors, "d-someone-else", compacted);
+    assert_eq!((verified.good.len(), verified.rejected.len()), (4, 0));
 }

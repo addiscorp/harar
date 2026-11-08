@@ -363,7 +363,10 @@ a `member.*` or `rekey` op served compacted, or the latest op on a key
 served compacted with nothing later, is taken as the edge hiding it
 (section 5b), and joining a ring needs its fingerprint pinned by the person,
 so an edge (or any paired device) can't stand up a ring of its own around a
-member.
+member. A second, different op served at a seq a member already holds is a
+fork, shown and counted against that author. What the edge can still do is
+withhold ops: it can delay a removal or a value, never forge one (section
+5b).
 
 ## 5b. Members: the agent's vault in a ring (phase 2, step 2)
 
@@ -414,13 +417,14 @@ say is public keys and device ids the edge already knows:
 | Op | `sealed` | `wrapped_key` | `key` | `version` |
 |---|---|---|---|---|
 | `member.add` by the device itself: a request to join | `{device, name, sign_pub, agree_pub, epoch: 0}` | empty | `sha256("harar:member\|request\|<device>")` | 0 |
-| `member.add` by a member: adds `device` | the same, with the epoch, and the device's own two keys | the ring key, wrapped to `agree_pub` for that epoch and device | ring MAC of `harar:member\|add\|<device>\|<epoch>` | the epoch |
-| `member.remove` | `{device, after}` | empty | ring MAC of `harar:member\|remove\|<device>\|<after>` | the epoch |
-| `rekey` | `{epoch, wraps: {device: the new key wrapped for that epoch and device}}` | the previous ring key under the new key's wrap subkey, AES-GCM, ad `harar-rekey\|<epoch>` | MAC of `harar:member\|rekey\|<epoch>` under the previous key | the new epoch |
+| `member.add` by a member: adds `device` | the same, with the epoch, the device's own two keys, and `removal`: the hash of the newest `member.remove` the granter knew | the ring key, wrapped to `agree_pub` for that epoch and device | ring MAC of `harar:member\|add\|<author>\|<device>\|<epoch>\|<sign_pub>\|<agree_pub>` | the epoch |
+| `member.remove` | `{device, after}` | empty | ring MAC of `harar:member\|remove\|<author>\|<device>\|<after>` | the epoch |
+| `rekey` | `{epoch, id, wraps: {device: the new key wrapped for that epoch and device}}`, `id` = MAC of `harar:member\|ring-id\|<epoch>` under the new key | the previous ring key under the new key's wrap subkey, AES-GCM, ad `harar-rekey\|<epoch>` | MAC of `harar:member\|rekey\|<author>\|<epoch>\|<id>` under the previous key | the new epoch |
 
 A ring MAC is an HMAC-SHA256 under the member subkey; it proves the author
-holds the ring key. The texts start with the vault's reserved `harar:`,
-which no synced path has.
+holds the ring key, and it covers the author and the whole body, so no MAC
+is good for any other op. The texts start with the vault's reserved
+`harar:`, which no synced path has.
 
 ### Who is a member
 
@@ -432,7 +436,9 @@ A member verifies everything it pulls; it trusts the edge for nothing.
   author's first op must be a `member.add` of itself; it carries the signing
   and key-agreement keys every later op is checked against. A chain that
   breaks is taken up to the break; the rest is refused, listed in `status`,
-  and asked for again at the next pull.
+  and asked for again at the next pull. **A fork** (a second, different op
+  at a seq already held) is listed in `status` (`forks`: author, seq, both
+  hashes), and that author's ops from there on don't count.
 - **Compaction can't hide anything.** The edge never compacts a ring op
   (section 5a), so one served compacted is a broken chain: its author is
   refused from there. A compacted secret op counts only when a later op on
@@ -444,27 +450,44 @@ A member verifies everything it pulls; it trusts the edge for nothing.
   the member founded or pinned (`trust`). Two founder ops that verify under
   the keys held are a ring conflict: nobody counts until it is resolved.
   A second, different epoch-0 key is never taken.
-- **Members** are the founder and the devices members' grants name, with
-  the keys that device's own first op carries: a grant naming other keys
-  makes no member, and that device's ops don't count. A `member.remove`
-  ends a member's ops at the seq it names (`after`, the last op the remover
-  had from it). This is three fixed passes, each only growing a set (the
-  devices grants reach; the removals they made; the devices grants within
-  their author's cut reach, and the removals within theirs), so it doesn't
-  depend on the order ops arrive in.
+- **Members** are the founder and the devices that grants by counting
+  members name. A counting member's grant that names a device with keys
+  other than that device's own first op's makes no member, and that
+  device's ops don't count; a grant by anyone else changes nothing (so
+  nobody can eject a member by naming it with other keys). A
+  `member.remove` ends a member's ops at the seq it names (`after`, the
+  last op the remover had from it). This is three fixed passes, each only
+  growing a set (the devices grants reach; the removals they made; the
+  devices grants within their author's cut reach, and the removals within
+  theirs), so it doesn't depend on the order ops arrive in.
 - **A secret op counts** only if its author is a member at its seq. One
   written after its author's removal is refused; one from an author not
-  known to be a member yet waits (at most 5000 wait; past that the oldest
-  from non-members are dropped, counted in `status`).
+  known to be a member yet waits.
+- **What a non-member can make a member hold** is bounded per author: at
+  most 2000 waiting secret ops and 2000 ring ops. Past that its newest are
+  let go and its chain and cursor go back to before them, so they are pulled
+  again later, never lost (`status.dropped` counts them). Nothing is let go
+  while no ring key is open (vault locked), since then nobody can be told
+  from a member. Refusals are kept at most 20 per author.
+- **A ring key is named by its id** (`rekey.id`, a MAC under the key), never
+  by the op that carried it, so re-signing a queued rekey after the chain
+  diverged changes nothing.
 - **Rekeys** are taken only from an author who counts at the rekey's seq,
   with an epoch of at least 1 that is one past a key the member holds,
-  whose back-wrap opens (with the new key) to that held key, and whose MAC
-  is under it. Each rekey's key opens the key before, so a member who has
-  the newest key has them all (a device approved after a rekey reads the
-  whole history). New writes use the newest epoch a counting member's
-  rekey made (the later rekey if two made one epoch), else the founder's
-  epoch-0 key; a key with neither origin is never written with. An epoch
-  past 2^32 − 1 is refused.
+  whose id is the new key's, whose back-wrap opens (with the new key) to
+  that held key, and whose MAC is under it. Each rekey's key opens the key
+  before, so a member who has the newest key has them all (a device
+  approved after a rekey reads the whole history). An epoch past 2^32 − 1
+  is refused.
+- **The write key** is, of the keys a counting member made (epoch 0: the
+  founder), the newest epoch whose key was never given (by a rekey's wraps
+  or a grant) to a device since removed; of two at one epoch, the larger
+  id. So when two members remove two devices at once, each rekey was
+  wrapped to the other's removed device, neither is written with, and any
+  member that sees it rekeys to the next epoch, wrapped only to the members
+  still active. And a member approved across a rekey (granted the old key,
+  left out of the new one's wraps) is granted the write key again by any
+  member that sees it lacks it.
 
 ### Joining
 
@@ -486,15 +509,37 @@ A member verifies everything it pulls; it trusts the edge for nothing.
    device fingerprint `status` shows on the joiner; a different one is
    refused. That wraps the ring key to the request's key-agreement key and
    publishes the `member.add`. Steps 3 and 4 can come in either order.
-5. The joiner's next sync opens the ring key, then applies the ring's ops.
-   **On joining, the ring's current value wins**: what the joiner's vault
-   held that differs goes to its history and is flagged as a conflict there;
-   the same value is adopted; what the ring lacks becomes the joiner's write.
+5. The joiner's next sync opens the ring key; its first step waits for a
+   pull that reached the end with nothing from a member left waiting, then
+   applies the ring's ops. **On joining, the ring's current value wins**:
+   what the joiner's vault held that differs goes to its history and is
+   flagged as a conflict there; the same value is adopted; what the ring
+   lacks becomes the joiner's write **at the lowest rank** (`at` = 0), so it
+   loses to any ring op on that path, now or later, and can never roll a
+   ring value back. `status.grant_view` shows the epoch and the newest
+   removal the granter knew, and whether that is behind what the joiner
+   sees.
 6. **Two founders at once** (two machines turned sync on before either saw
-   the other): the one that founded first, by `at` then device id, keeps
-   its ring; the other gives its own up and asks to join (steps 3 and 4),
-   unless its ring already has another member, in which case both rings
-   stand and `status` shows the conflict (`ring_conflicts`).
+   the other): neither gives its ring up by itself, whatever the times say.
+   `status.ring_conflicts` shows both ring fingerprints; the person picks
+   one by running `harar edge sync trust <the other's ring fingerprint>` on
+   the machine that should join it, which gives its own ring up (only while
+   that ring has no other member) and asks to join.
+
+**What the edge can still do: delay, never forge.** An edge (or anyone with
+its database) can withhold ops: it can keep a `member.remove` from members,
+or a value, for as long as it likes, and members can't tell an op withheld
+from one not yet written. It can't make an op, change one, or make a member
+take a key, a grant or a removal that isn't one; a fork or a compacted ring
+op it serves is caught. Phase 4's direct peer sync, where members exchange
+ops without the edge, closes the withholding gap.
+
+**Why not "admin" members.** Letting only the founder and devices it marks
+as admins write ring ops was considered. It narrows who can write ring ops,
+but once the phone is an admin (phase 3), two admins can still remove
+devices at once, so concurrent rekeys and stale grants still need the rules
+above. It would add a role and remove no whole class of these rules, so it
+was not done.
 
 ### Applying: last write wins
 
@@ -534,7 +579,11 @@ Every push is preceded by a pull. Ops that fail to go stay queued
 - **Ops are written unsigned** under the agent's lock (an op's hash doesn't
   cover its signature) and signed and sent outside it, so a Secure Enclave
   signature or a slow edge never holds the vault.
-- **A pull** takes at most 20 pages per sync (the next sync carries on), and
+- **The worker never opens a ring key while the vault is locked**: founding,
+  asking to join and pulling need none.
+- **A pull** takes at most 20 pages per sync (the next sync carries on, but
+  only if this one moved the cursor, and each repeat waits twice as long, up
+  to about a minute), and
   each page's `next` must move the cursor on, or the edge is refused.
 - **A diverged chain** (the state file restored from an older copy, or a
   push refused as `fork`, `wrong_seq` or `wrong_prev`): after the next full
@@ -553,9 +602,9 @@ Every push is preceded by a pull. Ops that fail to go stay queued
 | `harar edge sync off` | stops syncing. Nothing is deleted; `on` picks up where it left off, and what changed meanwhile goes as ops |
 | `harar edge sync status` | role (member, requested, removed), this device's fingerprint, the ring's fingerprint, members and requests with fingerprints, the epoch, queued and waiting ops, refused ops, ring conflicts, the chain, conflicts |
 | `harar edge sync now` | one sync |
-| `harar edge sync trust <ring fingerprint>` | pins the ring to join; no grant is taken before |
+| `harar edge sync trust <ring fingerprint>` | pins the ring to join; no grant is taken before. On a founder whose ring has no other member, gives that ring up for the one pinned |
 | `harar edge sync approve <device> <fingerprint>` | adds a device that asked, if the fingerprint is the one its `status` shows |
-| `harar edge unpair <device> [--force-no-rekey]` | with sync on, a member is first removed from the ring and the ring rekeyed, then unpaired. From a machine that doesn't sync, a device with ops in the ring is refused (unpair it from a member, so the ring is rekeyed); `--force-no-rekey` unpairs it anyway, with a warning: it keeps the ring key |
+| `harar edge unpair <device> [--force-no-rekey]` | with sync on, a member is first removed from the ring and the ring rekeyed, then unpaired. From a machine that doesn't sync, or syncs but isn't a member yet, a device with ops in the ring is refused (unpair it from a member, so the ring is rekeyed); `--force-no-rekey` unpairs it anyway, with a warning: it keeps the ring key |
 
 They all go through the agent (`--socket` for another one), which is the
 only writer of the member's chain, so no two processes ever sign the same

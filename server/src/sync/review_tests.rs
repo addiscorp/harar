@@ -13,7 +13,7 @@ const ROGUE: &str = "d-eeeeeeeeeeeeeeee";
 
 /// A founds; each of `joiners` asks, is trusted (where the code has that
 /// step) and approved.
-fn ring(dir: &std::path::Path, edge: &mut Edge, joiners: &[&str]) -> (super::member::Member, Vec<super::member::Member>) {
+pub(crate) fn ring(dir: &std::path::Path, edge: &mut Edge, joiners: &[&str]) -> (super::member::Member, Vec<super::member::Member>) {
     let mut a = member(dir, A, "mac");
     let mut av = vault(&[]);
     edge.sync(&mut a, &mut av);
@@ -49,9 +49,10 @@ fn review_1_a_rekey_from_a_device_that_is_not_a_member_is_never_taken() {
     let evil = random_key();
     for epoch in [0u32, 1] {
         let wrap = super::tests::wrap_to(&a_agree, epoch, A, &evil);
-        let body = RekeyBody { epoch, wraps: BTreeMap::from([(A.to_owned(), b64(wrap))]) };
+        let id = super::ledger::ring_id(&evil, epoch);
+        let body = RekeyBody { epoch, id: id.clone(), wraps: BTreeMap::from([(A.to_owned(), b64(wrap))]) };
         let back = b64(gcm_seal(&super::crypto::wrap_key(&evil), &*evil, op::rekey_ad(epoch).as_bytes(), random_iv()));
-        rogue.write(Kind::Rekey, super::tests::member_mac(&evil, &op::rekey_mac_text(epoch)), u64::from(epoch), op::plain_body(&body), back, 0);
+        rogue.write(Kind::Rekey, super::tests::member_mac(&evil, &op::rekey_mac_text(ROGUE, epoch, &id)), u64::from(epoch), op::plain_body(&body), back, 0);
     }
     edge.push(&mut rogue);
 
@@ -112,7 +113,7 @@ fn review_3_a_grant_whose_keys_are_not_the_devices_own_makes_no_member() {
     let other = b64(super::crypto::raw_public(&p256::SecretKey::random(&mut p256::elliptic_curve::rand_core::OsRng).public_key()));
     let body = MemberBody { sign_pub: other, ..real.clone() };
     let wrap = super::tests::wrap_to(&public_key(&unb64(&real.agree_pub).unwrap()).unwrap(), epoch, B, &ring);
-    a.write(Kind::MemberAdd, super::tests::member_mac(&ring, &op::add_mac_text(B, epoch)), u64::from(epoch), op::plain_body(&body), b64(wrap), 0);
+    a.write(Kind::MemberAdd, super::tests::member_mac(&ring, &op::add_mac_text(A, &body)), u64::from(epoch), op::plain_body(&body), b64(wrap), 0);
     edge.push(&mut a);
     edge.sync(&mut b, &mut bv);
     bv.insert("from/b".into(), "should not count".into());
@@ -188,32 +189,39 @@ fn review_5_last_write_wins_does_not_depend_on_arrival_order() {
     assert_eq!(ends[0], "one", "the highest-ranked op seen is the value");
 }
 
-/// #7: two devices found a ring at once. The later one gives its own up and
-/// asks to join; once it pins and is approved, its secrets reach the ring.
+/// #7 (and N6): two devices found a ring at once. Neither gives its ring up
+/// by itself, whatever the times say; both show the conflict with the other
+/// ring's fingerprint. Once the person pins A's ring on B, B gives its own up,
+/// asks, is approved, and its secrets reach the ring.
 #[test]
-fn review_7_of_two_founders_the_later_one_falls_back_and_joins() {
+fn review_7_of_two_founders_neither_falls_back_until_the_person_pins_one() {
     let dir = tempfile::tempdir().unwrap();
     let mut edge = Edge::default();
     let mut a = member(dir.path(), A, "mac");
     let mut b = member(dir.path(), B, "laptop");
     let (mut av, mut bv) = (vault(&[]), vault(&[("b/own", "from-b")]));
-    // Both found before either sees the other.
-    a.found_or_request().unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(3));
+    // Both found before either sees the other; B first.
     b.found_or_request().unwrap();
+    a.found_or_request().unwrap();
     b.step(&mut bv).unwrap();
     edge.push(&mut a);
     edge.push(&mut b);
     edge.sync(&mut a, &mut av);
     edge.sync(&mut b, &mut bv);
-    let status = b.status(None).unwrap();
-    assert_eq!(status["role"], "requested", "{status}");
-    assert_eq!(status["ring_conflicts"]["gave_up_ours_for"], A);
-    let status = a.status(None).unwrap();
-    assert_eq!(status["role"], "member");
-    assert_eq!(status["ring_conflicts"]["other_founders"][0]["device"], B, "A shows the other founder: {status}");
+    for (m, other) in [(&mut a, B), (&mut b, A)] {
+        let status = m.status(None).unwrap();
+        assert_eq!(status["role"], "member", "{status}");
+        assert_eq!(status["ring_conflicts"]["other_founders"][0]["device"], other, "{status}");
+        assert!(status["ring_conflicts"]["other_founders"][0]["ring"].is_string());
+    }
+    let a_ring = a.status(None).unwrap()["ring"].as_str().unwrap().to_owned();
+    assert_eq!(b.status(None).unwrap()["ring_conflicts"]["other_founders"][0]["ring"], a_ring.as_str(), "B shows A's ring fingerprint to pin");
 
     super::tests::trust(&mut a, &mut b);
+    edge.sync(&mut b, &mut bv);
+    let status = b.status(None).unwrap();
+    assert_eq!(status["role"], "requested", "{status}");
+    assert_eq!(status["ring_conflicts"]["gave_up_ours_for"], a_ring.as_str());
     edge.sync(&mut a, &mut av);
     super::tests::approve(&mut a, &mut b);
     edge.push(&mut a);

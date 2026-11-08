@@ -330,18 +330,28 @@ fn ring_participant(edge: &Paired, device: &str) -> Result<bool> {
 fn unpair(cmd: Unpair) -> Result<()> {
     use crate::agent::{AgentRequest, SyncCommand};
     let edge = Paired::find(&cmd.target)?;
-    let ring = if edge.sync.as_ref().is_some_and(|s| s.on) && cmd.device != edge.device {
-        let answer = super::agent::ask(&cmd.agent.socket,&AgentRequest::Sync(SyncCommand::Remove { device: cmd.device.clone() }))
+    // With sync on, the agent removes the device from the ring and rekeys; a
+    // machine that syncs but isn't a member yet can't, and is treated as one
+    // that doesn't sync.
+    let removed = if edge.sync.as_ref().is_some_and(|s| s.on) && cmd.device != edge.device {
+        let answer = super::agent::ask(&cmd.agent.socket, &AgentRequest::Sync(SyncCommand::Remove { device: cmd.device.clone() }))
             .context("this vault syncs through the edge, so the agent removes the device from the ring first")?;
-        if answer["ok"] != Value::Bool(true) {
-            bail!("the agent didn't remove {} from the ring, so it stays paired: {}", cmd.device, answer["error"].as_str().unwrap_or("no reason given"));
+        let error = answer["error"].as_str().unwrap_or("no reason given").to_owned();
+        match answer["ok"] == Value::Bool(true) {
+            true => Some(answer),
+            false if error.contains("isn't a member of the ring") => None,
+            false => bail!("the agent didn't remove {} from the ring, so it stays paired: {error}", cmd.device),
         }
+    } else {
+        None
+    };
+    let ring = if let Some(answer) = removed {
         Some(answer)
     } else {
         if cmd.device != edge.device && ring_participant(&edge, &cmd.device)? {
             if !cmd.force_no_rekey {
                 bail!(
-                    "{} has ops in the ring this edge syncs, and this machine doesn't sync with it, so it can't remove the device from the ring or rekey. Unpair it from a machine that does (harar edge sync status there says member), so it reads nothing written after; or pass --force-no-rekey to unpair it here and leave it the ring key",
+                    "{} has ops in the ring this edge syncs, and this machine isn't a syncing member of it, so it can't remove the device from the ring or rekey. Unpair it from a machine that does (harar edge sync status there says member), so it reads nothing written after; or pass --force-no-rekey to unpair it here and leave it the ring key",
                     cmd.device
                 );
             }

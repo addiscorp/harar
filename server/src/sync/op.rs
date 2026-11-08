@@ -213,6 +213,11 @@ pub(crate) struct MemberBody {
     pub agree_pub: String,
     /// The ring key's epoch the wrap holds (0 in a request).
     pub epoch: u32,
+    /// In a grant: the hash of the newest member.remove the granter knew
+    /// ("" for none), so the joiner can tell when its granter's view was
+    /// behind its own.
+    #[serde(default)]
+    pub removal: String,
 }
 
 /// Inside a member.remove: the device, and its last op that still counts.
@@ -228,6 +233,9 @@ pub(crate) struct RemoveBody {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RekeyBody {
     pub epoch: u32,
+    /// The new key's id: a MAC under it (`ring_id`). It names the key the
+    /// same way however the op is re-signed, and only a holder can check it.
+    pub id: String,
     pub wraps: BTreeMap<String, String>,
 }
 
@@ -239,19 +247,25 @@ pub(crate) fn read_plain_body<T: for<'de> Deserialize<'de>>(sealed: &str) -> Res
     serde_json::from_slice(&unb64(sealed)?).context("an op body")
 }
 
-/// The texts a member op's `key` is the ring MAC of. They start with the
-/// vault's reserved `harar:`, which no synced path has, so none of these is
-/// ever a secret's key.
-pub(crate) fn add_mac_text(device: &str, epoch: u32) -> String {
-    format!("harar:member|add|{device}|{epoch}")
+/// The texts a member op's `key` is the ring MAC of: the author and every
+/// field of the body that matters, so a MAC is never good for another op.
+/// They start with the vault's reserved `harar:`, which no synced path has,
+/// so none of these is ever a secret's key.
+pub(crate) fn add_mac_text(author: &str, body: &MemberBody) -> String {
+    format!("harar:member|add|{author}|{}|{}|{}|{}", body.device, body.epoch, body.sign_pub, body.agree_pub)
 }
 
-pub(crate) fn remove_mac_text(device: &str, after: u64) -> String {
-    format!("harar:member|remove|{device}|{after}")
+pub(crate) fn remove_mac_text(author: &str, device: &str, after: u64) -> String {
+    format!("harar:member|remove|{author}|{device}|{after}")
 }
 
-pub(crate) fn rekey_mac_text(epoch: u32) -> String {
-    format!("harar:member|rekey|{epoch}")
+pub(crate) fn rekey_mac_text(author: &str, epoch: u32, id: &str) -> String {
+    format!("harar:member|rekey|{author}|{epoch}|{id}")
+}
+
+/// What a ring key's id is the MAC of, under that key.
+pub(crate) fn ring_id_text(epoch: u32) -> String {
+    format!("harar:member|ring-id|{epoch}")
 }
 
 /// A join request's `key`: there is no ring key to MAC with yet.

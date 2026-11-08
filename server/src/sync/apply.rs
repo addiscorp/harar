@@ -144,12 +144,13 @@ impl VaultMeta {
 
     /// This member's queued ops were signed again with new seqs (the chain
     /// diverged): their hashes, old to new.
-    pub(crate) fn rename(&mut self, renamed: &BTreeMap<String, String>) {
+    pub(crate) fn rename(&mut self, renamed: &BTreeMap<String, (String, u64)>) {
         for m in self.paths.values_mut() {
-            if let Some(new) = renamed.get(&m.hash) {
+            if let Some((new, seq)) = renamed.get(&m.hash) {
                 m.hash = new.clone();
+                m.rank.seq = *seq;
             }
-            m.known = m.known.iter().map(|h| renamed.get(h).unwrap_or(h).clone()).collect();
+            m.known = m.known.iter().map(|h| renamed.get(h).map_or(h, |(new, _)| new).clone()).collect();
         }
     }
 
