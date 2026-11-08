@@ -225,7 +225,7 @@ All bodies are JSON. Errors are `{ "error": "<code>", "message": "…" }` with a
 | `POST /v1/pair` | a new device | `{ code, name, public_key }` → `{ device }`. `public_key` is the raw P-256 point, base64url. |
 | `POST /v1/pairings` | device | → `{ code, expires_at }` |
 | `GET /v1/devices` | device | the paired devices |
-| `DELETE /v1/devices/{id}` | device | unpairs it |
+| `DELETE /v1/devices/{id}` | device | unpairs it. Refused (`403 authority`) for a device that wrote a ring's `found` or a `transfer`, unless it is the caller, and (`409 needs_removal`) for a ring member until the authority's signed `remove` entry for it is stored (section 5b) |
 | `GET /v1/secrets` | device | paths and versions, no values |
 | `PUT /v1/secrets/{path}` | device, or a token that may write `path` | `{ value, rotate? }` → `{ path, version }` |
 | `DELETE /v1/secrets/{path}` | device, or a token that may write `path` | deletes it (a new version with no value) |
@@ -236,7 +236,7 @@ All bodies are JSON. Errors are `{ "error": "<code>", "message": "…" }` with a
 | `GET /v1/log?after={seq}` | device | log rows after `seq` |
 | `PUT /v1/recovery`, `GET /v1/recovery` | device | the edge key encrypted with the recovery code (section 4a) |
 | `PUT /v1/sync` | device | `{ ops: [...] }` (1 to 100) → `{ stored, duplicates }`. All or nothing (section 5a). |
-| `POST /v1/sync` | device | `{ since }` → `{ ops, next, more }`, at most 100 ops or about 1 MiB a page (section 5a) |
+| `POST /v1/sync` | device | `{ since, discover? }` → `{ ops, next, discover?, more }`, at most 100 ops or about 1 MiB a page (section 5a) |
 
 `resolve` takes the same `harar://` references as the clients'
 `secrets.resolve`, so a service moves between the local agent and the edge by
@@ -324,15 +324,26 @@ the op's code (`bad_op`, `bad_op_signature`, `unknown_author`, `wrong_seq`,
 
 ### Pulling: `POST /v1/sync`
 
-`since` is `{ "<device id>": <last seq I have> }` (`{}` for everything; at
-most 1000 authors). The answer has each author's ops after that seq, in
-seq order; `next` is the `since` for the following call, and `more` says
-whether there is more to read now. **A page shares its room fairly**: of
-the authors with ops after their cursor, each gets up to ⌈100 / their
-number⌉ ops on the page, so one author with many ops never starves the
-others. Because an author's ops only ever become visible in seq order, a
-cursor of each author's last seq never skips one. A member keeps the last
-`next` and starts its next sync from it.
+`since` is `{ "<device id>": <last seq I have> }` (at most 1000 authors).
+The answer has each of those authors' ops after that seq, in seq order;
+`next` is the `since` for the following call, and `more` says whether there
+is more to read now. **A page shares its room fairly**: the authors with
+ops after their cursor share it in passes, each pass giving each an equal
+part of the room left, so one author with many ops never starves the
+others, and who goes first turns with the cursor, so the same authors
+don't always take it. Because an author's ops only ever become visible in
+seq order, a cursor of each author's last seq never skips one.
+
+**Discovery.** `since` names only the authors a member follows. With
+`discover` (`""` to start, then the cursor the last answer handed back),
+every other author's ops come too, in the order the edge stored them,
+through that one opaque cursor, in at least 20 places kept for them on each
+page; the answer's `discover` is the cursor for the next call. Discovery
+reads only what was stored more than 5 seconds ago, so a batch that commits
+while a pull reads is never passed over (an op is stored, for discovery,
+when its batch commits). Without `discover`, every author not in `since` is
+read from 0, as before. A member keeps the last `next` and `discover` and
+starts its next sync from them.
 
 Each op comes back as sent, plus `hash`, `sealed_sha256`,
 `wrapped_key_sha256` and `compacted`.
@@ -366,9 +377,9 @@ The edge does not resolve conflicts, check versions or open anything: members
 do (#101, section 5b). Members also hold the edge to these rules: a ring op
 served compacted is forged; a compacted value op with no later op by its
 author on that key is taken as the edge hiding it; a second, different op at
-a seq already held is a fork; and a ring is followed only from the founder
-the person pinned. What the edge can still do is withhold ops: it can delay
-a removal or a value, never forge one.
+a seq already held is a fork only when it proves one (below); and a ring is
+followed only from the founder the person pinned. What the edge can still do
+is withhold ops: it can delay a removal or a value, never forge one.
 
 ## 5b. Members: the agent's vault in a ring (phase 2, step 2)
 
@@ -425,7 +436,7 @@ the op carrying it is re-signed.
 |---|---|---|---|
 | `found` (n = 0) | `member.add` | the founder's `member` (device, name, `sign_pub`, `agree_pub`), epoch 0 and its key's `id`, `wraps` the epoch-0 key to the founder | empty |
 | `add` | `member.add` | the new `member`'s device, name and both keys (as the authority checked them: `approve <device> <fingerprint>`), the current epoch and `id`, `wraps` the current key to it | empty |
-| `remove` | `rekey` | `removed: [{device, after}]`, the new epoch and its key's `id`, `wraps` the new key to every member that remains: removal and rekey are **one** op, so nobody gets one without the other | the previous key, sealed under the new key's wrap subkey (AES-GCM, ad `harar-rekey\|<epoch>`), so the newest key opens every older one |
+| `remove` | `rekey` | `removed: [{device, after, after_hash}]` (its last op that counts and that op's hash), the new epoch and its key's `id`, `wraps` the new key to every member that remains: removal and rekey are **one** op, so nobody gets one without the other | the previous key, sealed under the new key's wrap subkey (AES-GCM, ad `harar-rekey\|<epoch>`), so the newest key opens every older one |
 | `transfer` | `member.add` | `authority`: the device that is authority from here on (already a member) | empty |
 
 Every entry also has `n` (its place in the log) and `prev` (the head of entry
@@ -443,9 +454,15 @@ can approve it after checking the fingerprint the device shows.
 A member verifies everything it pulls; it trusts the edge for nothing.
 
 - **Every author's chain** links from its first op: seq counts up by one and
-  `prev` is the hash before. A second, different op at a seq already held
-  is a **fork**: listed (`status.forks`), and that author's ops from there
-  on don't count.
+  `prev` is the hash before. An op that isn't even what its own hashes say
+  (its recomputed hash, or its ciphertext's, differs) was made by whoever
+  served it: refused as forged and ignored, and the author's real op still
+  counts when it comes.
+- **A fork only on proof.** A second op at a seq already held is a **fork**
+  only when both ops' hashes recompute and both verify under the key the log
+  gives that author. Then both are kept as evidence (`status.forks`), and
+  that author's ops from there on don't count. Anything less proves nothing
+  about the author: it is refused as forged, and pulled again.
 - **The log starts at the ring the person pinned.** Entry 0 must be a
   `found` whose founder's ring fingerprint is the one founded here or pinned
   with `trust`, signed by the founder's own key in it. Every later entry
@@ -459,13 +476,20 @@ A member verifies everything it pulls; it trusts the edge for nothing.
   that author's chain goes back to before it, so it is pulled again. A
   forged op never ejects anyone or changes the log.
 - **A log fork** (two different entries at one place, both signed by the
-  authority) stops the log there: nothing after counts, and `status.log`
-  says so.
-- **What a non-member can make a member hold** is bounded: 2000 ops per
-  author. Past that the author is **parked**: its cursor stays where it is
-  (nothing past it is taken or let go) and pulls skip it until the log makes
-  it a member. This holds whether the vault is locked or not: who is a
-  member is in the log, and needs no ring key.
+  authority) stops the log there, on every member alike: nothing after
+  counts, **membership is frozen** (no approve, remove or transfer is
+  written), and `status.log.fork_at` says where. Values keep syncing under
+  the heads before the fork.
+- **What a member holds is bounded**, whoever is a member, and whether the
+  vault is locked or not (who is a member is in the log, and needs no ring
+  key): 20000 waiting ops per member and 2000 per other author, ops from at
+  most 50 authors that aren't members (beyond those, a device is only
+  counted, `status.unheld_authors`), and 64 MiB of waiting ciphertext in all.
+  An author past its share is **parked**: nothing past its cursor is taken
+  until the log makes it a member. A removed author's ops past its cut are
+  dropped as they come in, and once every epoch's key is held, a waiting op
+  none of them opens is let go and counted (`status.unopenable`). The log is
+  parsed once per change, not once per op.
 
 ### Values: written under a head
 
@@ -478,7 +502,11 @@ the replaced op's `at` + 1), never more than 5 minutes past now.
 A value op **counts** when its `head` is on the member's log, its author is
 a member at that head and was signed by the key the log gives it there, it
 opens with that head's epoch key, and, if its author was removed later, its
-seq is at most the removal's `after`. A value op whose head the member
+seq is at most the removal's `after` **and** the author's chain, as the
+member holds it, links to `after_hash` at `after`. Until it does, the
+author's ops at or below `after` wait; a different op there that verifies is
+a fork (kept as evidence), so the edge can't swap in other ops below the
+cut. A value op whose head the member
 doesn't have yet is **behind** the writer: it waits (`status.behind`), and
 the next pull brings the log; one dated more than 5 minutes ahead waits
 until it isn't.
@@ -516,11 +544,20 @@ A compacted value op (section 5a) counts only when a later op on the same
 ### Removing, and handing over the authority
 
 - **Removing** is the authority's: `harar edge unpair <device>` writes the
-  `remove` entry (with the device's `after`, the newest of its ops the
-  authority holds: one number in the one log, so every member cuts it at the
-  same place), then unpairs it. From any other machine, unpairing a device
-  that has ops in the ring is refused, unless `--force-no-rekey` (which
-  warns that it keeps the ring key).
+  `remove` entry (with the device's `after` and `after_hash`, the newest of
+  its ops the authority holds: one place in the one log, so every member
+  cuts it at the same op), then unpairs it. A member that had already
+  applied the removed device's ops past the cut takes them back: each path
+  whose current op is one of them falls back to its best op that still
+  counts. From any other machine, unpairing a device that has ops in the
+  ring is refused, unless `--force-no-rekey` (which warns that it keeps the
+  ring key), and even then the edge refuses it for a ring member (below).
+- **The edge holds removals to the log too.** It refuses to unpair a device
+  that wrote a ring's `found` or a `transfer` (an authority) unless that
+  device asks itself, and refuses to unpair a ring member until the
+  authority's signed `remove` entry for it is stored. So no paired device,
+  `--force-no-rekey` included, can unpair the authority or take a member off
+  the edge behind the log's back.
 - **Handing over**: `harar edge sync transfer <device>` on the authority
   writes a `transfer` entry; from then on only that device writes the log.
 - **If the authority is lost**, values keep syncing, but nobody can add or
@@ -532,10 +569,12 @@ A compacted value op (section 5a) counts only when a later op on the same
 
 - **It can delay or withhold** any op, for as long as it likes, and members
   can't tell an op withheld from one not written yet. Withholding a removal
-  matters most: a member behind the removal still writes with the old epoch
-  key, so **the removed device can read writes from members still behind
-  the removal, and only until they pull the log**. Withholding the newest
-  value leaves members on the one before.
+  matters most: **the edge can delay a member learning of a removal for as
+  long as it withholds the log entry from that member**, and meanwhile that
+  member still writes with the old epoch key, which the removed device
+  holds. A member detects being behind when it sees value ops naming a
+  newer head (`status.behind`); phase 4's direct sync closes the gap.
+  Withholding the newest value leaves members on the one before.
 - **It can't forge**: membership needs the authority's signature, values
   their author's log key, and the ring the person pinned. A forged op is
   refused and pulled again; it ejects nobody.
@@ -588,14 +627,41 @@ Every push is preceded by a pull. Ops that fail to go stay queued
 - **A pull** takes at most 20 pages per sync (the next sync carries on, but
   only if this one moved the cursor, and each repeat waits twice as long, up
   to about a minute), and each page's `next` must move the cursor on, or the
-  edge is refused. `since` names every author this member follows (a parked
-  one at its end), so the edge sends nothing twice.
+  edge is refused. `since` names this device and the log's members (a
+  removed one only until its cursor reaches its cut); every other device
+  comes through discovery (section 5a), so the edge sends nothing twice and
+  a pull's size doesn't grow with the devices that ever asked.
 - **Seqs are never reused.** A member keeps the highest seq it ever wrote
-  and never writes at or below it. Its queued ops are re-sequenced only when
-  the edge shows its own ops at or past the first queued seq (the state file
-  was restored from an older copy). If the edge shows fewer of its ops than
-  it already took, the edge is refused (`chain: the edge is withholding
-  this device's ops`), and nothing is re-signed.
+  and never writes at or below it. If the edge shows ops of this device
+  past that, or another op at a seq it has queued, its state file was
+  restored from an older copy: **nothing is signed** until a full pull has
+  made the edge's view of its chain the base, and its queued ops are then
+  re-sequenced after the edge's newest. **A restored device must complete a
+  full sync before it acts.** If the edge shows fewer of its ops than it
+  already took, or refuses its chain (`wrong_seq`, `wrong_prev`, `fork`),
+  the edge is refused (`status.chain`) and nothing is re-signed or sent.
+- **If the edge itself was restored** from a backup, so that it really has
+  lost ops this device wrote, the person says so on each device with
+  `harar edge sync reset-edge-view`. That is explicit and logged: the
+  device forgets what it knew of its own chain, the next full pull's view
+  becomes the base (the acknowledged seq included), and its queued ops go
+  after the edge's newest. Ops the edge lost are not written again.
+- **Membership changes wait for a sound view**: approve, remove and
+  transfer are refused unless the last pull reached the end, the chain is
+  sound (`status.chain` is `ok`), nothing restored is pending, the queued
+  ops follow the edge's chain, and the log doesn't fork.
+- **A clock refusal** (`409 clock`: an op dated ahead of the edge's clock,
+  which it never took) dates the queued ops again, no later than now, and
+  signs them again; the next push sends them.
+- **A vault restored from a backup** while the sync state wasn't: the vault
+  and the state share a mark that changes at every step (the one before is
+  accepted too, which covers a stop between saving the two). When they
+  differ, what was applied can't be told, so the member's view of the edge
+  starts over: cursors go, and the next pull brings everything again
+  (applying again is harmless).
+- **What a vault keeps** of sync is bounded too: the history of lost values
+  and of each path's earlier versions for 30 days (then only the current
+  one), the last 256 op hashes per path, and the last 500 conflict flags.
 - **A crash loses nothing**: what a sync applied is let go from the waiting
   ops only after the vault is saved (applying again is harmless), and a
   change recorded again after a crash reuses its op (each change has a tag,
@@ -607,11 +673,12 @@ Every push is preceded by a pull. Ops that fail to go stay queued
 |---|---|
 | `harar edge sync on [--edge <url>]` | makes the key-agreement key, and founds the ring or asks to join it. One ring per vault: a second edge is refused |
 | `harar edge sync off` | stops syncing. Nothing is deleted; `on` picks up where it left off, and what changed meanwhile goes as ops |
-| `harar edge sync status` | role (authority, member, removed, requested), this device's fingerprint (only here), the ring's fingerprint, the authority, the log (length, head, fork), members and requests, the epoch, queued, waiting, behind and forged ops, parked authors, ring conflicts, the chain, conflicts |
+| `harar edge sync status` | role (authority, member, removed, requested), this device's fingerprint (only here), the ring's fingerprint, the authority, the log (length, head, fork), members and requests, the epoch, queued, waiting, behind, forged and unopenable ops, parked and unheld authors, forks with their evidence, whether a restored state is being rebased, ring conflicts, the chain, conflicts |
 | `harar edge sync now` | one sync |
 | `harar edge sync trust <ring fingerprint>` | pins the ring to join; no log is followed before. On a founder whose ring has no other member, gives that ring up for the one pinned |
 | `harar edge sync approve <device> <fingerprint>` | the authority only: adds a device that asked, if the fingerprint is the one its `status` shows |
 | `harar edge sync transfer <device>` | the authority only: makes another member the authority |
+| `harar edge sync reset-edge-view` | after the edge was restored from a backup: this device takes its own chain from the edge again at the next full pull (logged; see "Seqs are never reused") |
 | `harar edge unpair <device> [--force-no-rekey]` | on the authority (sync on), the device is first removed from the ring with a new epoch key, then unpaired. Anywhere else, a device with ops in the ring is refused (unpair it from the authority); `--force-no-rekey` unpairs it anyway, with a warning: it keeps the ring key |
 
 They all go through the agent (`--socket` for another one), which is the

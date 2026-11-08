@@ -92,6 +92,9 @@ asked="$(sync_ b on)"
 expect "$asked" role requested
 b_id="$(field "$asked" device)"
 if out="$(as b get --socket "$work/b/s" "$path" 2>&1)"; then echo "B has A's secret before approval: $out"; exit 1; fi
+# B isn't a member, so A finds its request through discovery, which reads
+# only what has been stored for 5 seconds (docs/edge.md §5).
+sleep 6
 status="$(sync_ a now)"
 expect "$status" requests.0.device "$b_id"
 # The person reads B's fingerprint on B; A's screen never offers one to copy.

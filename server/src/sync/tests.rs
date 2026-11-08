@@ -434,8 +434,28 @@ fn build_vectors() -> Value {
         base = op.hash();
         push(op, serde_json::to_value(&body).unwrap(), &mut prev);
     }
+    // The put and the rotate, as the edge serves them once the delete has
+    // superseded them and they are compacted: no ciphertext, its hashes kept.
+    let compacted: Vec<Value> = ops[1..3]
+        .iter()
+        .map(|v| {
+            let mut served = Served::from(&serde_json::from_value::<Op>(v["op"].clone()).unwrap());
+            served.sealed = None;
+            served.wrapped_key = None;
+            served.compacted = true;
+            json!({ "served": served, "canonical": served.canonical().unwrap() })
+        })
+        .collect();
+    let mut wrap_plain = b"harar-ring-wrap-v1\n".to_vec();
+    wrap_plain.extend_from_slice(&0u32.to_be_bytes());
+    wrap_plain.extend_from_slice(author.as_bytes());
+    wrap_plain.push(b'\n');
+    wrap_plain.extend_from_slice(&ring);
     json!({
-        "about": "A ring founder's chain, made by server/src/sync (Rust) from fixed keys and IVs: the found entry of the membership log, then a put, a rotate and a delete written under its head. Both harar's tests and the edge's read it: the canonical encoding, hashes, signatures and seals must agree (docs/edge.md §5a, §5b). The ring's subkeys are HKDF-SHA256(salt harar-ring-v1, info harar-ring-name | harar-ring-member | harar-ring-wrap). Test keys only.",
+        "about": "A ring founder's chain, made by server/src/sync (Rust) from fixed keys and IVs: the found entry of the membership log, then a put, a rotate and a delete written under its head. Both harar's tests and the edge's read it: the canonical encoding, hashes, signatures and seals must agree (docs/edge.md §5a, §5b). The ring's subkeys are HKDF-SHA256(salt harar-ring-v1, info harar-ring-name | harar-ring-member | harar-ring-wrap). head = sha256(\"harar-log-v1\\n\" + the found op's sealed); entry_key = base64url(sha256(\"harar:log|\" + head)); fingerprints = the first 128 bits of sha256(\"harar-device-fp-v1\\n\" | \"harar-ring-fp-v1\\n\" + sign_pub + agree_pub), raw, in groups of 4 hex. ring_wrap is the found entry's wrap to its founder (ECIES, X9.63 SHA-256, AES-128-GCM with a 16-byte IV) and what it opens to. compacted is the put and rotate as served once compacted. Test keys only.",
+        "entry_key": op::entry_key(&head),
+        "ring_wrap": { "to": author, "epoch": 0, "sealed": b64(&wrap), "plain": b64(&wrap_plain) },
+        "compacted": compacted,
         "device": {
             "id": author,
             "sign_d": b64([1u8; 32]),

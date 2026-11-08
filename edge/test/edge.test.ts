@@ -2,7 +2,7 @@
 // HARAR_TEST_POSTGRES names one), real P-256 device keys and a stand-in log
 // sink: every test asserts what a caller or the database would see.
 import assert from "node:assert/strict";
-import { createCipheriv, createDecipheriv, createHash, createHmac, hkdfSync, webcrypto } from "node:crypto";
+import { createCipheriv, createDecipheriv, createECDH, createHash, createHmac, hkdfSync, webcrypto } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { after, describe, test } from "node:test";
@@ -936,6 +936,49 @@ for (const backend of backends) {
       const got = await as("POST", "/v1/sync", { since: {} });
       assert.deepEqual(got.body.ops.map((o: Row) => o.hash), v.ops.map((o: Row) => o.hash), "the edge hashes them as harar does");
       assert.deepEqual(got.body.ops.map(sent), ops);
+
+      // The log's head and entry key, and the two fingerprints (§5b).
+      const found = v.ops[0].op;
+      assert.equal(sha(`harar-log-v1\n${found.sealed}`), v.head, "head = sha256 of the found op's sealed");
+      assert.equal(createHash("sha256").update(`harar:log|${v.head}`).digest("base64url"), v.entry_key, "entry_key");
+      assert.equal(found.key, v.entry_key, "the found op's key is its entry key");
+      const agreePub = Buffer.from(v.device.agree_pub, "base64url");
+      const fingerprint = (label: string) => (createHash("sha256").update(Buffer.concat([Buffer.from(label), pub, agreePub])).digest("hex").slice(0, 32).match(/.{4}/g) ?? []).join("-");
+      assert.equal(fingerprint("harar-device-fp-v1\n"), v.device.fingerprint, "the device fingerprint");
+      assert.equal(fingerprint("harar-ring-fp-v1\n"), v.device.ring_fingerprint, "the ring fingerprint");
+
+      // The ring wrap in the found entry: ECIES to the founder's agreement
+      // key (X9.63 SHA-256 over the shared secret, the ephemeral point as
+      // shared info: a 16-byte AES-GCM key, then a 16-byte IV), opening to
+      // "harar-ring-wrap-v1\n" || epoch (4, big-endian) || device || "\n" || ring.
+      const entry = JSON.parse(Buffer.from(found.sealed, "base64url").toString("utf8"));
+      assert.equal(entry.wraps[v.device.id], v.ring_wrap.sealed, "the vector's wrap is the found entry's");
+      const wrap = Buffer.from(v.ring_wrap.sealed, "base64url");
+      const point = wrap.subarray(0, 65);
+      const ecdh = createECDH("prime256v1");
+      ecdh.setPrivateKey(Buffer.from(v.device.agree_d, "base64url"));
+      const shared = ecdh.computeSecret(point);
+      const derived = createHash("sha256").update(Buffer.concat([shared, Buffer.from([0, 0, 0, 1]), point])).digest();
+      const body = wrap.subarray(65);
+      const decipher = createDecipheriv("aes-128-gcm", derived.subarray(0, 16), derived.subarray(16, 32));
+      decipher.setAuthTag(body.subarray(body.length - 16));
+      const plain = Buffer.concat([decipher.update(body.subarray(0, body.length - 16)), decipher.final()]);
+      assert.equal(plain.toString("base64url"), v.ring_wrap.plain, "the wrap opens to the vector's plain text");
+      const epoch = Buffer.alloc(4);
+      epoch.writeUInt32BE(v.ring_wrap.epoch);
+      assert.deepEqual(plain, Buffer.concat([Buffer.from("harar-ring-wrap-v1\n"), epoch, Buffer.from(`${v.ring_wrap.to}\n`), ring]), "the wrap's plain text");
+
+      // Compacted, as the edge itself does it once the delete has superseded
+      // the put and the rotate and they are past the history it keeps.
+      env.clock.ms += 31 * 24 * 60 * 60 * 1000;
+      const later = await as("POST", "/v1/sync", { since: {} });
+      const kept = ["author", "seq", "prev", "kind", "key", "version", "sealed", "wrapped_key", "at", "sig", "hash", "sealed_sha256", "wrapped_key_sha256", "compacted"];
+      const pick = (o: Row) => Object.fromEntries(kept.map((k) => [k, o[k]]));
+      assert.deepEqual(later.body.ops.filter((o: Row) => o.compacted).map(pick), v.compacted.map((c: Row) => pick(c.served as Row)), "the edge compacts the put and rotate to the vectors' form");
+      for (const { served, canonical } of v.compacted) {
+        assert.equal(canonicalOp(served, served.sealed_sha256, served.wrapped_key_sha256), canonical, `compacted op ${served.seq}'s canonical`);
+        assert.equal(sha(canonical), served.hash, `compacted op ${served.seq} keeps its hash`);
+      }
     });
   });
 }

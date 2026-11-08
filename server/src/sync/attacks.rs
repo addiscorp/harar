@@ -8,7 +8,7 @@ use super::crypto::b64;
 use super::member::Member;
 use super::op::{self, Entry, EntryType, Kind, MemberKeys, Rank, Removed, Request, RequestType, Served};
 use super::tests::{A, B, C, Edge, member, ring, role, settle, trust, vault};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 const D: &str = "d-dddddddddddddddd";
 const E: &str = "d-eeeeeeeeeeeeeeee";
@@ -90,6 +90,15 @@ fn h1_a_member_behind_a_removal_never_regrants_the_removed_device() {
     let entries: Vec<Entry> = edge.ops[before..].iter().filter_map(super::ledger::entry_of).collect();
     assert_eq!(entries.iter().filter(|e| e.what == EntryType::Remove).count(), 1, "one rekey, no more");
     assert!(entries.iter().all(|e| !e.wraps.contains_key(X)), "a key given to X after its removal");
+    // And so the leak can't happen: what A and B write once they know is
+    // sealed with a key X never had, and X, however often it syncs, can't
+    // read it.
+    av.insert("after/a".into(), "secret-a".into());
+    bv.insert("after/b".into(), "secret-b".into());
+    settle(&mut edge, &mut [(&mut a, &mut av), (&mut b, &mut bv), (&mut x, &mut xv)], 3);
+    assert_eq!((bv.get("after/a").map(String::as_str), av.get("after/b").map(String::as_str)), (Some("secret-a"), Some("secret-b")));
+    assert!(!xv.contains_key("after/a") && !xv.contains_key("after/b"), "X read a write made after its removal");
+    assert_eq!(role(&mut x), "removed");
 }
 
 /// H2: the edge serves a fresh joiner a forged first op for member D, with
@@ -156,6 +165,44 @@ fn h3_a_withheld_own_op_never_makes_a_member_reuse_a_seq() {
     edge.pull(&mut a);
     assert_eq!(a.status(None).unwrap()["chain"], "ok");
     edge.push(&mut a);
+    assert!(a.state.outbox.is_empty());
+}
+
+/// H3 set up through an edge: the edge is rolled back to before A's newest
+/// op. A's next op is refused there, and A stops: it never signs again at a
+/// seq the edge took, so no two ops of A ever share one, until the person
+/// says the edge was restored (reset-edge-view) and A starts over from it.
+#[test]
+fn h3_an_edge_rolled_back_never_gets_two_ops_at_one_seq() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut edge = Edge::default();
+    let (mut a, _) = ring(dir.path(), &mut edge, &[]);
+    let mut av = vault(&[]);
+    av.insert("x".into(), "1".into());
+    edge.sync(&mut a, &mut av);
+    let acked = edge.ops.iter().filter(|o| o.author == A).map(|o| o.seq).max().unwrap();
+    let mut seen: Vec<Served> = edge.ops.clone();
+    edge.ops.retain(|o| !(o.author == A && o.seq == acked));
+    for (k, v) in [("y", "2"), ("z", "3")] {
+        av.insert(k.into(), v.into());
+        edge.sync(&mut a, &mut av);
+        seen.extend(edge.ops.iter().cloned());
+    }
+    let mut at_seq: BTreeMap<u64, BTreeSet<String>> = BTreeMap::new();
+    for o in seen.iter().filter(|o| o.author == A) {
+        at_seq.entry(o.seq).or_default().insert(o.hash.clone());
+    }
+    assert!(at_seq.values().all(|h| h.len() == 1), "two ops of A at one seq: {at_seq:?}");
+    assert!(a.state.outbox.iter().all(|o| o.seq > acked), "A queued an op at or below the {acked} it wrote");
+    let chain = a.status(None).unwrap()["chain"].clone();
+    assert!(chain.as_str().unwrap().contains("reset-edge-view"), "{chain}");
+    assert!(a.ready().is_empty(), "A goes on sending to an edge that refused its chain");
+    // The person confirms the edge was restored: A takes its chain from the
+    // edge again, and its queued ops go after the edge's newest.
+    a.reset_edge_view().unwrap();
+    edge.sync(&mut a, &mut av);
+    edge.sync(&mut a, &mut av);
+    assert_eq!(a.status(None).unwrap()["chain"], "ok");
     assert!(a.state.outbox.is_empty());
 }
 
@@ -529,6 +576,18 @@ fn a_second_op_at_one_seq_is_a_fork() {
     let real = edge.ops.iter().filter(|o| o.author == A).max_by_key(|o| o.seq).unwrap().clone();
     let key = a.edge.key().unwrap();
     let other = Served::from(&op::Op::sign(A, real.seq, &real.prev, real.kind, &real.key, real.version, real.sealed.clone().unwrap(), real.wrapped_key.clone().unwrap(), real.at + 1, &|m| key.sign(m)).unwrap());
+    // Not signed by A (the edge made it): no proof, so no fork. Refused as
+    // forged, and A's chain goes on.
+    let stranger = p256::ecdsa::SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+    let unsigned = Served::from(&op::Op::sign(A, real.seq, &real.prev, real.kind, &real.key, real.version, real.sealed.clone().unwrap(), real.wrapped_key.clone().unwrap(), real.at + 2, &|m| {
+        let s: p256::ecdsa::Signature = p256::ecdsa::signature::Signer::sign(&stranger, m);
+        Ok(s.to_bytes().into())
+    }).unwrap());
+    let empty_sig = Served { sig: String::new(), ..unsigned.clone() };
+    b.ingest(vec![unsigned, empty_sig]);
+    assert!(b.state.forks.is_empty(), "a fork without proof: {:?}", b.state.forks);
+    assert!(b.state.rejected.iter().any(|r| r.author == A && r.reason.starts_with("forged")), "{:?}", b.state.rejected);
+    // Signed by A: proof, kept as evidence.
     b.ingest(vec![other]);
     assert_eq!(b.status(None).unwrap()["forks"][0]["author"], A);
 }
@@ -589,8 +648,123 @@ fn a_far_future_at_never_wins_and_is_never_written() {
     settle(&mut edge, &mut [(&mut a, &mut av), (&mut b, &mut bv)], 1);
     let op = b.write(Kind::Put, b64([9u8; 32]), 1, b64(b"x"), b64(b"x"), u64::MAX / 2);
     assert!(op.at <= super::member::now_ms() + 300_000, "written {} ahead", op.at - super::member::now_ms());
-    let _ = &mut a;
-    let _ = &mut av;
+    b.state.outbox.clear();
+    // A writer that dates one a day ahead anyway (a clock gone wrong, or
+    // made to): signed, linked and on the edge, and B holds it unapplied
+    // while it's ahead, so it can't win over every write until then.
+    av.insert("k".into(), "now".into());
+    edge.sync(&mut a, &mut av);
+    edge.sync(&mut b, &mut bv);
+    av.insert("k".into(), "from-the-future".into());
+    a.step(&mut av).unwrap();
+    let ahead = super::member::now_ms() + 86_400_000;
+    let last = a.state.outbox.len() - 1;
+    a.state.outbox[last].at = ahead;
+    edge.push(&mut a);
+    assert!(edge.ops.iter().any(|o| o.author == A && o.at == ahead), "it reached the edge");
+    edge.sync(&mut b, &mut bv);
+    assert_eq!(bv.get("k").map(String::as_str), Some("now"), "an op a day ahead was applied");
+    assert!(b.state.pending.iter().any(|o| o.author == A && o.at == ahead), "B let it go instead of holding it");
+    bv.insert("k".into(), "later-but-now".into());
+    settle(&mut edge, &mut [(&mut b, &mut bv), (&mut a, &mut av)], 2);
+    assert_eq!(bv.get("k").map(String::as_str), Some("later-but-now"), "B's own later write lost to it");
+}
+
+/// H3's last part: the authority's log forks anyway (two entries at one
+/// place, both its own, which here only a hand-made edge can hold). Every
+/// member stops the log at the fork alike, membership is frozen there, and
+/// values go on under the heads before it.
+#[test]
+fn h3_a_log_fork_freezes_membership_and_values_go_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut edge = Edge::default();
+    let (mut a, mut others) = ring(dir.path(), &mut edge, &[B]);
+    let mut b = others.remove(0);
+    let (mut av, mut bv) = (vault(&[]), vault(&[]));
+    settle(&mut edge, &mut [(&mut a, &mut av), (&mut b, &mut bv)], 1);
+    let (mut c, mut d) = (member(dir.path(), C, "c"), member(dir.path(), D, "d"));
+    for j in [&mut c, &mut d] {
+        edge.sync(j, &mut vault(&[]));
+        trust(&a, j);
+    }
+    edge.sync(&mut a, &mut av);
+    let before = a.state.clone();
+    super::tests::approve(&mut a, &c);
+    a.sign_all().unwrap();
+    let one = a.state.outbox.clone();
+    a.state = before;
+    super::tests::approve(&mut a, &d);
+    a.sign_all().unwrap();
+    assert_eq!((one.len(), a.state.outbox.len()), (1, 1));
+    // The second entry at the same place goes after the first in A's chain
+    // (the edge takes no two ops at one seq), signed by A.
+    let mut other = a.state.outbox[0].clone();
+    other.seq = one[0].seq + 1;
+    other.prev = one[0].hash();
+    let key = a.edge.key().unwrap();
+    other.sig = super::crypto::b64(key.sign(other.canonical().as_bytes()).unwrap());
+    edge.ops.push(Served::from(&one[0]));
+    edge.ops.push(Served::from(&other));
+    a.state.outbox.clear();
+    a.state.high_seq = other.seq;
+    settle(&mut edge, &mut [(&mut a, &mut av), (&mut b, &mut bv)], 2);
+    for m in [&mut a, &mut b] {
+        let status = m.status(None).unwrap();
+        assert!(!status["log"]["fork_at"].is_null(), "{status}");
+        assert_eq!(members_of(m).len(), 2, "membership moved past the fork");
+    }
+    let err = a.approve(C, &c.fingerprint()).unwrap_err().to_string();
+    assert!(err.contains("frozen"), "{err}");
+    bv.insert("still".into(), "syncing".into());
+    settle(&mut edge, &mut [(&mut b, &mut bv), (&mut a, &mut av)], 2);
+    assert_eq!(av.get("still").map(String::as_str), Some("syncing"));
+}
+
+/// M9: the edge refuses a queued op as dated ahead of its clock (`clock`).
+/// It never took it, so the op is dated again, no later than now, and
+/// signed again; the next push takes it.
+#[test]
+fn m9_an_op_the_edge_refused_for_its_clock_is_dated_again_and_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut edge = Edge::default();
+    let (mut a, _) = ring(dir.path(), &mut edge, &[]);
+    let mut av = vault(&[]);
+    av.insert("k".into(), "v".into());
+    a.step(&mut av).unwrap();
+    let last = a.state.outbox.len() - 1;
+    a.state.outbox[last].at = super::member::now_ms() + 200_000;
+    a.sign_all().unwrap();
+    let refused = anyhow::anyhow!("refused (409 clock)");
+    a.sent(&[], Some(&refused));
+    let op = &a.state.outbox[last];
+    assert!(op.at <= super::member::now_ms() && op.sig.is_empty(), "kept as it was: at {}, signed {}", op.at, !op.sig.is_empty());
+    assert!(a.state.chain_error.is_none());
+    edge.push(&mut a);
+    assert!(a.state.outbox.is_empty(), "never sent again");
+}
+
+/// M8: the vault comes back from a backup two steps old while the sync
+/// state doesn't. Their marks differ: the view starts over, and the next
+/// pull brings back what the vault lost.
+#[test]
+fn m8_a_vault_restored_from_a_backup_is_caught_up_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut edge = Edge::default();
+    let (mut a, mut others) = ring(dir.path(), &mut edge, &[B]);
+    let mut b = others.remove(0);
+    let (mut av, mut bv) = (vault(&[]), vault(&[]));
+    settle(&mut edge, &mut [(&mut a, &mut av), (&mut b, &mut bv)], 1);
+    let backup = bv.clone();
+    av.insert("one".into(), "1".into());
+    edge.sync(&mut a, &mut av);
+    edge.sync(&mut b, &mut bv);
+    av.insert("two".into(), "2".into());
+    edge.sync(&mut a, &mut av);
+    edge.sync(&mut b, &mut bv);
+    assert_eq!(bv.get("two").map(String::as_str), Some("2"));
+    let mut bv = backup;
+    settle(&mut edge, &mut [(&mut b, &mut bv)], 2);
+    assert_eq!((bv.get("one").map(String::as_str), bv.get("two").map(String::as_str)), (Some("1"), Some("2")), "the restored vault stays behind");
 }
 
 /// C1's other half and N8: a member that isn't the authority can't remove

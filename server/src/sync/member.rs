@@ -129,6 +129,10 @@ pub(crate) struct State {
     /// full pull has made the edge's view the base.
     #[serde(default)]
     pub restored: bool,
+    /// `reset-edge-view` was run: the next full pull's view of this device's
+    /// chain is the base, acknowledged seq included. Nothing is signed until.
+    #[serde(default)]
+    pub adopt_edge: bool,
     /// Changed with every step, and kept in the vault too (`VaultMeta`).
     #[serde(default)]
     pub mark: u64,
@@ -515,6 +519,16 @@ impl Member {
     /// A seq is never reused otherwise.
     pub(crate) fn rebase(&mut self) {
         let (seq, hash) = self.edge_tip();
+        if self.state.adopt_edge {
+            self.state.acked_seq = seq;
+            self.state.high_seq = seq;
+            self.state.tip = Tip { seq, hash: hash.clone(), at: self.state.tip.at };
+            self.resequence(seq, hash);
+            self.state.adopt_edge = false;
+            self.state.restored = false;
+            self.state.chain_error = None;
+            return;
+        }
         if self.state.restored {
             self.state.high_seq = self.state.high_seq.max(seq);
             self.state.acked_seq = self.state.acked_seq.max(seq);
@@ -525,7 +539,7 @@ impl Member {
             return;
         }
         if seq < self.state.acked_seq {
-            self.state.chain_error = Some(format!("the edge is withholding this device's ops: it took up to {}, and shows {seq}", self.state.acked_seq));
+            self.state.chain_error = Some(format!("the edge is withholding this device's ops: it took up to {}, and shows {seq}; if the edge was restored from a backup, run harar edge sync reset-edge-view", self.state.acked_seq));
             return;
         }
         if self.state.chain_error.as_deref().is_some_and(|e| e.starts_with("the edge is withholding")) {
@@ -610,14 +624,20 @@ impl Member {
         if !self.pull_complete {
             bail!("this machine hasn't completed a full sync since it started; run harar edge sync now first");
         }
-        if self.state.restored {
-            bail!("this machine's sync state was restored from an older copy; run harar edge sync now first");
+        if self.state.restored || self.state.adopt_edge {
+            bail!("this machine's view of its own chain is being taken again from the edge; run harar edge sync now first");
         }
         if let Some(err) = &self.state.chain_error {
             bail!("this machine's chain on the edge isn't sound ({err}); fix that first");
         }
         if !self.outbox_follows_edge() {
             bail!("this machine's queued ops don't follow its chain on the edge yet; run harar edge sync now first");
+        }
+        if let Some(n) = self.log().fork {
+            // Two entries at one place, both the authority's: membership
+            // stays as it was before them, everywhere alike, and values go
+            // on under the heads before the fork.
+            bail!("the membership log forks at entry {n} (status.log): membership is frozen there");
         }
         Ok(())
     }
@@ -627,18 +647,16 @@ impl Member {
     /// edge's view as the base. Explicit, and logged: members that saw the
     /// ops the edge lost may see this device fork.
     pub(crate) fn reset_edge_view(&mut self) -> Result<Value> {
-        if !self.pull_complete {
-            bail!("run harar edge sync now first: the edge's view is taken only after a full pull");
-        }
-        let (seq, hash) = self.edge_tip();
+        let me = self.edge.device.clone();
         let was = self.state.acked_seq;
-        eprintln!("harar agent: reset-edge-view on {}: this device's chain goes back from {was} to the edge's {seq}", self.edge.url);
-        self.state.acked_seq = seq;
-        self.state.high_seq = seq;
-        self.state.tip = Tip { seq, hash: hash.clone(), at: self.state.tip.at };
-        self.resequence(seq, hash);
+        eprintln!("harar agent: reset-edge-view on {}: this device's chain (acknowledged up to {was}) is taken again from the edge at the next full pull", self.edge.url);
+        // What this device knows of its own chain goes; the next full pull
+        // brings the edge's, and `rebase` makes it the base.
+        self.state.authors.remove(&me);
+        self.state.next.remove(&me);
+        self.state.adopt_edge = true;
         self.state.chain_error = None;
-        Ok(json!({ "reset": true, "was": was, "now": seq }))
+        Ok(json!({ "reset": true, "was": was }))
     }
 
     // ------------------------------------------------------------ keys
@@ -728,7 +746,7 @@ impl Member {
     /// one: nothing is signed until a full pull has made the edge's view the
     /// base, so no seq is ever signed twice.
     pub(crate) fn unsigned(&self) -> Vec<Op> {
-        if self.state.restored {
+        if self.state.restored || self.state.adopt_edge {
             return Vec::new();
         }
         self.state.outbox.iter().filter(|o| o.sig.is_empty()).cloned().collect()

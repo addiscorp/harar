@@ -1,5 +1,45 @@
 {
-  "about": "A ring founder's chain, made by server/src/sync (Rust) from fixed keys and IVs: the found entry of the membership log, then a put, a rotate and a delete written under its head. Both harar's tests and the edge's read it: the canonical encoding, hashes, signatures and seals must agree (docs/edge.md §5a, §5b). The ring's subkeys are HKDF-SHA256(salt harar-ring-v1, info harar-ring-name | harar-ring-member | harar-ring-wrap). Test keys only.",
+  "about": "A ring founder's chain, made by server/src/sync (Rust) from fixed keys and IVs: the found entry of the membership log, then a put, a rotate and a delete written under its head. Both harar's tests and the edge's read it: the canonical encoding, hashes, signatures and seals must agree (docs/edge.md §5a, §5b). The ring's subkeys are HKDF-SHA256(salt harar-ring-v1, info harar-ring-name | harar-ring-member | harar-ring-wrap). head = sha256(\"harar-log-v1\\n\" + the found op's sealed); entry_key = base64url(sha256(\"harar:log|\" + head)); fingerprints = the first 128 bits of sha256(\"harar-device-fp-v1\\n\" | \"harar-ring-fp-v1\\n\" + sign_pub + agree_pub), raw, in groups of 4 hex. ring_wrap is the found entry's wrap to its founder (ECIES, X9.63 SHA-256, AES-128-GCM with a 16-byte IV) and what it opens to. compacted is the put and rotate as served once compacted. Test keys only.",
+  "compacted": [
+    {
+      "canonical": "harar-op-v1\nd-0123456789abcdef\n2\n6f541a035d6624add33da26c87d9d7c46e98dc905b195ba77f19ed03f5c3bfd7\nput\nKAM2Wq_n5_s1sH3GxDK_5pp8QjwF_T3V6TSHW-k3MiM\n1\ncc4b3b91592e188511d5d25e6aac3b50a4cacc90e2f1f39c364c5b0ca8c48aee\n18f63911ed8c2644116ba365ae4627acdeec73044d6d7642e4923bf281b56087\n1762603201000",
+      "served": {
+        "at": 1762603201000,
+        "author": "d-0123456789abcdef",
+        "compacted": true,
+        "hash": "76581dcd4f71590a20f58694b188cdbcf3f42306d3b47c5915f2ce8fbab50a92",
+        "key": "KAM2Wq_n5_s1sH3GxDK_5pp8QjwF_T3V6TSHW-k3MiM",
+        "kind": "put",
+        "prev": "6f541a035d6624add33da26c87d9d7c46e98dc905b195ba77f19ed03f5c3bfd7",
+        "sealed": null,
+        "sealed_sha256": "cc4b3b91592e188511d5d25e6aac3b50a4cacc90e2f1f39c364c5b0ca8c48aee",
+        "seq": 2,
+        "sig": "8K1NPcX4bj6I2HZL7cxDUWGp3DqlR14F8TPaorTsh6oscvA31e_3OeaRdQcdPzNyAw2KIQc-tLDZGcndtDSxiA",
+        "version": 1,
+        "wrapped_key": null,
+        "wrapped_key_sha256": "18f63911ed8c2644116ba365ae4627acdeec73044d6d7642e4923bf281b56087"
+      }
+    },
+    {
+      "canonical": "harar-op-v1\nd-0123456789abcdef\n3\n76581dcd4f71590a20f58694b188cdbcf3f42306d3b47c5915f2ce8fbab50a92\nrotate\nKAM2Wq_n5_s1sH3GxDK_5pp8QjwF_T3V6TSHW-k3MiM\n2\n357a1b1f257cca9f09ff0e3df54735f6d0fe07ff9284556b2770fc573f937c1e\n203a8d8fb838ea89e098e9a35933fc8b8a4ae058488ab65587dac3899cd0a6a8\n1762603202000",
+      "served": {
+        "at": 1762603202000,
+        "author": "d-0123456789abcdef",
+        "compacted": true,
+        "hash": "e36efa7e127ef98e15d8814fcd48cba4d16da67fb3905253f8fe4e4566603407",
+        "key": "KAM2Wq_n5_s1sH3GxDK_5pp8QjwF_T3V6TSHW-k3MiM",
+        "kind": "rotate",
+        "prev": "76581dcd4f71590a20f58694b188cdbcf3f42306d3b47c5915f2ce8fbab50a92",
+        "sealed": null,
+        "sealed_sha256": "357a1b1f257cca9f09ff0e3df54735f6d0fe07ff9284556b2770fc573f937c1e",
+        "seq": 3,
+        "sig": "xZLwDT96d8XgSiU1_4SesyC7cfGDrAsxqrJVrqJpIWLz1cL9smvie97I5eELh61Gz1wOsMn7tajiQu_9Wodxrg",
+        "version": 2,
+        "wrapped_key": null,
+        "wrapped_key_sha256": "203a8d8fb838ea89e098e9a35933fc8b8a4ae058488ab65587dac3899cd0a6a8"
+      }
+    }
+  ],
   "device": {
     "agree_d": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI",
     "agree_pub": "BFUPRxAD89-Xw99QaseX9nIfsaH7e49vg9IkSYplyI4kE2CT1wEuUJpzcVy9CwCjzA_0tcAbP_oZarH7MnA2uOY",
@@ -9,6 +49,7 @@
     "sign_d": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
     "sign_pub": "BG_wO5SSQc4drdQ1GeaWDgqFtBppoFwygQOqK84VlMoWPE91OlW_AdxT9sCwx-7ni0DG_30lqW4igrmJzvccFEo"
   },
+  "entry_key": "DReUkKOuF8AQS_cSOCYv5ZK-BK1kacl593iJ6QolCRA",
   "head": "603ef29ddeec5fe04f3e6004f96a66389c88381b68b1956ee58f747fce19d096",
   "ops": [
     {
@@ -95,5 +136,11 @@
       }
     }
   ],
-  "ring": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ"
+  "ring": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ",
+  "ring_wrap": {
+    "epoch": 0,
+    "plain": "aGFyYXItcmluZy13cmFwLXYxCgAAAABkLTAxMjM0NTY3ODlhYmNkZWYKBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ",
+    "sealed": "BFkat3HrvP1tnLkJTRBlKK3Rpp1EwsH2J_CJ7Fi5xhrfn05qvw0EXAxpOjxorXyXynK-ZN70om_s0mPdmKkngPDPC0S5bivFYXhD0DW2cPS25ciC7Iowi3LLYeDPWs2sYAPIn4DdmEdKFQ-AiCkMjrXI71YoAwnd6UmGOB_cFWujYSqxnn3sN3tloteUDqzwu6dKDNWHp2ANVWM",
+    "to": "d-0123456789abcdef"
+  }
 }
