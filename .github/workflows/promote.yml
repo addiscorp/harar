@@ -122,21 +122,14 @@ jobs:
             echo "- latest.json points here"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # The stable release's `harar` crate goes to crates.io (canaries never do),
-  # once vX.Y.Z is tagged. A failure here leaves the release itself promoted;
-  # Actions → Publish to crates.io retries the version.
-  crate:
-    needs: promote
-    uses: ./.github/workflows/crates.yml
-    with:
-      version: ${{ needs.promote.outputs.v }}
-    secrets: inherit
-
-  # The Python and Ruby clients go to PyPI and RubyGems, and Packagist (which
-  # reads the tag itself) is checked. These are dispatched, not called:
-  # trusted publishing trusts the workflow that runs at the top, so each must
-  # run as itself (pypi.yml, rubygems.yml), not inside Promote.
-  # workflow_dispatch is what GITHUB_TOKEN may start (as in tag-canary.yml).
+  # Every client goes to its registry at this version, the server's: the
+  # crate to crates.io, js/ to npm, python/ to PyPI, ruby/ to RubyGems, and
+  # Packagist (which reads the tag itself) is checked. Canaries never publish.
+  # Each is dispatched, not called: trusted publishing trusts the workflow
+  # that runs at the top, so each runs as itself (crates.yml, publish.yml,
+  # pypi.yml, rubygems.yml), not inside Promote. workflow_dispatch is what
+  # GITHUB_TOKEN may start (as in tag-canary.yml). A failed one leaves the
+  # release promoted; its Actions page retries the version by hand.
   clients:
     needs: promote
     runs-on: ubuntu-24.04
@@ -146,10 +139,10 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       V: ${{ needs.promote.outputs.v }}
     steps:
-      - name: Dispatch PyPI, RubyGems and Packagist for this release
+      - name: Dispatch every registry for this release
         run: |
           set -euo pipefail
-          for workflow in pypi.yml rubygems.yml packagist.yml; do
+          for workflow in crates.yml publish.yml pypi.yml rubygems.yml packagist.yml; do
             gh workflow run "$workflow" --repo "${{ github.repository }}" --ref main -f version="$V"
             echo "- ${workflow} for ${V}" >> "$GITHUB_STEP_SUMMARY"
           done

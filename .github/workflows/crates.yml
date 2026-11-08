@@ -1,21 +1,17 @@
 # Publish the `harar` crate (client/, `use harar::VaultClient`) to crates.io
-# from a stable release. Promote calls this after it tags vX.Y.Z; Actions →
-# Publish to crates.io → Run workflow retries a version by hand. Canaries never
-# publish here: crates.io versions are permanent (APS 3, APS 9). The harar
-# binary ships from harar-releases, never from a registry (APS 13).
+# from a stable release. Promote dispatches this after it tags vX.Y.Z; Actions
+# → Publish to crates.io → Run workflow retries a version by hand. Canaries
+# never publish here: crates.io versions are permanent (APS 3, APS 9). The
+# harar binary ships from harar-releases, never from a registry (APS 13).
 #
 # The token (APS 3): CARGO_TOKEN in the `release` environment, a crates.io
 # token that can only publish new versions of `harar`. Once the crate exists,
-# crates.io trusted publishing replaces it and the token is revoked.
+# crates.io trusted publishing replaces it (this file, `crates.yml`, in the
+# `release` environment: it runs as itself, not inside Promote) and the token
+# is revoked.
 name: Publish to crates.io
 
 on:
-  workflow_call:
-    inputs:
-      version:
-        description: "Stable version to publish (X.Y.Z, tagged vX.Y.Z)"
-        required: true
-        type: string
   workflow_dispatch:
     inputs:
       version:
