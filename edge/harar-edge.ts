@@ -343,15 +343,15 @@ export function edge(config: Config): { fetch(request: Request): Promise<Respons
 
   // ---------------------------------------------------------- callers
 
-  async function authenticate(request: Request, body: Bytes, url: URL): Promise<Actor> {
+  async function authenticate(request: Request, body: Bytes, url: URL, path: string): Promise<Actor> {
     const deviceId = request.headers.get("harar-device");
-    if (deviceId !== null) return { kind: "device", id: await verifyDevice(request, body, url, deviceId) };
+    if (deviceId !== null) return { kind: "device", id: await verifyDevice(request, body, url, path, deviceId) };
     const auth = request.headers.get("authorization");
     if (auth !== null) return verifyToken(auth);
     return { kind: "anonymous" };
   }
 
-  async function verifyDevice(request: Request, body: Bytes, url: URL, id: string): Promise<string> {
+  async function verifyDevice(request: Request, body: Bytes, url: URL, path: string, id: string): Promise<string> {
     const time = request.headers.get("harar-time") ?? "";
     const nonce = request.headers.get("harar-nonce") ?? "";
     const signature = unb64(request.headers.get("harar-signature") ?? "");
@@ -362,7 +362,10 @@ export function edge(config: Config): { fetch(request: Request): Promise<Respons
     const [device] = await sql.query(`SELECT public_key FROM harar_devices WHERE id = ? AND removed_at IS NULL`, [id]);
     if (!device) throw new Refusal(401, "unknown_device", "this device is not paired with this edge");
     const signed = utf8.encode(
-      ["harar-edge-v1", request.method, url.pathname + url.search, time, nonce, await sha256(body)].join("\n"),
+      // The API path, from /v1/: a platform that mounts the edge under a prefix
+      // (Supabase: /functions/v1/harar-edge outside, /harar-edge inside) shows
+      // the caller and the edge different full paths.
+      ["harar-edge-v1", request.method, path + url.search, time, nonce, await sha256(body)].join("\n"),
     );
     const publicKey = await crypto.subtle.importKey("raw", unb64(String(device.public_key))!, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
     if (!(await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, publicKey, signature, signed))) {
@@ -737,7 +740,7 @@ export function edge(config: Config): { fetch(request: Request): Promise<Respons
         if (declared > MAX_BODY) throw new Refusal(413, "too_large", `bodies are at most ${MAX_BODY} bytes`);
         const body = new Uint8Array(await request.arrayBuffer());
         if (body.length > MAX_BODY) throw new Refusal(413, "too_large", `bodies are at most ${MAX_BODY} bytes`);
-        actor = await authenticate(request, body, url);
+        actor = await authenticate(request, body, url, path);
         const planned = await plan(request, url, path, actor, body);
         await record({ actor: actorName(actor), action: planned.action, resource: planned.resource, decision: "allow", reason: "", ip });
         // In "refuse" mode nothing happens until every sink has the row.

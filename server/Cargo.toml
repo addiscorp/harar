@@ -26,6 +26,7 @@ serde_json = { workspace = true }
 sha2 = "0.10"
 tokio = { workspace = true, features = ["full"] }
 tokio-postgres = "0.7"
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
 zeroize = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -35,7 +35,7 @@ export async function smoke(base: string, code: string): Promise<string[]> {
     const text = body === undefined ? "" : JSON.stringify(body);
     const time = String(Math.floor(Date.now() / 1000));
     const nonce = Buffer.from(webcrypto.getRandomValues(new Uint8Array(16))).toString("base64url");
-    const signed = ["harar-edge-v1", method, prefix + path, time, nonce, createHash("sha256").update(text).digest("hex")].join("\n");
+    const signed = ["harar-edge-v1", method, path, time, nonce, createHash("sha256").update(text).digest("hex")].join("\n");
     const sig = await webcrypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, keys.privateKey, new TextEncoder().encode(signed));
     return call(method, path, body, {
       "harar-device": id,

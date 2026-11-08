@@ -23,6 +23,10 @@ HARAR_TEST_POSTGRES=postgres://… npm test  # and Postgres
 test/check-platforms.sh                    # each platform's entry against the core
 ```
 
+`test/serve-node.ts <init folder> <port>` serves an edge on this machine
+(node:sqlite, no platform), and `test/cli-e2e.sh <harar binary>` drives one
+with the harar CLI; CI runs it after building harar.
+
 `test/smoke.ts <base url> <setup code>` runs one user's journey against a
 running edge: pair, put, token, resolve, refuse, rotate, revoke, and the log
 read back as an unbroken chain. `test/assemble.ts` lays out a platform's
