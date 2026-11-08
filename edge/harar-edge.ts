@@ -7,8 +7,9 @@
 //
 // It holds the secrets devices put here for services, sealed under the edge
 // key; service tokens that may read or write them; the devices paired with
-// it; and a hash-chained log of every request, shipped as OpenTelemetry logs
-// to sinks that should live in another account.
+// it; members' sync ops, stored and forwarded blind (sealed under a ring key
+// the edge never has); and a hash-chained log of every request, shipped as
+// OpenTelemetry logs to sinks that should live in another account.
 
 export const VERSION = "0.3.1";
 
@@ -67,7 +68,9 @@ export type Action =
   | "token.revoke"
   | "log.read"
   | "recovery.set"
-  | "recovery.read";
+  | "recovery.read"
+  | "sync.put"
+  | "sync.read";
 
 // ---------------------------------------------------------------- adapters
 
@@ -109,6 +112,15 @@ export const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS harar_log (seq INTEGER PRIMARY KEY, at TEXT NOT NULL, actor TEXT NOT NULL,
      action TEXT NOT NULL, resource TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT NOT NULL, ip TEXT NOT NULL,
      prev_hash TEXT NOT NULL, hash TEXT NOT NULL, shipped INTEGER NOT NULL)`,
+  // Members' sync ops, stored blind (docs/edge.md §5a). sealed and wrapped_key
+  // are NULL once compacted; their sha256 stays, so the op still verifies.
+  // batch is set while a PUT is being written and NULL once it is committed.
+  `CREATE TABLE IF NOT EXISTS harar_ops (author TEXT NOT NULL, seq INTEGER NOT NULL, prev TEXT NOT NULL,
+     kind TEXT NOT NULL, key TEXT NOT NULL, version INTEGER NOT NULL, sealed TEXT, wrapped_key TEXT,
+     sealed_sha256 TEXT NOT NULL, wrapped_key_sha256 TEXT NOT NULL, at BIGINT NOT NULL, sig TEXT NOT NULL,
+     hash TEXT NOT NULL UNIQUE, stored_at TEXT NOT NULL, batch TEXT, PRIMARY KEY (author, seq))`,
+  `CREATE INDEX IF NOT EXISTS harar_ops_key ON harar_ops (key, at)`,
+  `CREATE INDEX IF NOT EXISTS harar_ops_stored ON harar_ops (stored_at)`,
 ];
 
 // ---------------------------------------------------------------- limits
@@ -122,6 +134,16 @@ const NONCE_LIFE_MS = 10 * 60 * 1000;
 const PAIRING_LIFE_MS = 10 * 60 * 1000;
 const SHIP_BATCH = 100;
 const REFERENCE_PREFIX = "harar://";
+const MAX_OPS = 100;
+const MAX_SEALED = 48 * 1024;
+const MAX_WRAPPED = 1024;
+const MAX_SINCE = 100;
+const SYNC_PAGE = 100;
+const SYNC_PAGE_BYTES = 1024 * 1024;
+const HISTORY_MS = 30 * 24 * 60 * 60 * 1000;
+const COMPACT_BATCH = 50;
+const STAGED_LIFE_MS = 60 * 1000;
+const MAX_INT = 2 ** 31 - 1;
 
 // ---------------------------------------------------------------- bytes
 
@@ -237,6 +259,63 @@ class Refusal extends Error {
     this.status = status;
     this.code = code;
   }
+}
+
+// ---------------------------------------------------------------- sync ops
+
+const OP_KINDS = ["put", "rotate", "delete", "member.add", "member.remove", "rekey"] as const;
+type OpKind = (typeof OP_KINDS)[number];
+
+/** One member's change, as it signed it (docs/edge.md §5a). The edge can't
+ *  open `sealed`: it is sealed under the ring key, which the edge never has,
+ *  and `key` is an HMAC of the secret's path under that ring key. */
+interface Op {
+  author: string;
+  seq: number;
+  prev: string;
+  kind: OpKind;
+  key: string;
+  version: number;
+  sealed: string;
+  wrapped_key: string;
+  at: number;
+  sig: string;
+}
+
+const DEVICE_ID = /^d-[0-9a-f]{16}$/;
+const OP_FIELDS = ["author", "seq", "prev", "kind", "key", "version", "sealed", "wrapped_key", "at", "sig"];
+
+function count(value: unknown, max: number): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= max;
+}
+
+/** An op from a request, every field checked; nothing else is let through. */
+function parseOp(value: unknown, i: number): Op {
+  const bad = (what: string) => new Refusal(400, "bad_op", `ops[${i}]: ${what}`);
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw bad("an op is a JSON object");
+  const op = value as Record<string, unknown>;
+  const extra = Object.keys(op).filter((k) => !OP_FIELDS.includes(k));
+  if (extra.length > 0) throw bad(`unknown field ${extra[0]}`);
+  const b64 = (v: unknown, max: number) => typeof v === "string" && v.length <= max && /^[A-Za-z0-9_-]*$/.test(v);
+  if (typeof op.author !== "string" || !DEVICE_ID.test(op.author)) throw bad("author is a device id");
+  if (!count(op.seq, MAX_INT) || op.seq < 1) throw bad("seq is a whole number from 1");
+  if (typeof op.prev !== "string" || !(op.prev === "" || /^[0-9a-f]{64}$/.test(op.prev))) throw bad("prev is an op hash (64 hex), or empty for an author's first op");
+  if (typeof op.kind !== "string" || !(OP_KINDS as readonly string[]).includes(op.kind)) throw bad(`kind is one of ${OP_KINDS.join(", ")}`);
+  if (typeof op.key !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(op.key)) throw bad("key is 32 bytes, base64url (an HMAC-SHA256)");
+  if (!count(op.version, MAX_INT)) throw bad("version is a whole number");
+  if (!b64(op.sealed, MAX_SEALED)) throw bad(`sealed is base64url, at most ${MAX_SEALED} characters`);
+  if (!b64(op.wrapped_key, MAX_WRAPPED)) throw bad(`wrapped_key is base64url, at most ${MAX_WRAPPED} characters`);
+  if (!count(op.at, Number.MAX_SAFE_INTEGER)) throw bad("at is unix milliseconds");
+  if (typeof op.sig !== "string" || !/^[A-Za-z0-9_-]{86}$/.test(op.sig)) throw bad("sig is a P-256 signature, raw r || s (64 bytes), base64url");
+  return op as unknown as Op;
+}
+
+/** What an op's author signs, and what its hash is of: every field but sig,
+ *  one per line. sealed and wrapped_key go in as their sha256, so an op whose
+ *  ciphertext was compacted away still verifies, signature and chain. No
+ *  field can hold a newline (parseOp), so the encoding is unambiguous. */
+function opCanonical(op: Pick<Op, "author" | "seq" | "prev" | "kind" | "key" | "version" | "at">, sealedSha256: string, wrappedKeySha256: string): string {
+  return ["harar-op-v1", op.author, op.seq, op.prev, op.kind, op.key, op.version, sealedSha256, wrappedKeySha256, op.at].join("\n");
 }
 
 function json(status: number, body: unknown): Response {
@@ -443,6 +522,55 @@ export function edge(config: Config): { fetch(request: Request): Promise<Respons
       if (inserted.length === 1) return version;
     }
     throw new Refusal(503, "busy", `${path} is being written by someone else; try again`);
+  }
+
+  // ---------------------------------------------------------- sync
+
+  /** Compaction (docs/edge.md §5a): a put, rotate or delete op stored more
+   *  than 30 days ago that a later op on its key supersedes (by at, then
+   *  author id, then seq) loses its ciphertext. Its header, signature and
+   *  hash stay, so every author's chain still verifies from its first op.
+   *  The latest op on a key is never superseded, and member.* and rekey ops
+   *  are never touched. At most COMPACT_BATCH ops per call; it runs on every
+   *  sync request, so there is no schedule to pay for. */
+  async function compact(): Promise<void> {
+    await sql.query(
+      `UPDATE harar_ops SET sealed = NULL, wrapped_key = NULL WHERE hash IN (
+         SELECT o.hash FROM harar_ops o
+         WHERE o.batch IS NULL AND o.sealed IS NOT NULL AND o.kind IN ('put', 'rotate', 'delete') AND o.stored_at < ?
+           AND EXISTS (SELECT 1 FROM harar_ops n
+             WHERE n.key = o.key AND n.batch IS NULL
+               AND (n.at > o.at OR (n.at = o.at AND (n.author > o.author OR (n.author = o.author AND n.seq > o.seq)))))
+         ORDER BY o.stored_at LIMIT ${COMPACT_BATCH})`,
+      [iso(now() - HISTORY_MS)],
+    );
+  }
+
+  /** An op as members get it back: what its author sent, its hash, and the
+   *  sha256 of its ciphertext (all a compacted op still has). */
+  function served(row: Row) {
+    return {
+      author: String(row.author),
+      seq: Number(row.seq),
+      prev: String(row.prev),
+      kind: String(row.kind),
+      key: String(row.key),
+      version: Number(row.version),
+      sealed: row.sealed === null ? null : String(row.sealed),
+      wrapped_key: row.wrapped_key === null ? null : String(row.wrapped_key),
+      at: Number(row.at),
+      sig: String(row.sig),
+      hash: String(row.hash),
+      sealed_sha256: String(row.sealed_sha256),
+      wrapped_key_sha256: String(row.wrapped_key_sha256),
+      compacted: row.sealed === null,
+    };
+  }
+
+  /** The author's newest committed op: its seq and hash, or 0 and "". */
+  async function tip(author: string): Promise<{ seq: number; hash: string }> {
+    const [row] = await sql.query(`SELECT seq, hash FROM harar_ops WHERE author = ? AND batch IS NULL ORDER BY seq DESC LIMIT 1`, [author]);
+    return row ? { seq: Number(row.seq), hash: String(row.hash) } : { seq: 0, hash: "" };
   }
 
   // ---------------------------------------------------------- requests
@@ -744,6 +872,143 @@ export function edge(config: Config): { fetch(request: Request): Promise<Respons
       };
     }
 
+    // Sync (docs/edge.md §5a): members' ops, stored and forwarded blind. The
+    // whole batch is checked here, before its log row, and stored all or
+    // nothing.
+    if (method === "PUT" && path === "/v1/sync") {
+      device(actor);
+      const { ops } = input();
+      if (!Array.isArray(ops) || ops.length === 0 || ops.length > MAX_OPS) {
+        throw new Refusal(400, "bad_request", `sync takes { ops: [...] }, 1 to ${MAX_OPS} ops`);
+      }
+      const parsed = ops.map(parseOp);
+      const keys = new Map<string, CryptoKey | null>();
+      const checked: { op: Op; hash: string; sealedSha256: string; wrappedKeySha256: string }[] = [];
+      for (const [i, op] of parsed.entries()) {
+        if (!keys.has(op.author)) {
+          const [author] = await sql.query(`SELECT public_key FROM harar_devices WHERE id = ? AND removed_at IS NULL`, [op.author]);
+          keys.set(
+            op.author,
+            author ? await crypto.subtle.importKey("raw", unb64(String(author.public_key))!, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]) : null,
+          );
+        }
+        const publicKey = keys.get(op.author);
+        if (!publicKey) throw new Refusal(403, "unknown_author", `ops[${i}]: ${op.author} is not a device paired with this edge`);
+        if (op.at > now() + CLOCK_SKEW_S * 1000) throw new Refusal(400, "clock", `ops[${i}]: at is more than 5 minutes in the future`);
+        const sealedSha256 = await sha256(op.sealed);
+        const wrappedKeySha256 = await sha256(op.wrapped_key);
+        const canonical = utf8.encode(opCanonical(op, sealedSha256, wrappedKeySha256));
+        if (!(await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, publicKey, unb64(op.sig)!, canonical))) {
+          throw new Refusal(403, "bad_op_signature", `ops[${i}]: sig is not ${op.author}'s signature of this op`);
+        }
+        checked.push({ op, hash: await sha256(canonical), sealedSha256, wrappedKeySha256 });
+      }
+      // Each author's ops form a chain: seq counts up by one from 1, and prev
+      // is the hash of the author's op before (empty for its first).
+      const stored = new Map<string, { seq: number; hash: string }>();
+      const heads = new Map<string, { seq: number; hash: string }>();
+      const fresh: typeof checked = [];
+      for (const [i, c] of checked.entries()) {
+        const { op } = c;
+        if (!stored.has(op.author)) {
+          const t = await tip(op.author);
+          stored.set(op.author, t);
+          heads.set(op.author, t);
+        }
+        if (op.seq <= stored.get(op.author)!.seq) {
+          // Already here: fine if it's the same op (a retried PUT).
+          const [row] = await sql.query(`SELECT hash FROM harar_ops WHERE author = ? AND seq = ? AND batch IS NULL`, [op.author, op.seq]);
+          if (row && String(row.hash) === c.hash) continue;
+          throw new Refusal(409, "fork", `ops[${i}]: ${op.author} already has a different op ${op.seq}`);
+        }
+        const head = heads.get(op.author)!;
+        if (op.seq !== head.seq + 1) throw new Refusal(409, "wrong_seq", `ops[${i}]: ${op.author}'s next op is ${head.seq + 1}, not ${op.seq}`);
+        if (op.prev !== head.hash) throw new Refusal(409, "wrong_prev", `ops[${i}]: prev is not the hash of ${op.author}'s op ${head.seq}`);
+        heads.set(op.author, { seq: op.seq, hash: c.hash });
+        fresh.push(c);
+      }
+      const ranges = [...heads].filter(([a, h]) => h.seq > stored.get(a)!.seq).map(([a, h]) => `${a}:${stored.get(a)!.seq + 1}-${h.seq}`);
+      return {
+        action: "sync.put",
+        resource: ranges.join(","),
+        act: async () => {
+          if (fresh.length > 0) {
+            // All or nothing without a transaction (D1 has none, and caps a
+            // statement at 100 parameters): rows go in marked with this
+            // batch, invisible to every read, and one UPDATE commits them.
+            // A batch a crashed request left behind is cleared after a minute.
+            await sql.query(`DELETE FROM harar_ops WHERE batch IS NOT NULL AND stored_at < ?`, [iso(now() - STAGED_LIFE_MS)]);
+            const batch = hex(random(8));
+            const at = iso();
+            try {
+              for (const { op, hash, sealedSha256, wrappedKeySha256 } of fresh) {
+                await sql.query(
+                  `INSERT INTO harar_ops (author, seq, prev, kind, key, version, sealed, wrapped_key, sealed_sha256, wrapped_key_sha256, at, sig, hash, stored_at, batch)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                  [op.author, op.seq, op.prev, op.kind, op.key, op.version, op.sealed, op.wrapped_key, sealedSha256, wrappedKeySha256, op.at, op.sig, hash, at, batch],
+                );
+              }
+            } catch {
+              // Another PUT took one of these seqs first.
+              await sql.query(`DELETE FROM harar_ops WHERE batch = ?`, [batch]);
+              throw new Refusal(409, "sync_busy", "another sync wrote these ops' places first; pull and try again");
+            }
+            const committed = await sql.query(`UPDATE harar_ops SET batch = NULL WHERE batch = ? RETURNING hash`, [batch]);
+            if (committed.length !== fresh.length) {
+              await sql.query(`DELETE FROM harar_ops WHERE batch = ?`, [batch]);
+              throw new Refusal(409, "sync_busy", "this sync took too long to commit; try again");
+            }
+          }
+          await compact();
+          return { status: 200, body: { stored: fresh.length, duplicates: checked.length - fresh.length } };
+        },
+      };
+    }
+
+    if (method === "POST" && path === "/v1/sync") {
+      device(actor);
+      const { since = {} } = input();
+      if (!since || typeof since !== "object" || Array.isArray(since)) throw new Refusal(400, "bad_request", "since is { <device id>: <seq> }");
+      const entries = Object.entries(since as Record<string, unknown>);
+      if (entries.length > MAX_SINCE || !entries.every(([a, s]) => DEVICE_ID.test(a) && count(s, MAX_INT))) {
+        throw new Refusal(400, "bad_request", `since is { <device id>: <seq> }, at most ${MAX_SINCE} authors`);
+      }
+      const from = new Map(entries as [string, number][]);
+      return {
+        action: "sync.read",
+        resource: "",
+        act: async () => {
+          await compact();
+          const authors = await sql.query(`SELECT DISTINCT author FROM harar_ops WHERE batch IS NULL ORDER BY author`);
+          const ops: ReturnType<typeof served>[] = [];
+          const next: Record<string, number> = Object.fromEntries(from);
+          let bytes = 0;
+          let more = false;
+          // Per author, in seq order: an author's ops become visible only in
+          // order, so a cursor of each author's last seq never skips one.
+          outer: for (const { author } of authors) {
+            const a = String(author);
+            const rows = await sql.query(
+              `SELECT author, seq, prev, kind, key, version, sealed, wrapped_key, sealed_sha256, wrapped_key_sha256, at, sig, hash
+               FROM harar_ops WHERE author = ? AND seq > ? AND batch IS NULL ORDER BY seq LIMIT ?`,
+              [a, from.get(a) ?? 0, SYNC_PAGE - ops.length + 1],
+            );
+            for (const row of rows) {
+              if (ops.length >= SYNC_PAGE || bytes >= SYNC_PAGE_BYTES) {
+                more = true;
+                break outer;
+              }
+              const op = served(row);
+              ops.push(op);
+              bytes += (op.sealed?.length ?? 0) + (op.wrapped_key?.length ?? 0);
+              next[a] = op.seq;
+            }
+          }
+          return { status: 200, body: { ops, next, more } };
+        },
+      };
+    }
+
     throw new Refusal(404, "no_route", `${method} ${path} is not part of the harar edge API`);
   }
 
@@ -764,6 +1029,8 @@ export function edge(config: Config): { fetch(request: Request): Promise<Respons
       ["GET", /^\/v1\/log$/, "log.read"],
       ["PUT", /^\/v1\/recovery$/, "recovery.set"],
       ["GET", /^\/v1\/recovery$/, "recovery.read"],
+      ["PUT", /^\/v1\/sync$/, "sync.put"],
+      ["POST", /^\/v1\/sync$/, "sync.read"],
     ];
     return routes.find(([m, re]) => m === method && re.test(path))?.[2] ?? null;
   }
