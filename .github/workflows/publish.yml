@@ -1,8 +1,9 @@
-# Publish the JavaScript client (js/, `import { vault } from 'harar'`) to npm.
-# Runs when a merge to main changes js/package.json: a new version is
-# published, an unchanged one is skipped. Actions → Publish to npm → Run
-# workflow retries by hand. The harar binary ships from harar-releases, never
-# npm; this package only talks to the installed one.
+# Publish the JavaScript client (js/, `import { vault } from 'harar'`) to npm
+# as `harar` from a stable release. Promote dispatches this after it tags
+# vX.Y.Z; Actions → Publish to npm → Run workflow retries a version by hand.
+# Canaries never publish here: npm versions are permanent (APS 9). The harar
+# binary ships from harar-releases, never npm (APS 13); this package only
+# talks to the installed one.
 #
 # npm trusted publishing (OIDC): npm trusts this workflow by its filename
 # (`publish.yml`) in the `release` environment. There is no NPM_TOKEN anywhere.
@@ -10,69 +11,83 @@
 name: Publish to npm
 
 on:
-  push:
-    branches: [main]
-    paths: ['js/package.json']
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Stable version to publish (X.Y.Z, tagged vX.Y.Z)"
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 jobs:
-  test:
-    runs-on: ubuntu-24.04
-    defaults:
-      run:
-        working-directory: js
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - uses: oven-sh/setup-bun@v2
-      - run: npm test
-      - run: bun test test/
-
   publish:
-    needs: test
+    name: Publish harar to npm
     runs-on: ubuntu-24.04
     environment: release
     permissions:
       contents: read
       id-token: write # OIDC: trusted publishing
-    defaults:
-      run:
-        working-directory: js
+    env:
+      V: ${{ inputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - name: The version is a stable release
+        run: |
+          if [[ ! "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'$V' is not a stable version (X.Y.Z). Canaries never publish to npm."
+            exit 1
+          fi
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: v${{ inputs.version }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+      - uses: oven-sh/setup-bun@v2
+      - name: The client is harar at this release's version
+        run: scripts/check-clients.sh && [ "$(scripts/version.sh)" = "$V" ]
+      - name: Test
+        working-directory: js
+        run: npm test && bun test test/
       # Trusted publishing needs npm >= 11.5.1, newer than Node 22 ships.
       # A major, pinned: an unpinned @latest once changed npm's output mid-run.
       - run: npm install -g npm@12 && npm --version
-      # A version is published once; a rerun after it landed skips, not fails.
+      - name: Pack
+        working-directory: js
+        run: npm pack --pack-destination ..
+      # A version is published once; a rerun after it landed checks its bytes only.
       - name: Publish
         run: |
           set -euo pipefail
-          version="$(node -p "require('./package.json').version")"
-          if [ "$(npm view "harar@$version" version 2>/dev/null || true)" = "$version" ]; then
-            echo "harar@$version is already on npm"
+          if [ "$(npm view "harar@$V" version 2>/dev/null || true)" = "$V" ]; then
+            echo "harar@$V is already on npm; checking its bytes only."
           else
-            npm publish --access public
+            npm publish "harar-${V}.tgz" --access public
           fi
-      # Read it back: a green run means the version is on the registry.
-      - name: Verify
+      # Success is npm serving these bytes, not a green step: the tarball it
+      # serves must be the one this job packed.
+      - name: npm serves this release
         run: |
           set -euo pipefail
-          version="$(node -p "require('./package.json').version")"
+          want="$(openssl dgst -sha512 -binary "harar-${V}.tgz" | base64 -w0)"
           for _ in $(seq 1 20); do
-            if [ "$(npm view "harar@$version" version 2>/dev/null || true)" = "$version" ]; then
-              echo "harar@$version is on npm"
-              exit 0
+            got="$(npm view "harar@$V" dist.integrity 2>/dev/null || true)"
+            if [ -n "$got" ]; then
+              if [ "$got" = "sha512-${want}" ]; then
+                echo "npm serves harar@${V} (${got})"
+                {
+                  echo "### harar ${V} is on npm"
+                  echo "- https://www.npmjs.com/package/harar/v/${V}"
+                  echo "- ${got}, the bytes this job packed"
+                } >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+              echo "::error::npm serves harar@${V} as ${got}, but this release packs sha512-${want}."
+              exit 1
             fi
             sleep 15
           done
-          echo "harar@$version never appeared on npm" >&2
+          echo "::error::npm does not serve harar@${V} after 300 s."
           exit 1
