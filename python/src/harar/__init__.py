@@ -18,7 +18,7 @@ import re
 import socket as _socket
 import sys
 
-__all__ = ["REFERENCE_PREFIX", "HararError", "Secrets", "Vault", "agent_socket", "reference", "vault"]
+__all__ = ["REFERENCE_PREFIX", "EdgeSecrets", "EdgeVault", "HararError", "Secrets", "Vault", "agent_socket", "reference", "vault"]
 
 # harar's answers are small; anything longer is refused.
 MAX_ANSWER = 1024 * 1024
@@ -135,7 +135,99 @@ class Vault:
         return value
 
 
-def vault(socket=None):
+# A harar edge service token, as `harar edge token create` makes it.
+_EDGE_TOKEN = re.compile(r"\Aharar_edge_[0-9a-f]{16}_[A-Za-z0-9_-]{43}\Z")
+# https://, or http:// to this machine only.
+_EDGE_URL = re.compile(r"\A(https://[^/]|http://(127\.0\.0\.1|localhost|\[::1\])([:/]|\Z))")
+
+
+def _ask_edge(edge, token, refs, what):
+    """The values `refs` name, from a harar edge (docs/edge.md): one POST of
+    /v1/resolve with the service token, all or nothing."""
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(
+        edge + "/v1/resolve",
+        data=json.dumps({"refs": refs}).encode("utf-8"),
+        method="POST",
+        headers={"content-type": "application/json", "authorization": "Bearer " + token},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT_S) as res:
+            status, body = res.status, res.read(MAX_ANSWER + 1)
+    except urllib.error.HTTPError as e:
+        status, body = e.code, e.read(MAX_ANSWER + 1)
+    except _socket.timeout:
+        raise HararError(f"harar at {edge}: did not answer in {TIMEOUT_S} s") from None
+    except (urllib.error.URLError, OSError) as e:
+        raise HararError(f"harar at {edge}: {getattr(e, 'reason', e)}") from None
+    if len(body) > MAX_ANSWER:
+        raise HararError("harar sent too long an answer")
+    try:
+        answer = json.loads(body.decode("utf-8"))
+    except ValueError:
+        raise HararError(f"harar at {edge} did not answer with JSON ({status})") from None
+    if not isinstance(answer, dict):
+        raise HararError(f"harar at {edge} did not answer with an object")
+    if not 200 <= status < 300:
+        code = answer.get("error") if isinstance(answer.get("error"), str) else str(status)
+        message = answer.get("message")
+        raise HararError(f"harar refused {what}: {code}" + (f": {message}" if isinstance(message, str) else ""))
+    values = answer.get("values")
+    if not isinstance(values, list) or len(values) != len(refs) or not all(isinstance(v, str) for v in values):
+        raise HararError(f"harar sent no value for {what}")
+    return values
+
+
+class EdgeSecrets:
+    """harar:// references resolved at a harar edge, with a service token."""
+
+    def __init__(self, edge, token):
+        self._edge, self._token = edge, token
+
+    def resolve(self, ref):
+        """The value `ref` names."""
+        if reference(ref) is None:
+            _not_a_reference(ref)
+        return self.resolve_all([ref])[0]
+
+    def resolve_all(self, refs):
+        """Each reference's value, in order, in one request: all or nothing."""
+        refs = list(refs)
+        if not refs:
+            return []
+        for ref in refs:
+            if reference(ref) is None:
+                _not_a_reference(ref)
+        return _ask_edge(self._edge, self._token, refs, refs[0] if len(refs) == 1 else f"{len(refs)} references")
+
+
+def _not_a_reference(ref):
+    raise HararError(f"not a harar:// reference: {ref!r}")
+
+
+class EdgeVault:
+    """A vault at a harar edge (docs/edge.md): it resolves references, and
+    only those its service token may read. hosts and send are for gateways
+    on harar's local socket."""
+
+    def __init__(self, edge, token):
+        if not isinstance(edge, str) or not _EDGE_URL.match(edge):
+            raise ValueError("vault(edge=...): the edge is an https:// URL")
+        if not isinstance(token, str) or not _EDGE_TOKEN.match(token):
+            raise ValueError("vault(edge=..., token=...): the token is a harar edge service token (harar edge token create)")
+        self.secrets = EdgeSecrets(edge.rstrip("/"), token)
+
+
+def vault(socket=None, edge=None, token=None):
     """harar at `socket`: by default the per-user agent on this machine
-    (`harar agent`), else a primary (/run/harar.sock)."""
+    (`harar agent`), else a primary (/run/harar.sock). Or, with `edge` and
+    `token`, a harar edge, for a service off your network: its URL and a
+    service token from `harar edge token create`, read from the platform's
+    secrets."""
+    if edge is not None or token is not None:
+        if socket is not None:
+            raise ValueError("vault(): a socket or an edge, not both")
+        return EdgeVault(edge, token)
     return Vault(agent_socket() if socket is None else socket)

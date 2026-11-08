@@ -85,8 +85,9 @@ harar edge pair https://harar-edge.<you>.workers.dev --dir .
 
 This machine is a device of the edges it pairs with. Its key is in the Secure
 Enclave on a Mac, so each signed request asks for Touch ID; elsewhere, or with
-`--file-key`, it's a 0600 file. Paired edges are listed in `edges.json`,
-next to the agent's state.
+`--file-key`, it's a 0600 file. Paired edges are listed in `edges.json`:
+in `~/Library/Application Support/harar` on a Mac, `~/.local/state/harar`
+on Linux (state that must outlive a reboot, so never `$XDG_RUNTIME_DIR`).
 
 | Command | Does |
 |---|---|

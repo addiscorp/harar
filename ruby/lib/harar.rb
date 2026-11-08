@@ -145,9 +145,108 @@ module Harar
     end
   end
 
+  # A harar edge service token, as `harar edge token create` makes it.
+  EDGE_TOKEN = /\Aharar_edge_[0-9a-f]{16}_[A-Za-z0-9_-]{43}\z/
+  # https://, or http:// to this machine only.
+  EDGE_URL = %r{\A(https://[^/]|http://(127\.0\.0\.1|localhost|\[::1\])([:/]|\z))}
+
+  # harar:// references resolved at a harar edge, with a service token.
+  class EdgeSecrets
+    def initialize(edge, token)
+      @edge = edge
+      @token = token
+    end
+
+    # The value `ref` names.
+    def resolve(ref)
+      resolve_all([ref]).first
+    end
+
+    # Each reference's value, in order, in one request: all or nothing.
+    def resolve_all(refs)
+      refs = refs.to_a
+      return [] if refs.empty?
+
+      refs.each { |ref| raise Error, "not a harar:// reference: #{ref.inspect}" if Harar.reference(ref).nil? }
+      ask(refs, refs.length == 1 ? refs.first : "#{refs.length} references")
+    end
+
+    private
+
+    # One POST of /v1/resolve (docs/edge.md), all or nothing.
+    def ask(refs, what)
+      status, body = post(JSON.generate({ refs: refs }))
+      begin
+        answer = JSON.parse(body)
+      rescue JSON::ParserError
+        raise Error, "harar at #{@edge} did not answer with JSON (#{status})"
+      end
+      raise Error, "harar at #{@edge} did not answer with an object" unless answer.is_a?(Hash)
+
+      unless (200..299).cover?(status)
+        code = answer["error"].is_a?(String) ? answer["error"] : status.to_s
+        message = answer["message"].is_a?(String) ? ": #{answer['message']}" : ""
+        raise Error, "harar refused #{what}: #{code}#{message}"
+      end
+      values = answer["values"]
+      unless values.is_a?(Array) && values.length == refs.length && values.all? { |v| v.is_a?(String) }
+        raise Error, "harar sent no value for #{what}"
+      end
+
+      values
+    end
+
+    def post(body)
+      require "net/http"
+      uri = URI("#{@edge}/v1/resolve")
+      Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == "https", open_timeout: TIMEOUT_S, read_timeout: TIMEOUT_S) do |http|
+        request = Net::HTTP::Post.new(uri)
+        request["content-type"] = "application/json"
+        request["authorization"] = "Bearer #{@token}"
+        request.body = body
+        http.request(request) do |res|
+          text = +""
+          res.read_body do |chunk|
+            text << chunk
+            raise Error, "harar sent too long an answer" if text.bytesize > MAX_ANSWER
+          end
+          return [res.code.to_i, text.force_encoding(Encoding::UTF_8)]
+        end
+      end
+    rescue Net::OpenTimeout, Net::ReadTimeout
+      raise Error, "harar at #{@edge}: did not answer in #{TIMEOUT_S} s"
+    rescue SystemCallError, SocketError, IOError, OpenSSL::SSL::SSLError => e
+      raise Error, "harar at #{@edge}: #{e.message}"
+    end
+  end
+
+  # A vault at a harar edge (docs/edge.md): it resolves references, and only
+  # those its service token may read. hosts and send are for gateways on
+  # harar's local socket.
+  class EdgeVault
+    attr_reader :secrets
+
+    def initialize(edge, token)
+      raise ArgumentError, "Harar.vault(edge:): the edge is an https:// URL" unless edge.is_a?(String) && edge.match?(EDGE_URL)
+      unless token.is_a?(String) && token.match?(EDGE_TOKEN)
+        raise ArgumentError, "Harar.vault(edge:, token:): the token is a harar edge service token (harar edge token create)"
+      end
+
+      @secrets = EdgeSecrets.new(edge.sub(%r{/+\z}, ""), token)
+    end
+  end
+
   # harar at `socket`: by default the per-user agent on this machine
-  # (`harar agent`), else a primary (/run/harar.sock).
-  def self.vault(socket: agent_socket)
-    Vault.new(socket)
+  # (`harar agent`), else a primary (/run/harar.sock). Or, with `edge:` and
+  # `token:`, a harar edge, for a service off your network: its URL and a
+  # service token from `harar edge token create`, read from the platform's
+  # secrets.
+  def self.vault(socket: nil, edge: nil, token: nil)
+    unless edge.nil? && token.nil?
+      raise ArgumentError, "Harar.vault: a socket or an edge, not both" unless socket.nil?
+
+      return EdgeVault.new(edge, token)
+    end
+    Vault.new(socket.nil? ? agent_socket : socket)
   end
 end

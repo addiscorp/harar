@@ -72,8 +72,96 @@ export function agentSocket() {
   return join(HOME || '/', '.harar', 'agent.sock')
 }
 
-/** A vault on harar's socket: the agent on this machine unless `socket` names another. */
-export function vault({ socket = agentSocket() } = {}) {
+/** A harar edge service token, as `harar edge token create` makes it. */
+const EDGE_TOKEN = /^harar_edge_[0-9a-f]{16}_[A-Za-z0-9_-]{43}$/
+/** https://, or http:// to this machine only. */
+const EDGE_URL = /^(https:\/\/[^/]|http:\/\/(127\.0\.0\.1|localhost|\[::1\])([:/]|$))/
+
+/** The values `refs` name, from a harar edge (docs/edge.md): one POST of
+ *  /v1/resolve with the service token, all or nothing. */
+async function askEdge(edge, token, refs, what) {
+  let res
+  try {
+    res = await fetch(`${edge}/v1/resolve`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({ refs }),
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    })
+  } catch (e) {
+    const why = e?.name === 'TimeoutError' ? `did not answer in ${TIMEOUT_MS / 1000} s` : e?.cause?.message ?? e?.message
+    throw new Error(`harar at ${edge}: ${why}`)
+  }
+  const text = await readCapped(res, edge)
+  let answer
+  try {
+    answer = JSON.parse(text)
+  } catch {
+    throw new Error(`harar at ${edge} did not answer with JSON (${res.status})`)
+  }
+  if (typeof answer !== 'object' || answer === null || Array.isArray(answer))
+    throw new Error(`harar at ${edge} did not answer with an object`)
+  if (!res.ok) {
+    const code = typeof answer.error === 'string' ? answer.error : String(res.status)
+    const why = typeof answer.message === 'string' ? `: ${answer.message}` : ''
+    throw new Error(`harar refused ${what}: ${code}${why}`)
+  }
+  const { values } = answer
+  if (!Array.isArray(values) || values.length !== refs.length || !values.every((v) => typeof v === 'string'))
+    throw new Error(`harar sent no value for ${what}`)
+  return values
+}
+
+/** The body, refused past MAX_ANSWER bytes. */
+async function readCapped(res, edge) {
+  const chunks = []
+  let size = 0
+  for await (const chunk of res.body ?? []) {
+    size += chunk.length
+    if (size > MAX_ANSWER) throw new Error('harar sent too long an answer')
+    chunks.push(chunk)
+  }
+  return Buffer.concat(chunks).toString('utf8')
+}
+
+/** References checked here first, so a typo never leaves this process. */
+function keysOf(refs) {
+  for (const ref of refs)
+    if (reference(ref) === undefined) throw new Error(`not a harar:// reference: ${JSON.stringify(ref)}`)
+}
+
+/** A vault at a harar edge: only `secrets`, since hosts and send are for
+ *  gateways on harar's local socket. */
+function edgeVault(edge, token) {
+  if (typeof edge !== 'string' || !EDGE_URL.test(edge))
+    throw new Error('vault({ edge }): the edge is an https:// URL')
+  if (typeof token !== 'string' || !EDGE_TOKEN.test(token))
+    throw new Error('vault({ edge, token }): the token is a harar edge service token (harar edge token create)')
+  const base = edge.replace(/\/+$/, '')
+  return {
+    secrets: {
+      async resolve(ref) {
+        keysOf([ref])
+        return (await askEdge(base, token, [ref], ref))[0]
+      },
+      async resolveAll(refs) {
+        if (!Array.isArray(refs)) throw new Error('resolveAll takes an array of harar:// references')
+        if (refs.length === 0) return []
+        keysOf(refs)
+        return askEdge(base, token, refs, refs.length === 1 ? refs[0] : `${refs.length} references`)
+      },
+    },
+  }
+}
+
+/** A vault on harar's socket: the agent on this machine unless `socket` names
+ *  another; or, with `{ edge, token }`, a harar edge. */
+export function vault(options = {}) {
+  if (options.edge !== undefined || options.token !== undefined) {
+    if (options.socket !== undefined) throw new Error('vault(): a socket or an edge, not both')
+    return edgeVault(options.edge, options.token)
+  }
+  const { socket = agentSocket() } = options
   if (typeof socket !== 'string' || !socket.startsWith('/'))
     throw new Error('vault({ socket }): the socket is an absolute path')
   const resolve = async (ref) => {

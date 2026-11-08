@@ -31,4 +31,21 @@ an earlier deadline, or a cancel, ends the wait sooner.
 No dependencies beyond the standard library; Go 1.21 or later. Versions are
 harar's own: `go/vX.Y.Z` is tagged with each stable release `vX.Y.Z`.
 
+## At a harar edge
+
+A service off your network (Railway, Vercel, CI) resolves the same references at
+a [harar edge](https://github.com/addiscorp/harar/blob/main/docs/edge.md) in your own
+Cloudflare, Vercel or Supabase account, with a service token from
+`harar edge token create`. The token comes from the platform's secrets; pass it in.
+It reads only what its token allows, and every read is in the edge's log.
+
+```go
+vault, err := harar.Edge("https://harar-edge.you.workers.dev", os.Getenv("HARAR_EDGE_TOKEN"))
+key, err := vault.Secrets.Resolve(ctx, "harar://prod/shop/STRIPE_KEY")
+```
+
+`vault.Secrets` and the socket vault's `Secrets` are both a `harar.Resolver`.
+
+hosts and send stay on the local socket: they are for gateways.
+
 harar itself: https://github.com/addiscorp/harar

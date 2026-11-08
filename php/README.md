@@ -27,4 +27,19 @@ A gateway that attaches keys on their way out (`import { gateway } from
 The package is the root `composer.json` of this repository; Packagist takes
 each stable `vX.Y.Z` tag as a version.
 
+## At a harar edge
+
+A service off your network (Railway, Vercel, CI) resolves the same references at
+a [harar edge](https://github.com/addiscorp/harar/blob/main/docs/edge.md) in your own
+Cloudflare, Vercel or Supabase account, with a service token from
+`harar edge token create`. The token comes from the platform's secrets; pass it in.
+It reads only what its token allows, and every read is in the edge's log.
+
+```php
+$harar = Harar\vault(edge: 'https://harar-edge.you.workers.dev', token: getenv('HARAR_EDGE_TOKEN'));
+$key = $harar->secrets->resolve('harar://prod/shop/STRIPE_KEY');
+```
+
+hosts and send stay on the local socket: they are for gateways.
+
 harar itself: https://github.com/addiscorp/harar

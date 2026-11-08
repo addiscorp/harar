@@ -3,8 +3,8 @@
 //!
 //! This machine becomes a device of the edge: a P-256 key (the Secure Enclave
 //! on a Mac, a 0600 key file otherwise or with --file-key) that signs every
-//! request. Which edges it is paired with lives in `edges.json` next to the
-//! agent's state.
+//! request. Which edges it is paired with lives in `edges.json` (state_dir:
+//! Application Support on a Mac, ~/.local/state/harar on Linux).
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
@@ -504,8 +504,20 @@ struct EdgesFile {
     edges: Vec<Paired>,
 }
 
+/// Where this machine keeps its edges and their device keys: state that must
+/// outlive a reboot. The agent's folder on macOS (Application Support); on
+/// Linux `~/.local/state/harar`, never the agent's `$XDG_RUNTIME_DIR`, which
+/// is emptied at logout.
+fn state_dir() -> PathBuf {
+    if cfg!(target_os = "macos") {
+        return harar::agent_dir();
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
+    home.join(".local/state/harar")
+}
+
 fn edges_path() -> PathBuf {
-    harar::agent_dir().join("edges.json")
+    state_dir().join("edges.json")
 }
 
 fn read_edges() -> Result<EdgesFile> {
@@ -626,7 +638,7 @@ fn new_key(url: &str, file_key: bool) -> Result<(DeviceKey, StoredKey)> {
     }
     let _ = file_key;
     let key = SigningKey::random(&mut OsRng);
-    let path = harar::agent_dir().join("edge-keys").join(format!("{}.p256", &hex(&Sha256::digest(url.as_bytes()))[..16]));
+    let path = state_dir().join("edge-keys").join(format!("{}.p256", &hex(&Sha256::digest(url.as_bytes()))[..16]));
     let secret = zeroize::Zeroizing::new(STANDARD.encode(key.to_bytes()));
     if path.exists() {
         fs::remove_file(&path).with_context(|| format!("replace the unused key {}", path.display()))?;
