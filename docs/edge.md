@@ -96,11 +96,12 @@ state folder, where the agent keeps its vault too.
 | `harar edge pair <url> [--dir] [--name] [--file-key]` | pairs with the setup code from `--dir`, or a code typed at a no-echo prompt. With `--dir`, it first checks the edge has the folder's key (section 4a), and afterwards removes the key, setup code and recovery copy from disk |
 | `harar edge recover [--with-code] [--out <file>] [--env]` | restores the edge key (section 4a), to stdout for piping into the platform, never to a terminal |
 | `harar edge pairing` | a one-time code for another device (10 minutes) |
-| `harar edge devices`, `harar edge unpair <id>` | the paired devices |
+| `harar edge devices`, `harar edge unpair <id>` | the paired devices; with sync on, unpairing a member first removes it from the ring and rekeys (section 5b) |
 | `harar edge put <path> [--rotate]`, `harar edge delete <path>`, `harar edge secrets` | secrets; the value is typed twice at a no-echo prompt, or `--secret-stdin` |
 | `harar edge token create <name> --read <pattern> --write <pattern> [--expires-in <s>]` | a service token, shown once |
 | `harar edge token list`, `harar edge token revoke <id>` | the tokens |
 | `harar edge log [--after <seq>]` | the log, with its hash chain checked here |
+| `harar edge sync on [--edge]`, `off`, `status`, `now`, `approve <device>` | the agent's vault as a member of a ring, synced through this edge (section 5b); off until `on` |
 
 With more than one edge paired, `--edge <url>` says which. Every command
 answers in JSON.
@@ -359,6 +360,147 @@ Each op comes back as sent, plus `hash`, `sealed_sha256`,
 The edge does not resolve conflicts, check versions or open anything: members
 do, by these same rules (#101).
 
+## 5b. Members: the agent's vault in a ring (phase 2, step 2)
+
+`harar edge sync on` makes the agent's vault a member of the edge's ring.
+The code is `server/src/sync/`; `edge/test/sync-vectors.json` is a chain of
+ops it made that harar's tests and the edge's both check, so the two sides
+can't drift on the encoding, the hashes, the signatures or the seals.
+
+### Keys
+
+- **Signing**: the device key the machine paired with (section 3). Every op
+  is signed with it.
+- **Key agreement**: a second P-256 key per edge, made by `sync on`: in the
+  Secure Enclave when the device key is, otherwise a 0600 file beside it in
+  `edge-keys/`. Its public half travels in the member's ops.
+- **The ring key**: 32 random bytes, made by the ring's founder. A member
+  holds it only wrapped to its own key-agreement key (ECIES, Apple's
+  cofactor variable-IV X9.63 SHA-256 AES-GCM, as `enclave.rs`; the Rust
+  implementation is checked against the Secure Enclave on the macOS runner).
+  It is never sent unwrapped, logged, or written to disk unwrapped.
+- **A secret version** has its own data key. `sealed` is `iv ‖ AES-256-GCM`
+  of `{"path", "value", "base"}` under the data key; `wrapped_key` is the
+  data key under the ring key; both with associated data
+  `harar-op|<key>|<version>`, where `key` is `HMAC-SHA256(ring key, path)`.
+  After opening, a member checks the path inside against `key`.
+
+### What member ops hold
+
+A secret op (`put`, `rotate`, `delete`) is as above. `base` is the hash of
+the op the write replaced on its author's vault (`""` for none): it tells a
+successor from a concurrent write. A member's ops hold no path or value
+anywhere else, and its state file holds only ops and wrapped keys.
+
+The ring's own ops hold plain JSON (base64url) in `sealed`, since what they
+say is public keys and device ids the edge already knows:
+
+| Op | `sealed` | `wrapped_key` | `key` | `version` |
+|---|---|---|---|---|
+| `member.add` by the device itself: a request to join | `{device, name, sign_pub, agree_pub, epoch: 0}` | empty | `sha256("harar:member\|request\|<device>")` | 0 |
+| `member.add` by a member: adds `device` | the same, with the epoch | the ring key, ECIES to `agree_pub` | ring MAC of `harar:member\|add\|<device>\|<epoch>` | the epoch |
+| `member.remove` | `{device, after}` | empty | ring MAC of `harar:member\|remove\|<device>\|<after>` | the epoch |
+| `rekey` | `{epoch, wraps: {device: ECIES(new key)}}` | the previous ring key under the new one, AES-GCM, ad `harar-rekey\|<epoch>` | MAC of `harar:member\|rekey\|<epoch>` under the previous key | the new epoch |
+
+A ring MAC proves the author holds the ring key. The texts start with the
+vault's reserved `harar:`, which no synced path has, so none is a secret's
+`key`.
+
+### Who is a member
+
+A member verifies everything it pulls; it trusts the edge for nothing.
+
+- **Chains.** Each author's ops verify from its first: seq counts up by one,
+  prev is the hash before, the hash is recomputed (from the served
+  ciphertext hashes for a compacted op), and the signature checks. An
+  author's first op must be a `member.add` of itself, and it carries the
+  signing key every later op is checked with. A chain that breaks is taken
+  up to the break; the rest is refused, listed in `status`, and asked for
+  again at the next pull.
+- **The founder** is the author whose first op adds itself with a MAC under
+  the ring key of epoch 0. Members are the founder and every device a
+  member's `member.add` names; a `member.remove` ends a member's ops at the
+  seq it names (`after`, the last op the remover had from it). This is a
+  fixed point over all the ring's ops, so it doesn't depend on the order
+  they arrive in.
+- **A secret op counts** only if its author is a member at its seq. One
+  written after its author's removal is refused; one from an author not
+  known to be a member yet waits.
+- **Rekeys.** A rekey's wrap to a member gives it the new key, and each
+  rekey's key opens the key before, so a member who has the newest key has
+  them all (a device approved after a rekey reads the whole history). New
+  writes use the newest epoch a member's rekey made.
+
+### Joining
+
+1. The first member to turn sync on, on an edge that holds no ops, founds
+   the ring: a new ring key, wrapped to itself, and a `member.add` of
+   itself. Its vault's secrets become `put` ops.
+2. Any later device that turns sync on publishes a request (its first op).
+   It needs no change to pairing: the request is signed with the pairing
+   key it carries, and the edge took it only from a paired device.
+3. A member runs `harar edge sync approve <device>`, after comparing the
+   request's `fingerprint` (in `status` on both machines): that wraps the
+   ring key to the request's key-agreement key and publishes the
+   `member.add`. (Approval from the phone is phase 3.)
+4. The newcomer's next sync opens the ring key, then applies the ring's ops.
+   What its vault held before is its own write: the same value as the
+   ring's is just adopted; a different one is a concurrent write, so last
+   write wins and the loser is kept (below).
+
+### Applying: last write wins
+
+For each path, a write whose `base` is the path's current op replaces it.
+Two writes that didn't see each other are a conflict: the later one by
+(`at`, author id, `seq`) is kept, the same order the edge compacts by; the
+other goes into the vault's history with its value, and the conflict is
+flagged. Both members reach the same result and both flag it; `harar edge
+sync status` shows the flags (paths, devices, times, versions; never
+values). A delete is a version too. A value another member changed has no
+hosts here (`harar hosts`) until the owner allows them again, as with a
+value changed here. Hosts are each machine's own and are not synced.
+
+What the vault knows about sync (each path's current op, the history and
+the flags) is inside the vault, under the reserved key `harar:sync`, so it
+is sealed with the vault.
+
+### When it syncs
+
+Never on a timer: an edge is metered, and one nobody uses should cost
+nothing.
+
+- **The agent starts**: it pulls, and verifies and keeps what it pulled; it
+  applies it when the vault is unlocked (the pull needs no secret).
+- **The vault unlocks**: what was pulled is applied.
+- **Every change** (`put`, `delete` through the agent): recorded as an op at
+  once, then pulled-before-pushed by the agent's sync worker.
+- **`harar edge sync now`**: pull, apply, push, and say what happened.
+
+Every push is preceded by a pull. Ops that fail to go stay queued
+(`status` says how many, and the last error) and go at the next of these.
+
+### Commands
+
+| Command | Does |
+|---|---|
+| `harar edge sync on [--edge <url>]` | makes the key-agreement key, and founds the ring or asks to join it. One ring per vault: a second edge is refused |
+| `harar edge sync off` | stops syncing. Nothing is deleted; `on` picks up where it left off, and what changed meanwhile goes as ops |
+| `harar edge sync status` | role (member, requested, removed), members and requests with fingerprints, the epoch, queued and waiting ops, refused ops, conflicts |
+| `harar edge sync now` | one sync |
+| `harar edge sync approve <device>` | adds a device that asked |
+| `harar edge unpair <device>` | with sync on, a member is first removed from the ring and the ring rekeyed, then unpaired |
+
+They all go through the agent (`--socket` for another one), which is the
+only writer of the member's chain, so no two processes ever sign the same
+seq. Each needs the vault unlocked and the terminal approved, as any vault
+request.
+
+**Not verified here:** the Secure Enclave key-agreement key. CI and the
+end-to-end test (`edge/test/sync-e2e.sh`) use file keys, since an enclave
+key that needs presence would ask for Touch ID. With enclave keys, a sync
+that unwraps the ring key asks once while the vault stays unlocked, and
+each op signed asks too.
+
 ## 6. The log
 
 Every request is one row, allowed or refused:
@@ -438,7 +580,7 @@ raises an alarm when the edge's chain stops advancing (phase 3).
    and flagged. Mac sync is opt-in (`harar edge sync on`). 30 days of history,
    then compaction.
    - 2a: `harar_ops` and `/v1/sync` on the edge (section 5a);
-   - 2b: the Mac agent as a member, and `harar edge sync on`;
+   - 2b: the Mac agent as a member, and `harar edge sync on` (section 5b);
    - 2c: harar-app as a member (with phase 3).
 3. **harar-app**: the phone pairs by QR code. It is a member, the approver,
    the token manager and the log viewer, and the edge sends its notifications.
