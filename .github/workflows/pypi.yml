@@ -75,8 +75,9 @@ jobs:
               python3 - served.json dist <<'PY'
           import hashlib, json, os, sys
           served = {u["filename"]: u["digests"]["sha256"] for u in json.load(open(sys.argv[1]))["urls"]}
+          # The wheel and sdist; the publish step also leaves its .publish.attestation files here.
           built = {f: hashlib.sha256(open(os.path.join(sys.argv[2], f), "rb").read()).hexdigest()
-                   for f in os.listdir(sys.argv[2])}
+                   for f in os.listdir(sys.argv[2]) if f.endswith((".whl", ".tar.gz"))}
           if served != built:
               sys.exit("::error::PyPI serves %s, but this release builds %s" % (served, built))
           for f, h in sorted(built.items()):
