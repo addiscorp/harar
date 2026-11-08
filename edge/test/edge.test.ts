@@ -823,33 +823,33 @@ for (const backend of backends) {
       const m2 = await macM.op("member.add", "member", "laptop", { at: t + 1000 });
       const n1 = await macM.op("put", "N", "gone", { at: t });
       const n2 = await macM.op("delete", "N", null, { at: t + 1000, version: 2 });
-      const q1 = await macM.op("put", "Q", "mac wins: later at", { at: t + 5000 });
-      // Same at on one key: the larger author id wins.
-      const tie = await macM.op("put", "T", "mac", { at: t + 2000 });
-      await mac.as("PUT", "/v1/sync", { ops: [k1, k2, l1, m1, m2, n1, n2, q1, tie] });
-      // The phone writes Q later, but with an older at: it loses.
-      const q2 = await phoneM.op("put", "Q", "phone loses: earlier at", { at: t + 4000 });
-      const tie2 = await phoneM.op("put", "T", "phone", { at: t + 2000 });
+      const q1 = await macM.op("put", "Q", "mac: later at", { at: t + 5000 });
+      // Same at on one key by one author: the larger seq supersedes.
+      const s1 = await macM.op("put", "S", "first", { at: t + 2000 });
+      const s2 = await macM.op("rotate", "S", "second", { at: t + 2000, version: 2 });
+      await mac.as("PUT", "/v1/sync", { ops: [k1, k2, l1, m1, m2, n1, n2, q1, s1, s2] });
+      // The phone writes Q too: another author's op on the key compacts
+      // nothing, either way.
+      const q2 = await phoneM.op("put", "Q", "phone: earlier at", { at: t + 4000 });
       clock.ms += 1000;
-      await phone.as("PUT", "/v1/sync", { ops: [q2, tie2] });
-      const [tieWinner, tieLoser] = mac.id > phone.id ? [tie, tie2] : [tie2, tie];
+      await phone.as("PUT", "/v1/sync", { ops: [q2] });
 
       const compacted = async () => (await pull(mac)).ops.filter((o) => o.compacted).map((o) => [o.author, o.seq]);
       clock.ms = t + 29 * 24 * 60 * 60 * 1000;
       assert.deepEqual(await compacted(), [], "nothing before 30 days");
       clock.ms = t + 31 * 24 * 60 * 60 * 1000;
       const ids = (ops: Row[]) => ops.map((o) => [o.author, o.seq]).sort();
-      assert.deepEqual((await compacted()).sort(), ids([k1, n1, q2, tieLoser]));
+      assert.deepEqual((await compacted()).sort(), ids([k1, n1, s1]));
 
       const { ops } = await pull(phone);
       const kept = ops.filter((o) => !o.compacted);
-      assert.deepEqual(ids(kept), ids([k2, l1, m1, m2, n2, q1, tieWinner]));
-      for (const o of kept) assert.deepEqual(sent(o), sent([k1, k2, l1, m1, m2, n1, n2, q1, tie, q2, tie2].find((x) => x.author === o.author && x.seq === o.seq)!));
+      assert.deepEqual(ids(kept), ids([k2, l1, m1, m2, n2, q1, s2, q2]));
+      for (const o of kept) assert.deepEqual(sent(o), sent([k1, k2, l1, m1, m2, n1, n2, q1, s1, s2, q2].find((x) => x.author === o.author && x.seq === o.seq)!));
       for (const o of ops.filter((x) => x.compacted)) assert.deepEqual([o.sealed, o.wrapped_key], [null, null]);
       await checkOps(ops, [mac, phone]);
 
-      // A member who lost the ring's history still learns the latest of each key.
-      assert.deepEqual(kept.filter((o) => o.kind !== "member.add").map((o) => open(o, macM.ring).value).sort(), ["mac wins: later at", "new", "only", null, tieWinner === tie ? "mac" : "phone"].sort());
+      // A member who lost the ring's history still learns each author's latest of each key.
+      assert.deepEqual(kept.filter((o) => o.kind !== "member.add").map((o) => open(o, macM.ring).value).sort(), ["mac: later at", "new", "only", null, "second", "phone: earlier at"].sort());
     });
 
     test("sync: harar's own ops (test/sync-vectors.json, made by the Rust member) are what docs/edge.md says, and the edge takes them as they are", async () => {

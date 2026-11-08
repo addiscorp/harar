@@ -1,5 +1,5 @@
 {
-  "about": "A ring member's chain, made by server/src/sync (Rust) from fixed keys and IVs. Both harar's tests and the edge's read it: the canonical encoding, hashes, signatures and seals must agree (docs/edge.md §5a, §5b). The ring's subkeys are HKDF-SHA256(salt harar-ring-v1, info harar-ring-name | harar-ring-member | harar-ring-wrap). Test keys only.",
+  "about": "A ring founder's chain, made by server/src/sync (Rust) from fixed keys and IVs: the found entry of the membership log, then a put, a rotate and a delete written under its head. Both harar's tests and the edge's read it: the canonical encoding, hashes, signatures and seals must agree (docs/edge.md §5a, §5b). The ring's subkeys are HKDF-SHA256(salt harar-ring-v1, info harar-ring-name | harar-ring-member | harar-ring-wrap). Test keys only.",
   "device": {
     "agree_d": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI",
     "agree_pub": "BFUPRxAD89-Xw99QaseX9nIfsaH7e49vg9IkSYplyI4kE2CT1wEuUJpzcVy9CwCjzA_0tcAbP_oZarH7MnA2uOY",
@@ -9,83 +9,87 @@
     "sign_d": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
     "sign_pub": "BG_wO5SSQc4drdQ1GeaWDgqFtBppoFwygQOqK84VlMoWPE91OlW_AdxT9sCwx-7ni0DG_30lqW4igrmJzvccFEo"
   },
+  "head": "603ef29ddeec5fe04f3e6004f96a66389c88381b68b1956ee58f747fce19d096",
   "ops": [
     {
-      "canonical": "harar-op-v1\nd-0123456789abcdef\n1\n\nmember.add\nVF0DC1GO4uPf_y1AblJKdzM0GjRbC2qzuSaLxvJeRHQ\n0\n1b90ef73efe34b7906171c3cd3a7e1cfba59d97033109d5dfb913fce1144d4cc\nb9a10d9f2833cc2052a80e4b1da8d4b8b70c19588b1de9efe0b5db419dcc19af\n1762603200000",
-      "hash": "7e9a436689e9dfee8913c52efcc60276fc7471ebb9cbce0ca6ee649f07550bd7",
+      "canonical": "harar-op-v1\nd-0123456789abcdef\n1\n\nmember.add\nDReUkKOuF8AQS_cSOCYv5ZK-BK1kacl593iJ6QolCRA\n0\n16dd41e6e0b8bd765673539d31add3b4786817279b9a2f5c8b2f8555d34d338a\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n1762603200000",
+      "hash": "6f541a035d6624add33da26c87d9d7c46e98dc905b195ba77f19ed03f5c3bfd7",
       "op": {
         "at": 1762603200000,
         "author": "d-0123456789abcdef",
-        "key": "VF0DC1GO4uPf_y1AblJKdzM0GjRbC2qzuSaLxvJeRHQ",
+        "key": "DReUkKOuF8AQS_cSOCYv5ZK-BK1kacl593iJ6QolCRA",
         "kind": "member.add",
         "prev": "",
-        "sealed": "eyJkZXZpY2UiOiJkLTAxMjM0NTY3ODlhYmNkZWYiLCJuYW1lIjoidmVjdG9yIiwic2lnbl9wdWIiOiJCR193TzVTU1FjNGRyZFExR2VhV0RncUZ0QnBwb0Z3eWdRT3FLODRWbE1vV1BFOTFPbFdfQWR4VDlzQ3d4LTduaTBER18zMGxxVzRpZ3JtSnp2Y2NGRW8iLCJhZ3JlZV9wdWIiOiJCRlVQUnhBRDg5LVh3OTlRYXNlWDluSWZzYUg3ZTQ5dmc5SWtTWXBseUk0a0UyQ1Qxd0V1VUpwemNWeTlDd0NqekFfMHRjQWJQX29aYXJIN01uQTJ1T1kiLCJlcG9jaCI6MCwicmVtb3ZhbCI6IiJ9",
+        "sealed": "eyJ0eXBlIjoiZm91bmQiLCJuIjowLCJwcmV2IjoiIiwiZXBvY2giOjAsImlkIjoiQ1lHcThwb1FjdDN6S3NDYlNONnA0cUpoR2xfM1lQXzFreS1ubktHeUluayIsIm1lbWJlciI6eyJkZXZpY2UiOiJkLTAxMjM0NTY3ODlhYmNkZWYiLCJuYW1lIjoidmVjdG9yIiwic2lnbl9wdWIiOiJCR193TzVTU1FjNGRyZFExR2VhV0RncUZ0QnBwb0Z3eWdRT3FLODRWbE1vV1BFOTFPbFdfQWR4VDlzQ3d4LTduaTBER18zMGxxVzRpZ3JtSnp2Y2NGRW8iLCJhZ3JlZV9wdWIiOiJCRlVQUnhBRDg5LVh3OTlRYXNlWDluSWZzYUg3ZTQ5dmc5SWtTWXBseUk0a0UyQ1Qxd0V1VUpwemNWeTlDd0NqekFfMHRjQWJQX29aYXJIN01uQTJ1T1kifSwid3JhcHMiOnsiZC0wMTIzNDU2Nzg5YWJjZGVmIjoiQkZrYXQzSHJ2UDF0bkxrSlRSQmxLSzNScHAxRXdzSDJKX0NKN0ZpNXhocmZuMDVxdncwRVhBeHBPanhvclh5WHluSy1aTjcwb21fczBtUGRtS2tuZ1BEUEMwUzViaXZGWVhoRDBEVzJjUFMyNWNpQzdJb3dpM0xMWWVEUFdzMnNZQVBJbjREZG1FZEtGUS1BaUNrTWpyWEk3MVlvQXduZDZVbUdPQl9jRld1allTcXhubjNzTjN0bG90ZVVEcXp3dTZkS0ROV0hwMkFOVldNIn19",
         "seq": 1,
-        "sig": "Y2pVqjA4dpNCopkZfvsEU9NvwHexF02jWMAnM9nJJpF3V0m4K381Eiby7W7tyBBFA5CKdsDZGXJXXjXvWEyWUw",
+        "sig": "OMDBvT2JFPvPvJbYIG7DQC8hBjgPxEugPh81paqkocZnGVe8R1HOX7vYvTSxdF0z0Ie4B2VvqXsTXS8xouxB5A",
         "version": 0,
-        "wrapped_key": "BFkat3HrvP1tnLkJTRBlKK3Rpp1EwsH2J_CJ7Fi5xhrfn05qvw0EXAxpOjxorXyXynK-ZN70om_s0mPdmKkngPDPC0S5bivFYXhD0DW2cPS25ciC7Iowi3LLYeDPWs2sYAPIn4DdmEdKFQ-AiCkMjrXI71YoAwnd6UmGOB_cFWujYSqxnn3sN3tloteUDqzwu6dKDNWHp2ANVWM"
+        "wrapped_key": ""
       },
       "opens": null
     },
     {
-      "canonical": "harar-op-v1\nd-0123456789abcdef\n2\n7e9a436689e9dfee8913c52efcc60276fc7471ebb9cbce0ca6ee649f07550bd7\nput\nKAM2Wq_n5_s1sH3GxDK_5pp8QjwF_T3V6TSHW-k3MiM\n1\nbdaac78f3d0fe23926c1c089addccc6cff00f93440b63531ff5b902c33a6e778\n18f63911ed8c2644116ba365ae4627acdeec73044d6d7642e4923bf281b56087\n1762603201000",
-      "hash": "f0450de4e462953e18b2644fc79380390e656b089c839e359d5c33bf265557fc",
+      "canonical": "harar-op-v1\nd-0123456789abcdef\n2\n6f541a035d6624add33da26c87d9d7c46e98dc905b195ba77f19ed03f5c3bfd7\nput\nKAM2Wq_n5_s1sH3GxDK_5pp8QjwF_T3V6TSHW-k3MiM\n1\ncc4b3b91592e188511d5d25e6aac3b50a4cacc90e2f1f39c364c5b0ca8c48aee\n18f63911ed8c2644116ba365ae4627acdeec73044d6d7642e4923bf281b56087\n1762603201000",
+      "hash": "76581dcd4f71590a20f58694b188cdbcf3f42306d3b47c5915f2ce8fbab50a92",
       "op": {
         "at": 1762603201000,
         "author": "d-0123456789abcdef",
         "key": "KAM2Wq_n5_s1sH3GxDK_5pp8QjwF_T3V6TSHW-k3MiM",
         "kind": "put",
-        "prev": "7e9a436689e9dfee8913c52efcc60276fc7471ebb9cbce0ca6ee649f07550bd7",
-        "sealed": "BQUFBQUFBQUFBQUFCHJQujmSx8h5G8x0ZT_5hRHxTWEl2HVJleEIaTnQqSn9tTgW7FKn52GjkwESsd-9Ve9D90gkjAN_n0qLhePqn82_eYcf5NZw7OsNnGF2I8J7ew",
+        "prev": "6f541a035d6624add33da26c87d9d7c46e98dc905b195ba77f19ed03f5c3bfd7",
+        "sealed": "BQUFBQUFBQUFBQUFCHJQujmSx8h5G8x0ZT_5hRHxTWEl2HVJleEIaTnQqSn9tTgW7FKn52GjkwESsd-9Ve9D90gkjAN_n0qLhePqn83us6iOiLGk_jr6pz-3-5tWHJr76fYZlw1YXAqlobHJ1Z5lYmWvr7azQ3l4Dy5DZhVK1PgsfawY90jyc2Dbtz-4MYkJqlsvsF9fSY-oOz2RhJQCSP31XcytLNMY",
         "seq": 2,
-        "sig": "ZTcb-xB2m6v4wEslC44z4khH23lSzo27WxUEjOkG0uRAX0hkHMuPvamwNhhTa5G4m4MRTJja5szdDqiRWaQcHw",
+        "sig": "8K1NPcX4bj6I2HZL7cxDUWGp3DqlR14F8TPaorTsh6oscvA31e_3OeaRdQcdPzNyAw2KIQc-tLDZGcndtDSxiA",
         "version": 1,
         "wrapped_key": "Dw8PDw8PDw8PDw8PuJyPLOKR7b90Og14lpWkIyS1_T0I1KRIRcwQpPOmy9Pe__0RqopXVoV7kIwWzi0O"
       },
       "opens": {
         "base": "",
+        "head": "603ef29ddeec5fe04f3e6004f96a66389c88381b68b1956ee58f747fce19d096",
         "path": "prod/shop/STRIPE_KEY",
         "value": "sk_live_vector"
       }
     },
     {
-      "canonical": "harar-op-v1\nd-0123456789abcdef\n3\nf0450de4e462953e18b2644fc79380390e656b089c839e359d5c33bf265557fc\nrotate\nKAM2Wq_n5_s1sH3GxDK_5pp8QjwF_T3V6TSHW-k3MiM\n2\n8918d459ef0319b9b409467c5d123ce69736a303ea3fc652167280792f36da01\n203a8d8fb838ea89e098e9a35933fc8b8a4ae058488ab65587dac3899cd0a6a8\n1762603202000",
-      "hash": "a1b5a072c0787dc61ce43a531b891d6d5550539c41945f94c5d5c4989817429e",
+      "canonical": "harar-op-v1\nd-0123456789abcdef\n3\n76581dcd4f71590a20f58694b188cdbcf3f42306d3b47c5915f2ce8fbab50a92\nrotate\nKAM2Wq_n5_s1sH3GxDK_5pp8QjwF_T3V6TSHW-k3MiM\n2\n357a1b1f257cca9f09ff0e3df54735f6d0fe07ff9284556b2770fc573f937c1e\n203a8d8fb838ea89e098e9a35933fc8b8a4ae058488ab65587dac3899cd0a6a8\n1762603202000",
+      "hash": "e36efa7e127ef98e15d8814fcd48cba4d16da67fb3905253f8fe4e4566603407",
       "op": {
         "at": 1762603202000,
         "author": "d-0123456789abcdef",
         "key": "KAM2Wq_n5_s1sH3GxDK_5pp8QjwF_T3V6TSHW-k3MiM",
         "kind": "rotate",
-        "prev": "f0450de4e462953e18b2644fc79380390e656b089c839e359d5c33bf265557fc",
-        "sealed": "BgYGBgYGBgYGBgYG2Pd4kXQE5UucREQSVolaPBCanXO6AprtjScCJtXE4x4axq6mj0Lbz2s9cvDz_YR5S2-UYFZyTAYHbIALgajkQ7VhvnQ_YUGIa0QfjMs8FylhMGigB32pOUPpE0qgIHmTTxTjIIVPDAbnMTyDGit70yVJVgQp7FEsTnZvPWsaj5IM27PaCdnALZxOTu9CnrWsF-E_",
+        "prev": "76581dcd4f71590a20f58694b188cdbcf3f42306d3b47c5915f2ce8fbab50a92",
+        "sealed": "BgYGBgYGBgYGBgYG2Pd4kXQE5UucREQSVolaPBCanXO6AprtjScCJtXE4x4axq6mj0Lbz2s9cvDz_YR5S2-UYFZyTAYHbIALgajkQ7UwuHUyYEGOOxVNjcgwGyplM2CkAHOrNBHoFUurey3CFUK1cIRLXQbpbGzZHSV91SlBB1d4vAd2TiY4amsf2c1d2-IbXa3Hp3a0p2uWgjqhockHFeD6kGlo8Crflg9EYy7-8L0JUmBHkIoW8QiKpWgiV4eR5YriM5_FazCKAsX9e7OfuHJkHzc7p5P5C79ZiFqgMvCvRfuBU--R2-E",
         "seq": 3,
-        "sig": "7B-PyFWq2a0fWuJkAcoXfvJBoQzNe0HzsHW6gKUWXIyILpP2rS1W5TAjQ_M4b71V1CKD6siIgXr1UWm307eIhA",
+        "sig": "xZLwDT96d8XgSiU1_4SesyC7cfGDrAsxqrJVrqJpIWLz1cL9smvie97I5eELh61Gz1wOsMn7tajiQu_9Wodxrg",
         "version": 2,
         "wrapped_key": "EBAQEBAQEBAQEBAQORX4UQtNyTW84DNepblmQL7DoBQQHcCeYYsakvUeF4_NbC12VxSykjqaKujK5YC6"
       },
       "opens": {
-        "base": "f0450de4e462953e18b2644fc79380390e656b089c839e359d5c33bf265557fc",
+        "base": "76581dcd4f71590a20f58694b188cdbcf3f42306d3b47c5915f2ce8fbab50a92",
+        "head": "603ef29ddeec5fe04f3e6004f96a66389c88381b68b1956ee58f747fce19d096",
         "path": "prod/shop/STRIPE_KEY",
         "value": "sk_live_rotated"
       }
     },
     {
-      "canonical": "harar-op-v1\nd-0123456789abcdef\n4\na1b5a072c0787dc61ce43a531b891d6d5550539c41945f94c5d5c4989817429e\ndelete\nKAM2Wq_n5_s1sH3GxDK_5pp8QjwF_T3V6TSHW-k3MiM\n3\nc749b55d3d1c85fe9a2098b1f400cdbb69c5f237b41f0febc91f99c04101fa1f\n1203bb74c3f1f0bcf954c278df48f89d7687ee709dfa3331b1e198e4bf8d6407\n1762603203000",
-      "hash": "ab2fd9c4c7a924421c7387a3d167421b549cb54ca184c95a9c97968ab0763d78",
+      "canonical": "harar-op-v1\nd-0123456789abcdef\n4\ne36efa7e127ef98e15d8814fcd48cba4d16da67fb3905253f8fe4e4566603407\ndelete\nKAM2Wq_n5_s1sH3GxDK_5pp8QjwF_T3V6TSHW-k3MiM\n3\n829f8c746b9b6867a2902a0a834a5f5b2dcdf8c5e9ddf204a75c12a753d51a54\n1203bb74c3f1f0bcf954c278df48f89d7687ee709dfa3331b1e198e4bf8d6407\n1762603203000",
+      "hash": "6c8fb17f86e3189f4e9931397c61f08af27cd1b791d61cdaa8621ad3d186c72f",
       "op": {
         "at": 1762603203000,
         "author": "d-0123456789abcdef",
         "key": "KAM2Wq_n5_s1sH3GxDK_5pp8QjwF_T3V6TSHW-k3MiM",
         "kind": "delete",
-        "prev": "a1b5a072c0787dc61ce43a531b891d6d5550539c41945f94c5d5c4989817429e",
-        "sealed": "BwcHBwcHBwcHBwcHtbk6XnKOnV9umfNVW_bVHCPVqEOtLC0xK95eutDKPfyK07qSN_P6XNLSqd5yeG7B8EMSL0rG4iu_NVtExabta-QzGUFEpu14PPO8qvfcxTrpXDYLPyJALZnz0VNXinds44R9Ao_N40sDEvljRErh1-AbDxn08LGliDnMLb7X0A9p4y2Ow-M",
+        "prev": "e36efa7e127ef98e15d8814fcd48cba4d16da67fb3905253f8fe4e4566603407",
+        "sealed": "BwcHBwcHBwcHBwcHtbk6XnKOnV9umfNVW_bVHCPVqEOtLC0xK95eutDKPfyK07qSN_P6XNLSqd5yeG7B8EMSL07Etnu4ZFsTl6TtNrVuQhJE8Ox0N6O9_6XayTu7WmFbbiZDec3231YBiHdo49BxBYrA4RtUQ_RuS0Tm0OcdBkv0ocd6ZgJfj48akk0wxG_UexxVQ7LUMalVUUs2vwiKUWOSpsL85O7JHzYPMUdzQdk_mHgpdajWPx9a9k6KGd-fK__aVlI3a0TV-XlXpCFJgOEBdmZZWuiPNV7Qpg",
         "seq": 4,
-        "sig": "U8gMVJCcmdwxAGT8zCeKa5QeZs_Tlr2-6EWGu4pUhwewKI6JlXOxYzxZ3kEoPS6lrxbPumAP-P01pClPTzVUmQ",
+        "sig": "90miVym0618Ls4zGUVjOvtIy7jK2ENou0wo-W-i4wJJ_9E8Fy9kU7tCZeuvxmOREkEQivJE4BPwvv_muQp_Jiw",
         "version": 3,
         "wrapped_key": "ERERERERERERERERj1pmVNhbnYpMkoBz1lNwAfaV8JwErlmdrgvl7RiYXd_nyTZp2NUIWXUOFHlSvvhq"
       },
       "opens": {
-        "base": "a1b5a072c0787dc61ce43a531b891d6d5550539c41945f94c5d5c4989817429e",
+        "base": "e36efa7e127ef98e15d8814fcd48cba4d16da67fb3905253f8fe4e4566603407",
+        "head": "603ef29ddeec5fe04f3e6004f96a66389c88381b68b1956ee58f747fce19d096",
         "path": "prod/shop/STRIPE_KEY",
         "value": null
       }

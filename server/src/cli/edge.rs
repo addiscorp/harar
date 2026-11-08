@@ -98,6 +98,16 @@ enum SyncCmd {
     /// Add a device that asked to join: the ring key, wrapped to its key.
     /// Refused unless the fingerprint is the one `status` shows on it.
     Approve(SyncApprove),
+    /// Make another member the ring's authority (only the authority can).
+    Transfer(SyncTransfer),
+}
+
+#[derive(Debug, Args)]
+struct SyncTransfer {
+    /// The member's device id (d-…), from `harar edge sync status`.
+    device: String,
+    #[command(flatten)]
+    agent: AgentArg,
 }
 
 #[derive(Debug, Args)]
@@ -301,6 +311,7 @@ fn run_blocking(cmd: Edge) -> Result<()> {
                 SyncCmd::Now(a) => (a.socket, SyncCommand::Now),
                 SyncCmd::Trust(c) => (c.agent.socket, SyncCommand::Trust { fingerprint: c.fingerprint }),
                 SyncCmd::Approve(c) => (c.agent.socket, SyncCommand::Approve { device: c.device, fingerprint: c.fingerprint }),
+                SyncCmd::Transfer(c) => (c.agent.socket, SyncCommand::Transfer { device: c.device }),
             };
             super::agent::send(&socket, &AgentRequest::Sync(command))
         }
@@ -330,16 +341,16 @@ fn ring_participant(edge: &Paired, device: &str) -> Result<bool> {
 fn unpair(cmd: Unpair) -> Result<()> {
     use crate::agent::{AgentRequest, SyncCommand};
     let edge = Paired::find(&cmd.target)?;
-    // With sync on, the agent removes the device from the ring and rekeys; a
-    // machine that syncs but isn't a member yet can't, and is treated as one
-    // that doesn't sync.
+    // With sync on, the agent (on the ring's authority) removes the device
+    // from the ring with a new epoch key. Anywhere else the agent can't, and
+    // this machine is treated as one that doesn't sync.
     let removed = if edge.sync.as_ref().is_some_and(|s| s.on) && cmd.device != edge.device {
         let answer = super::agent::ask(&cmd.agent.socket, &AgentRequest::Sync(SyncCommand::Remove { device: cmd.device.clone() }))
             .context("this vault syncs through the edge, so the agent removes the device from the ring first")?;
         let error = answer["error"].as_str().unwrap_or("no reason given").to_owned();
         match answer["ok"] == Value::Bool(true) {
             true => Some(answer),
-            false if error.contains("isn't a member of the ring") => None,
+            false if error.contains("only the ring's authority") || error.contains("isn't a member of the ring") => None,
             false => bail!("the agent didn't remove {} from the ring, so it stays paired: {error}", cmd.device),
         }
     } else {
@@ -351,7 +362,7 @@ fn unpair(cmd: Unpair) -> Result<()> {
         if cmd.device != edge.device && ring_participant(&edge, &cmd.device)? {
             if !cmd.force_no_rekey {
                 bail!(
-                    "{} has ops in the ring this edge syncs, and this machine isn't a syncing member of it, so it can't remove the device from the ring or rekey. Unpair it from a machine that does (harar edge sync status there says member), so it reads nothing written after; or pass --force-no-rekey to unpair it here and leave it the ring key",
+                    "{} has ops in the ring this edge syncs, and this machine isn't the ring's authority, so it can't remove the device from the ring or rekey. Unpair it from the authority (harar edge sync status shows which device), so it reads nothing written after; or pass --force-no-rekey to unpair it here and leave it the ring key",
                     cmd.device
                 );
             }

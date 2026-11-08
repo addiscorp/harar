@@ -77,7 +77,7 @@ first=e2e-first-value-plaintext
 member a
 as a edge pair "$url" --dir "$work/edge" --file-key --name a >/dev/null
 on="$(sync_ a on)"
-expect "$on" role member
+expect "$on" role authority
 a_id="$(field "$on" device)"
 expect "$on" founder "$a_id"
 put a "$path" "$first"
@@ -154,12 +154,17 @@ for m in a b; do
 done
 echo "ok  the edge's database and the members' sync state hold no path and no value"
 
-# A machine that doesn't sync can't unpair a ring member: it couldn't rekey.
-sync_ b off >/dev/null
-if out="$(as b edge unpair "$a_id" --socket "$work/b/s" 2>&1)"; then echo "a machine with sync off unpaired a ring member: $out"; exit 1; fi
-case "$out" in *"isn't a syncing member"*) ;; *) echo "unpair refused for the wrong reason: $out"; exit 1 ;; esac
+# Only the authority changes membership: B (a member) can't approve or
+# unpair a ring member, syncing or not.
+if out="$(sync_ b approve "$a_id" "$b_fp" 2>&1)"; then echo "a member that isn't the authority approved: $out"; exit 1; fi
+case "$out" in *"only the ring's authority"*) ;; *) echo "approve refused for the wrong reason: $out"; exit 1 ;; esac
+for state in on off; do
+  [ "$state" = off ] && sync_ b off >/dev/null
+  if out="$(as b edge unpair "$a_id" --socket "$work/b/s" 2>&1)"; then echo "a machine that isn't the authority unpaired a ring member: $out"; exit 1; fi
+  case "$out" in *"isn't the ring's authority"*) ;; *) echo "unpair refused for the wrong reason: $out"; exit 1 ;; esac
+done
 expect "$(sync_ b on)" role member
-echo "ok  a machine that doesn't sync refuses to unpair a ring member"
+echo "ok  only the authority approves or unpairs a ring member"
 
 # Unpairing B removes it from the ring and rekeys; A writes on with the new key.
 unpaired="$(as a edge unpair "$b_id" --socket "$work/a/s")"

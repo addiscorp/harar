@@ -189,54 +189,87 @@ pub(crate) struct Rank {
 // ------------------------------------------------------------------ inside
 
 /// Inside a put, rotate or delete's `sealed`: the path, the value (none for
-/// a delete) and the hash of the op this write replaced on its author's
-/// vault ("" for none), which tells a successor from a concurrent write.
+/// a delete), the hash of the op this write replaced on its author's vault
+/// ("" for none), which tells a successor from a concurrent write, and the
+/// head of the membership log it was written under.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ValueBody {
     pub path: String,
     pub value: Option<String>,
     #[serde(default)]
     pub base: String,
+    #[serde(default)]
+    pub head: String,
 }
 
-/// Inside a member.add's `sealed` (plain JSON, base64url: a member's public
-/// keys aren't secret). By the device itself with no `wrapped_key`, it asks
-/// to join; by a member, with the ring key wrapped to `agree_pub`, it adds
-/// the device, and a device adding itself so is the ring's founder.
+/// A device and its two public keys (raw P-256, base64url).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct MemberBody {
+pub(crate) struct MemberKeys {
     pub device: String,
     pub name: String,
-    /// The device's signing key (its pairing key), raw P-256, base64url.
+    /// Its signing key (its pairing key).
     pub sign_pub: String,
-    /// Its key-agreement key, raw P-256, base64url.
+    /// Its key-agreement key.
     pub agree_pub: String,
-    /// The ring key's epoch the wrap holds (0 in a request).
-    pub epoch: u32,
-    /// In a grant: the hash of the newest member.remove the granter knew
-    /// ("" for none), so the joiner can tell when its granter's view was
-    /// behind its own.
-    #[serde(default)]
-    pub removal: String,
 }
 
-/// Inside a member.remove: the device, and its last op that still counts.
+/// A removed device, and the newest of its ops that still counts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct RemoveBody {
+pub(crate) struct Removed {
     pub device: String,
     pub after: u64,
 }
 
-/// Inside a rekey: the new epoch, and its ring key wrapped (ECIES) to each
-/// member that remains. The op's `wrapped_key` is the previous ring key
-/// sealed under the new one, so a member who has the newest key has them all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum EntryType {
+    Found,
+    Add,
+    Remove,
+    Transfer,
+}
+
+/// An entry of the membership log (docs/edge.md §5b), the plain JSON
+/// (base64url) of a `member.add` (found, add, transfer) or `rekey` (remove)
+/// op's `sealed`. Only the authority writes one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct RekeyBody {
+pub(crate) struct Entry {
+    #[serde(rename = "type")]
+    pub what: EntryType,
+    /// Its place in the log.
+    pub n: u64,
+    /// The head of entry n - 1 ("" for found).
+    pub prev: String,
+    /// The epoch after this entry, and its key's id (`ring_id`).
     pub epoch: u32,
-    /// The new key's id: a MAC under it (`ring_id`). It names the key the
-    /// same way however the op is re-signed, and only a holder can check it.
     pub id: String,
+    /// found and add: the device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<MemberKeys>,
+    /// remove: the devices removed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed: Vec<Removed>,
+    /// transfer: the device that is authority from here on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<String>,
+    /// The epoch's key, wrapped to each device that gets it here.
+    #[serde(default)]
     pub wraps: BTreeMap<String, String>,
+}
+
+/// A device's request to join: its own `member.add` of this. It certifies
+/// nothing; it only lists the device, for the authority to approve.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Request {
+    #[serde(rename = "type")]
+    pub what: RequestType,
+    pub member: MemberKeys,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum RequestType {
+    Request,
 }
 
 pub(crate) fn plain_body<T: Serialize>(body: &T) -> String {
@@ -247,20 +280,14 @@ pub(crate) fn read_plain_body<T: for<'de> Deserialize<'de>>(sealed: &str) -> Res
     serde_json::from_slice(&unb64(sealed)?).context("an op body")
 }
 
-/// The texts a member op's `key` is the ring MAC of: the author and every
-/// field of the body that matters, so a MAC is never good for another op.
-/// They start with the vault's reserved `harar:`, which no synced path has,
-/// so none of these is ever a secret's key.
-pub(crate) fn add_mac_text(author: &str, body: &MemberBody) -> String {
-    format!("harar:member|add|{author}|{}|{}|{}|{}", body.device, body.epoch, body.sign_pub, body.agree_pub)
+/// A log entry's head: the hash of its `sealed` text, whatever op carries it.
+pub(crate) fn head_of(sealed: &str) -> String {
+    sha256_hex(format!("harar-log-v1\n{sealed}"))
 }
 
-pub(crate) fn remove_mac_text(author: &str, device: &str, after: u64) -> String {
-    format!("harar:member|remove|{author}|{device}|{after}")
-}
-
-pub(crate) fn rekey_mac_text(author: &str, epoch: u32, id: &str) -> String {
-    format!("harar:member|rekey|{author}|{epoch}|{id}")
+/// A log entry op's `key`: opaque, from its head.
+pub(crate) fn entry_key(head: &str) -> String {
+    b64(sha2::Digest::finalize(<sha2::Sha256 as sha2::Digest>::new_with_prefix(format!("harar:log|{head}"))))
 }
 
 /// What a ring key's id is the MAC of, under that key.
@@ -268,7 +295,7 @@ pub(crate) fn ring_id_text(epoch: u32) -> String {
     format!("harar:member|ring-id|{epoch}")
 }
 
-/// A join request's `key`: there is no ring key to MAC with yet.
+/// A join request's `key`.
 pub(crate) fn request_key(device: &str) -> String {
     b64(sha2::Digest::finalize(<sha2::Sha256 as sha2::Digest>::new_with_prefix(format!("harar:member|request|{device}"))))
 }

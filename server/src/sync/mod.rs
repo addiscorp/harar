@@ -7,10 +7,6 @@ pub(crate) mod ledger;
 pub(crate) mod member;
 pub(crate) mod op;
 #[cfg(test)]
-mod review2_tests;
-#[cfg(test)]
-mod round3_tests;
-#[cfg(test)]
-mod review_tests;
+mod attacks;
 #[cfg(test)]
 mod tests;

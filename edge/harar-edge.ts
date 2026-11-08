@@ -137,7 +137,7 @@ const REFERENCE_PREFIX = "harar://";
 const MAX_OPS = 100;
 const MAX_SEALED = 48 * 1024;
 const MAX_WRAPPED = 1024;
-const MAX_SINCE = 100;
+const MAX_SINCE = 1000;
 const SYNC_PAGE = 100;
 const SYNC_PAGE_BYTES = 1024 * 1024;
 const HISTORY_MS = 30 * 24 * 60 * 60 * 1000;
@@ -527,10 +527,12 @@ export function edge(config: Config): { fetch(request: Request): Promise<Respons
   // ---------------------------------------------------------- sync
 
   /** Compaction (docs/edge.md §5a): a put, rotate or delete op stored more
-   *  than 30 days ago that a later op on its key supersedes (by at, then
-   *  author id, then seq) loses its ciphertext. Its header, signature and
-   *  hash stay, so every author's chain still verifies from its first op.
-   *  The latest op on a key is never superseded, and member.* and rekey ops
+   *  than 30 days ago that a later put, rotate or delete on its key by the
+   *  same author supersedes (by at, then seq) loses its ciphertext. Only an
+   *  author supersedes its own ops: the edge can't tell members from other
+   *  paired devices, so a device that copies a key never makes a member's
+   *  latest value go. Its header, signature and hash stay, so every
+   *  author's chain still links from its first op. member.* and rekey ops
    *  are never touched. At most COMPACT_BATCH ops per call; it runs on every
    *  sync request, so there is no schedule to pay for. */
   async function compact(): Promise<void> {
@@ -539,8 +541,8 @@ export function edge(config: Config): { fetch(request: Request): Promise<Respons
          SELECT o.hash FROM harar_ops o
          WHERE o.batch IS NULL AND o.sealed IS NOT NULL AND o.kind IN ('put', 'rotate', 'delete') AND o.stored_at < ?
            AND EXISTS (SELECT 1 FROM harar_ops n
-             WHERE n.key = o.key AND n.batch IS NULL
-               AND (n.at > o.at OR (n.at = o.at AND (n.author > o.author OR (n.author = o.author AND n.seq > o.seq)))))
+             WHERE n.key = o.key AND n.author = o.author AND n.batch IS NULL AND n.kind IN ('put', 'rotate', 'delete')
+               AND (n.at > o.at OR (n.at = o.at AND n.seq > o.seq)))
          ORDER BY o.stored_at LIMIT ${COMPACT_BATCH})`,
       [iso(now() - HISTORY_MS)],
     );
@@ -979,31 +981,40 @@ export function edge(config: Config): { fetch(request: Request): Promise<Respons
         resource: "",
         act: async () => {
           await compact();
-          const authors = await sql.query(`SELECT DISTINCT author FROM harar_ops WHERE batch IS NULL ORDER BY author`);
+          // The authors with ops after their cursor; each gets an equal share
+          // of the page, so one author with many ops never starves the rest.
+          const tips = await sql.query(`SELECT author, MAX(seq) AS seq FROM harar_ops WHERE batch IS NULL GROUP BY author ORDER BY author`);
+          const last = new Map(tips.map((t) => [String(t.author), Number(t.seq)]));
           const ops: ReturnType<typeof served>[] = [];
           const next: Record<string, number> = Object.fromEntries(from);
+          const at = (a: string) => next[a] ?? 0;
+          let behind = [...last.keys()].filter((a) => last.get(a)! > at(a));
           let bytes = 0;
-          let more = false;
-          // Per author, in seq order: an author's ops become visible only in
-          // order, so a cursor of each author's last seq never skips one.
-          outer: for (const { author } of authors) {
-            const a = String(author);
-            const rows = await sql.query(
-              `SELECT author, seq, prev, kind, key, version, sealed, wrapped_key, sealed_sha256, wrapped_key_sha256, at, sig, hash
-               FROM harar_ops WHERE author = ? AND seq > ? AND batch IS NULL ORDER BY seq LIMIT ?`,
-              [a, from.get(a) ?? 0, SYNC_PAGE - ops.length + 1],
-            );
-            for (const row of rows) {
-              if (ops.length >= SYNC_PAGE || bytes >= SYNC_PAGE_BYTES) {
-                more = true;
-                break outer;
+          // In passes, each author still behind gets an equal share of the
+          // room left, so one author with many ops never starves the rest and
+          // no room is left unused. Each author's ops go in seq order: they
+          // become visible only in order, so a cursor never skips one.
+          while (behind.length > 0 && ops.length < SYNC_PAGE && bytes < SYNC_PAGE_BYTES) {
+            const share = Math.max(1, Math.ceil((SYNC_PAGE - ops.length) / behind.length));
+            for (const a of behind) {
+              const room = Math.min(share, SYNC_PAGE - ops.length);
+              if (room <= 0 || bytes >= SYNC_PAGE_BYTES) break;
+              const rows = await sql.query(
+                `SELECT author, seq, prev, kind, key, version, sealed, wrapped_key, sealed_sha256, wrapped_key_sha256, at, sig, hash
+                 FROM harar_ops WHERE author = ? AND seq > ? AND batch IS NULL ORDER BY seq LIMIT ?`,
+                [a, at(a), room],
+              );
+              for (const row of rows) {
+                if (bytes >= SYNC_PAGE_BYTES) break;
+                const op = served(row);
+                ops.push(op);
+                bytes += (op.sealed?.length ?? 0) + (op.wrapped_key?.length ?? 0);
+                next[a] = op.seq;
               }
-              const op = served(row);
-              ops.push(op);
-              bytes += (op.sealed?.length ?? 0) + (op.wrapped_key?.length ?? 0);
-              next[a] = op.seq;
             }
+            behind = behind.filter((a) => last.get(a)! > at(a));
           }
+          const more = behind.length > 0;
           return { status: 200, body: { ops, next, more } };
         },
       };

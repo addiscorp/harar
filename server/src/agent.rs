@@ -57,6 +57,7 @@ pub(crate) enum SyncCommand {
     Now,
     Trust { fingerprint: String },
     Approve { device: String, fingerprint: String },
+    Transfer { device: String },
     Remove { device: String },
 }
 
@@ -368,10 +369,16 @@ impl Vault {
             let _ = forget_hosts(&mut next, path);
         }
         // The ops first: a vault saved without them would never send them.
+        // The waiting ops it applied go only once the vault is saved, so a
+        // crash between the two loses nothing (applying again is harmless).
         member.save()?;
         if next != unlocked.keys {
             write_encrypted_keys(&self.state_path, &unlocked.identity.to_public(), &next)?;
             unlocked.keys = next;
+        }
+        if !stepped.applied.is_empty() {
+            member.applied(&stepped.applied);
+            member.save()?;
         }
         Ok(member.state.outbox.len() > queued)
     }
@@ -640,7 +647,7 @@ pub(crate) fn sync_cycle(vault: &Mutex<Vault>) -> Result<serde_json::Value> {
     let (edge, since) = {
         let v = lock_vault(vault);
         let Some(member) = v.sync.as_ref() else { return Ok(serde_json::json!({ "on": false })) };
-        (member.edge.clone(), member.state.next.clone())
+        (member.edge.clone(), member.since())
     };
     // The network and every signature happen outside the vault's lock.
     let device = edge.key()?;
@@ -681,7 +688,7 @@ pub(crate) fn sync_cycle(vault: &Mutex<Vault>) -> Result<serde_json::Value> {
     let mut v = lock_vault(vault);
     // There was more to pull than one sync takes: another follows, but only
     // if this one moved the cursor on, and later each time it repeats.
-    let advanced = v.sync.as_ref().is_some_and(|m| m.state.next != since);
+    let advanced = v.sync.as_ref().is_some_and(|m| m.since() != since);
     v.more_streak = if more && advanced { v.more_streak.saturating_add(1) } else { 0 };
     if v.more_streak > 0
         && let Some(wake) = v.wake.clone()
@@ -811,6 +818,18 @@ fn run_sync(vault: &Mutex<Vault>, command: SyncCommand) -> Result<serde_json::Va
             };
             sync_cycle(vault)?;
             Ok(approved)
+        }
+        SyncCommand::Transfer { device } => {
+            sync_cycle(vault)?;
+            let moved = {
+                let mut v = lock_vault(vault);
+                let member = v.sync.as_mut().ok_or_else(|| anyhow!("sync is off; harar edge sync on first"))?;
+                let moved = member.transfer(&device)?;
+                member.save()?;
+                moved
+            };
+            sync_cycle(vault)?;
+            Ok(moved)
         }
         SyncCommand::Remove { device } => {
             sync_cycle(vault)?;
