@@ -291,6 +291,14 @@ use a synced passkey: the person's choice for now.
 
 Your Mac keeps its encrypted vault file. The primary stores everything in Postgres.
 
+The per-user agent (`harar agent`) keeps its vault, `vault.age`, in the state
+folder: `~/Library/Application Support/harar` on a Mac, `~/.local/state/harar`
+on Linux. Its sockets (`agent.sock`, `ssh.sock`) are beside it on a Mac and in
+`$XDG_RUNTIME_DIR/harar` on Linux, a tmpfs emptied at logout, which is why the
+vault is never kept there. An agent that finds a vault an older harar left in
+`$XDG_RUNTIME_DIR/harar` moves it to the state folder when it starts, and
+refuses to start, touching neither, if both folders hold one.
+
 **The key ladder:**
 
 1. Hardware key: inside the TPM or Secure Enclave, never readable. Unseals 2.

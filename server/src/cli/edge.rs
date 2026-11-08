@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use super::print_json;
 use super::secret_input::SecretInput;
+use crate::common::{ensure_state_dir, ensure_state_subdir, state_dir};
 
 mod files {
     include!(concat!(env!("OUT_DIR"), "/edge_files.rs"));
@@ -504,18 +505,6 @@ struct EdgesFile {
     edges: Vec<Paired>,
 }
 
-/// Where this machine keeps its edges and their device keys: state that must
-/// outlive a reboot. The agent's folder on macOS (Application Support); on
-/// Linux `~/.local/state/harar`, never the agent's `$XDG_RUNTIME_DIR`, which
-/// is emptied at logout.
-fn state_dir() -> PathBuf {
-    if cfg!(target_os = "macos") {
-        return harar::agent_dir();
-    }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
-    home.join(".local/state/harar")
-}
-
 fn edges_path() -> PathBuf {
     state_dir().join("edges.json")
 }
@@ -529,8 +518,8 @@ fn read_edges() -> Result<EdgesFile> {
 }
 
 fn write_edges(file: &EdgesFile) -> Result<()> {
+    ensure_state_dir()?;
     let path = edges_path();
-    fs::create_dir_all(path.parent().expect("a parent folder"))?;
     let part = path.with_extension("json.part");
     let mut out = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&part)?;
     out.write_all(serde_json::to_string_pretty(file)?.as_bytes())?;
@@ -638,7 +627,7 @@ fn new_key(url: &str, file_key: bool) -> Result<(DeviceKey, StoredKey)> {
     }
     let _ = file_key;
     let key = SigningKey::random(&mut OsRng);
-    let path = state_dir().join("edge-keys").join(format!("{}.p256", &hex(&Sha256::digest(url.as_bytes()))[..16]));
+    let path = ensure_state_subdir("edge-keys")?.join(format!("{}.p256", &hex(&Sha256::digest(url.as_bytes()))[..16]));
     let secret = zeroize::Zeroizing::new(STANDARD.encode(key.to_bytes()));
     if path.exists() {
         fs::remove_file(&path).with_context(|| format!("replace the unused key {}", path.display()))?;

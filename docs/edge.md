@@ -87,7 +87,8 @@ This machine is a device of the edges it pairs with. Its key is in the Secure
 Enclave on a Mac, so each signed request asks for Touch ID; elsewhere, or with
 `--file-key`, it's a 0600 file. Paired edges are listed in `edges.json`:
 in `~/Library/Application Support/harar` on a Mac, `~/.local/state/harar`
-on Linux (state that must outlive a reboot, so never `$XDG_RUNTIME_DIR`).
+on Linux (state that must outlive a reboot, so never `$XDG_RUNTIME_DIR`): the
+state folder, where the agent keeps its vault too.
 
 | Command | Does |
 |---|---|

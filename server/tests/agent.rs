@@ -303,3 +303,224 @@ fn openssh_lists_and_signs_with_a_vault_key_like_git_does() {
     assert!(verified.status.success(), "{}", String::from_utf8_lossy(&verified.stderr));
     assert!(String::from_utf8_lossy(&verified.stdout).contains("Good \"git\" signature for sami@imac"));
 }
+
+/// `harar agent` as a person runs it: no --socket or --state, so every path is
+/// the default one, in `<dir>/home` and, on Linux, `<dir>/run` for
+/// `$XDG_RUNTIME_DIR`.
+fn harar_as_user(dir: &Path) -> Command {
+    let mut command = harar();
+    command.env("HOME", dir.join("home")).env("XDG_RUNTIME_DIR", dir.join("run"));
+    command
+}
+
+fn default_of(help: &str, flag: &str) -> PathBuf {
+    let after = &help[help.find(flag).unwrap_or_else(|| panic!("{flag} in:\n{help}"))..];
+    let start = after.find("[default: ").unwrap() + "[default: ".len();
+    // clap quotes a default with a space in it (Application Support).
+    PathBuf::from(after[start..start + after[start..].find(']').unwrap()].trim_matches('"'))
+}
+
+#[test]
+fn the_vault_is_never_kept_in_xdg_runtime_dir() {
+    let dir = tempfile::Builder::new().prefix("ha").tempdir().unwrap();
+    let help = harar_as_user(dir.path()).args(["agent", "--help"]).output().unwrap();
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).unwrap();
+    let vault = default_of(&help, "--state");
+    assert!(vault.starts_with(dir.path().join("home")), "{}", vault.display());
+    assert!(!vault.starts_with(dir.path().join("run")), "the vault would be emptied at logout: {}", vault.display());
+    if cfg!(target_os = "linux") {
+        assert_eq!(vault, dir.path().join("home/.local/state/harar/vault.age"));
+        assert_eq!(default_of(&help, "--socket"), dir.path().join("run/harar/agent.sock"), "sockets stay in the runtime folder");
+        assert_eq!(default_of(&help, "--ssh-socket"), dir.path().join("run/harar/ssh.sock"));
+    }
+    if cfg!(target_os = "macos") {
+        assert_eq!(vault, dir.path().join("home/Library/Application Support/harar/vault.age"), "nothing moves on a Mac");
+    }
+}
+
+/// Starts `harar agent` with only --key, waits for its socket, and returns it.
+#[cfg(target_os = "linux")]
+fn start_default_agent(dir: &Path, key: &Path) -> Child {
+    let socket = dir.join("run/harar/agent.sock");
+    let child = harar_as_user(dir)
+        .arg("agent")
+        .arg("--key")
+        .arg(key)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn harar agent");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::os::unix::net::UnixStream::connect(&socket).is_err() {
+        assert!(Instant::now() < deadline, "agent did not listen on {}", socket.display());
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    // The socket takes connections from the moment it is bound, before the
+    // vault is moved; an answer means the agent is past that.
+    json(&run(&["status"], &socket, None));
+    child
+}
+
+#[cfg(target_os = "linux")]
+fn stop(mut child: Child) -> String {
+    use std::io::Read;
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let mut stderr = String::new();
+    child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+    stderr
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_older_agents_vault_moves_out_of_the_runtime_folder_and_still_opens() {
+    let dir = tempfile::Builder::new().prefix("ha").tempdir().unwrap();
+    let key = dir.path().join("master.key");
+    fs::write(&key, age::x25519::Identity::generate().to_string().expose_secret()).unwrap();
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o400)).unwrap();
+    let old = dir.path().join("run/harar/vault.age");
+    let socket = dir.path().join("run/harar/agent.sock");
+
+    // An agent that keeps its vault where an older harar did:
+    // $XDG_RUNTIME_DIR/harar/vault.age, written 0600.
+    let older = harar_as_user(dir.path())
+        .arg("agent")
+        .arg("--state")
+        .arg(&old)
+        .arg("--key")
+        .arg(&key)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::os::unix::net::UnixStream::connect(&socket).is_err() {
+        assert!(Instant::now() < deadline, "agent did not listen on {}", socket.display());
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    json(&run(&["put", "dev/neon/url", "--secret-stdin"], &socket, Some("postgres://kept-across-the-move\n")));
+    let older_said = stop(older);
+    assert!(!older_said.contains("moved the vault"), "a vault named with --state is never moved: {older_said}");
+    let sealed = fs::read(&old).unwrap();
+    assert_eq!(fs::metadata(&old).unwrap().permissions().mode() & 0o777, 0o600);
+
+    // This harar, started the way a person starts it.
+    let agent = start_default_agent(dir.path(), &key);
+    let state = dir.path().join("home/.local/state/harar/vault.age");
+    assert_eq!(fs::read(&state).unwrap(), sealed, "the same bytes, in the state folder");
+    assert_eq!(fs::metadata(&state).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(fs::metadata(state.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+    assert!(!old.exists(), "nothing left in the runtime folder");
+    let got = json(&run(&["get", "dev/neon/url"], &socket, None));
+    assert_eq!(got["value"], "postgres://kept-across-the-move");
+    let said = stop(agent);
+    assert_eq!(
+        said.lines().filter(|line| line.contains("moved the vault")).collect::<Vec<_>>(),
+        [format!("harar agent moved the vault from {} to {}", old.display(), state.display())],
+        "one line says so: {said}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_agent_with_a_vault_in_both_places_refuses_to_start_and_touches_neither() {
+    let dir = tempfile::Builder::new().prefix("ha").tempdir().unwrap();
+    let key = dir.path().join("master.key");
+    fs::write(&key, age::x25519::Identity::generate().to_string().expose_secret()).unwrap();
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o400)).unwrap();
+    let old = dir.path().join("run/harar/vault.age");
+    let state = dir.path().join("home/.local/state/harar/vault.age");
+    for (path, bytes) in [(&old, "the older vault"), (&state, "the newer vault")] {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let mut child = harar_as_user(dir.path())
+        .arg("agent")
+        .arg("--key")
+        .arg(&key)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() > deadline {
+            let said = stop(child);
+            panic!("the agent started with a vault in both places: {said}");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains(&old.display().to_string()) && stderr.contains(&state.display().to_string()), "names both: {stderr}");
+    assert_eq!(fs::read_to_string(&old).unwrap(), "the older vault");
+    assert_eq!(fs::read_to_string(&state).unwrap(), "the newer vault");
+}
+
+/// Where `harar_as_user(dir)` keeps its state.
+fn state_folder(dir: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        dir.join("home/Library/Application Support/harar")
+    } else {
+        dir.join("home/.local/state/harar")
+    }
+}
+
+fn mode_of(path: &Path) -> u32 {
+    fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+#[test]
+fn harar_edge_keeps_the_state_folder_private_whoever_made_it() {
+    // A port nothing listens on: the pair fails after the device key is made.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    for made_loose_before in [false, true] {
+        let dir = tempfile::Builder::new().prefix("ha").tempdir().unwrap();
+        let state = state_folder(dir.path());
+        let up = state.parent().unwrap().to_path_buf();
+        if made_loose_before {
+            // As an older `harar edge` left it: 0755, in a 0755 parent.
+            fs::create_dir_all(&state).unwrap();
+            fs::set_permissions(&up, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut pair = harar_as_user(dir.path())
+            .args(["edge", "pair", &format!("http://127.0.0.1:{closed}"), "--file-key", "--name", "t", "--secret-stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        pair.stdin.take().unwrap().write_all(b"ABCD-EFGH\n").unwrap();
+        let pair = pair.wait_with_output().unwrap();
+        assert!(!pair.status.success(), "nothing listens on {closed}");
+
+        assert_eq!(mode_of(&state), 0o700, "the state folder (made loose before: {made_loose_before})");
+        assert_eq!(mode_of(&state.join("edge-keys")), 0o700, "edge-keys (made loose before: {made_loose_before})");
+        if made_loose_before {
+            assert_eq!(mode_of(&up), 0o755, "a parent of the state folder is never changed");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_agent_makes_a_state_folder_harar_edge_left_open_private() {
+    let dir = tempfile::Builder::new().prefix("ha").tempdir().unwrap();
+    let key = dir.path().join("master.key");
+    fs::write(&key, age::x25519::Identity::generate().to_string().expose_secret()).unwrap();
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o400)).unwrap();
+    let state = state_folder(dir.path());
+    fs::create_dir_all(&state).unwrap();
+    fs::set_permissions(state.parent().unwrap(), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let agent = start_default_agent(dir.path(), &key);
+    assert_eq!(mode_of(&state), 0o700);
+    assert_eq!(mode_of(state.parent().unwrap()), 0o755, "never a parent");
+    stop(agent);
+}
