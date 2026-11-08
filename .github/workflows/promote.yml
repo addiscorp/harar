@@ -5,8 +5,8 @@
 # Checks the canary's release.json names the tagged commit, copies
 # <canary>/ to <X.Y.Z>/ in harar-releases, rewrites that release.json for the
 # stable channel, points latest.json at it, tags vX.Y.Z on the canary's commit
-# and makes the GitHub release. A version is promoted once; the next needs a
-# bump (scripts/bump-version.sh).
+# (and go/vX.Y.Z, the Go module's tag for go/) and makes the GitHub release.
+# A version is promoted once; the next needs a bump (scripts/bump-version.sh).
 name: Promote
 
 on:
@@ -101,7 +101,7 @@ jobs:
           aws s3 sync "stable/${V}/" "s3://${R2_BUCKET_RELEASES}/${V}/" --endpoint-url="${R2_ENDPOINT}"
           aws s3 cp "stable/${V}/release.json" "s3://${R2_BUCKET_RELEASES}/latest.json" \
             --endpoint-url="${R2_ENDPOINT}" --cache-control "no-cache"
-      - name: Tag vX.Y.Z and make the GitHub release
+      - name: Tag vX.Y.Z (and go/vX.Y.Z for the Go module) and make the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -110,7 +110,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "v${V}" "${{ steps.validate.outputs.commit }}" -m "harar ${V} (promoted from ${{ steps.validate.outputs.canary }})"
-          git push origin "v${V}"
+          # The Go client lives in go/, so Go takes its versions from go/ tags.
+          git tag -a "go/v${V}" "${{ steps.validate.outputs.commit }}" -m "harar's Go client ${V}"
+          git push origin "v${V}" "go/v${V}"
           gh release create "v${V}" stable/${V}/* --repo "${{ github.repository }}" --title "harar ${V}" \
             --notes "Promoted from ${{ steps.validate.outputs.canary }}, the same bytes. Install: curl -fsSL https://harar-releases.addis.gg/install.sh | sh"
       - name: Summary
@@ -142,7 +144,7 @@ jobs:
       - name: Dispatch every registry for this release
         run: |
           set -euo pipefail
-          for workflow in crates.yml publish.yml pypi.yml rubygems.yml packagist.yml; do
+          for workflow in crates.yml publish.yml pypi.yml rubygems.yml packagist.yml go.yml; do
             gh workflow run "$workflow" --repo "${{ github.repository }}" --ref main -f version="$V"
             echo "- ${workflow} for ${V}" >> "$GITHUB_STEP_SUMMARY"
           done

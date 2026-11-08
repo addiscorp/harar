@@ -1,0 +1,80 @@
+# The Go client (go/, module github.com/addiscorp/harar/go) on the Go module
+# proxy. Go publishes nothing from here: a module is its tag on GitHub, and
+# because it lives in go/, the tag is go/vX.Y.Z, which Promote pushes beside
+# vX.Y.Z on the same commit. This asks proxy.golang.org for the version (the
+# first ask is what fetches and caches it, and pkg.go.dev lists it from
+# there), then checks the proxy serves the tagged commit and the checksum
+# database agrees. Canary tags (vX.Y.Z-canary-<sha>) are not go/ tags, so Go
+# never sees them (APS 9).
+#
+# No token and no account.
+name: Go
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Stable version to check (X.Y.Z, tagged go/vX.Y.Z)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: The Go proxy serves github.com/addiscorp/harar/go
+    runs-on: ubuntu-24.04
+    env:
+      V: ${{ inputs.version }}
+      MODULE: github.com/addiscorp/harar/go
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: go/v${{ inputs.version }}
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: false
+      - name: go/vX.Y.Z is the release's commit
+        run: |
+          set -euo pipefail
+          want="$(git rev-parse "v${V}^{commit}")"
+          got="$(git rev-parse HEAD)"
+          if [ "$got" != "$want" ]; then
+            echo "::error::go/v${V} is ${got}, but v${V} is ${want}."
+            exit 1
+          fi
+      - name: The tagged client passes its tests
+        working-directory: go
+        run: go test -race ./...
+      - name: The proxy serves this release at the tagged commit
+        run: |
+          set -euo pipefail
+          want="$(git rev-parse HEAD)"
+          for _ in $(seq 1 20); do
+            if curl -fsSL -o info.json "https://proxy.golang.org/${MODULE}/@v/v${V}.info"; then
+              got="$(python3 -c 'import json; print(json.load(open("info.json")).get("Origin", {}).get("Hash", ""))')"
+              if [ "$got" != "$want" ]; then
+                echo "::error::proxy.golang.org serves ${MODULE} v${V} at ${got:-no commit}, but go/v${V} is ${want}."
+                exit 1
+              fi
+              # What a user's `go get` does: download through the proxy and
+              # check it against sum.golang.org.
+              mkdir -p ../user && cd ../user
+              go mod init example.com/user
+              go get "${MODULE}@v${V}"
+              grep -F "${MODULE} v${V} " go.sum
+              {
+                echo "### ${MODULE} ${V} is on the Go proxy"
+                echo "- https://pkg.go.dev/${MODULE}@v${V}"
+                echo "- at ${got}, the tagged commit; sum.golang.org agrees"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::proxy.golang.org does not serve ${MODULE} v${V} after 5 minutes."
+          exit 1

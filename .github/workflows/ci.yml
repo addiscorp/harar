@@ -92,6 +92,26 @@ jobs:
       - run: |
           php -r 'require "vendor/autoload.php"; exit(Harar\vault(socket: "/run/harar.sock") instanceof Harar\Vault ? 0 : 1);'
 
+  # The Go module github.com/addiscorp/harar/go: its tests on the oldest Go
+  # it supports and the newest, and gofmt and vet clean.
+  go:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        go: ["1.21", "stable"]
+    defaults:
+      run:
+        working-directory: go
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+      - run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+      - run: go test -race -v ./...
+
   linux:
     runs-on: ubuntu-24.04
     # Compilation is cached in R2. public-ci holds only the key for this

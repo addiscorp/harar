@@ -35,6 +35,7 @@ local socket; the clients hold no secrets.
 - **Python:** the [`harar`](python/README.md) PyPI package, `pip install harar`.
 - **Ruby:** the [`harar`](ruby/README.md) gem, `gem install harar`.
 - **PHP:** the [`addis/harar`](php/README.md) Composer package, `composer require addis/harar`.
+- **Go:** the [`github.com/addiscorp/harar/go`](go/README.md) module, `go get github.com/addiscorp/harar/go`.
 
 Each one resolves `harar://` references, the way 1Password's SDKs resolve
 `op://` ones, from the agent on your machine with no account or token:
