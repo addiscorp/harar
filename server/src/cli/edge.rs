@@ -75,6 +75,48 @@ enum EdgeCmd {
     /// copy on the edge. Pipe it to the platform:
     /// harar edge recover | npx wrangler secret put HARAR_EDGE_KEY
     Recover(Recover),
+    /// Sync the agent's vault with the other members of a ring, through
+    /// this edge (docs/edge.md §5b). Off until `harar edge sync on`.
+    #[command(subcommand)]
+    Sync(SyncCmd),
+}
+
+#[derive(Debug, Subcommand)]
+enum SyncCmd {
+    /// Start syncing the agent's vault through this edge: found the ring if
+    /// the edge has none yet, otherwise ask to join it (a member approves).
+    On(SyncOn),
+    /// Stop syncing. Nothing is deleted; `on` picks up where it left off.
+    Off(AgentArg),
+    /// The ring: members, requests to join, queued ops and conflicts.
+    Status(AgentArg),
+    /// Pull, apply and push now.
+    Now(AgentArg),
+    /// Add a device that asked to join: the ring key, wrapped to its key.
+    Approve(SyncApprove),
+}
+
+#[derive(Debug, Args)]
+struct AgentArg {
+    /// The agent's socket.
+    #[arg(long, default_value_os_t = harar::default_agent_socket())]
+    socket: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct SyncOn {
+    #[command(flatten)]
+    target: Target,
+    #[command(flatten)]
+    agent: AgentArg,
+}
+
+#[derive(Debug, Args)]
+struct SyncApprove {
+    /// The device id (d-…), from `harar edge sync status`.
+    device: String,
+    #[command(flatten)]
+    agent: AgentArg,
 }
 
 #[derive(Debug, Args)]
@@ -129,6 +171,10 @@ struct Unpair {
     device: String,
     #[command(flatten)]
     target: Target,
+    /// When the vault syncs through this edge, the agent removes the device
+    /// from the ring first.
+    #[command(flatten)]
+    agent: AgentArg,
 }
 
 #[derive(Debug, Args)]
@@ -207,7 +253,7 @@ fn run_blocking(cmd: Edge) -> Result<()> {
         EdgeCmd::Pair(cmd) => pair(cmd),
         EdgeCmd::Pairing(t) => print_json(&Paired::find(&t)?.call("POST", "/v1/pairings", None)?),
         EdgeCmd::Devices(t) => print_json(&Paired::find(&t)?.call("GET", "/v1/devices", None)?),
-        EdgeCmd::Unpair(cmd) => print_json(&Paired::find(&cmd.target)?.call("DELETE", &format!("/v1/devices/{}", cmd.device), None)?),
+        EdgeCmd::Unpair(cmd) => unpair(cmd),
         EdgeCmd::Secrets(t) => print_json(&Paired::find(&t)?.call("GET", "/v1/secrets", None)?),
         EdgeCmd::Put(cmd) => {
             let edge = Paired::find(&cmd.target)?;
@@ -228,7 +274,41 @@ fn run_blocking(cmd: Edge) -> Result<()> {
         EdgeCmd::Token(TokenCmd::Revoke(cmd)) => print_json(&Paired::find(&cmd.target)?.call("DELETE", &format!("/v1/tokens/{}", cmd.id), None)?),
         EdgeCmd::Log(cmd) => log(cmd),
         EdgeCmd::Recover(cmd) => recover(cmd),
+        EdgeCmd::Sync(cmd) => {
+            use crate::agent::{AgentRequest, SyncCommand};
+            let (socket, command) = match cmd {
+                SyncCmd::On(c) => (c.agent.socket, SyncCommand::On { edge: c.target.edge }),
+                SyncCmd::Off(a) => (a.socket, SyncCommand::Off),
+                SyncCmd::Status(a) => (a.socket, SyncCommand::Status),
+                SyncCmd::Now(a) => (a.socket, SyncCommand::Now),
+                SyncCmd::Approve(c) => (c.agent.socket, SyncCommand::Approve { device: c.device }),
+            };
+            super::agent::send(&socket, &AgentRequest::Sync(command))
+        }
     }
+}
+
+/// Unpairs a device. When this vault syncs through the edge and the device
+/// is a member of the ring, the agent first removes it from the ring and
+/// rekeys (docs/edge.md §5b), so it can read nothing written after.
+fn unpair(cmd: Unpair) -> Result<()> {
+    use crate::agent::{AgentRequest, SyncCommand};
+    let edge = Paired::find(&cmd.target)?;
+    let ring = if edge.sync.as_ref().is_some_and(|s| s.on) && cmd.device != edge.device {
+        let answer = super::agent::ask(&cmd.agent.socket,&AgentRequest::Sync(SyncCommand::Remove { device: cmd.device.clone() }))
+            .context("this vault syncs through the edge, so the agent removes the device from the ring first")?;
+        if answer["ok"] != Value::Bool(true) {
+            bail!("the agent didn't remove {} from the ring, so it stays paired: {}", cmd.device, answer["error"].as_str().unwrap_or("no reason given"));
+        }
+        Some(answer)
+    } else {
+        None
+    };
+    let mut answer = edge.call("DELETE", &format!("/v1/devices/{}", cmd.device), None)?;
+    if let Some(ring) = ring {
+        answer["ring"] = ring;
+    }
+    print_json(&answer)
 }
 
 // ------------------------------------------------------------------ init
@@ -451,7 +531,7 @@ fn check_url(url: &str) -> Result<()> {
 // ------------------------------------------------------------------ devices
 
 /// This machine's key for one edge.
-enum DeviceKey {
+pub(crate) enum DeviceKey {
     #[cfg(target_os = "macos")]
     Enclave(crate::enclave::EnclaveKey),
     File(SigningKey),
@@ -459,7 +539,7 @@ enum DeviceKey {
 
 impl DeviceKey {
     /// The raw P-256 point (65 bytes), as the edge stores it.
-    fn public_key(&self) -> Result<Vec<u8>> {
+    pub(crate) fn public_key(&self) -> Result<Vec<u8>> {
         match self {
             #[cfg(target_os = "macos")]
             DeviceKey::Enclave(key) => key.public_key(),
@@ -468,7 +548,7 @@ impl DeviceKey {
     }
 
     /// ECDSA P-256 over SHA-256, raw r || s.
-    fn sign(&self, message: &[u8]) -> Result<[u8; 64]> {
+    pub(crate) fn sign(&self, message: &[u8]) -> Result<[u8; 64]> {
         let signature: Signature = match self {
             #[cfg(target_os = "macos")]
             DeviceKey::Enclave(key) => Signature::from_der(&key.sign(message)?).context("the Secure Enclave's signature")?,
@@ -478,9 +558,69 @@ impl DeviceKey {
     }
 }
 
+/// This machine's key-agreement key for one edge's ring (docs/edge.md §5b):
+/// the ring key is kept wrapped to it. In the Secure Enclave when the device
+/// key is (opening asks for Touch ID); otherwise a 0600 file.
+pub(crate) enum AgreementKey {
+    #[cfg(target_os = "macos")]
+    Enclave(crate::enclave::EnclaveKey),
+    File(p256::SecretKey),
+}
+
+impl AgreementKey {
+    pub(crate) fn public_key(&self) -> Result<Vec<u8>> {
+        match self {
+            #[cfg(target_os = "macos")]
+            AgreementKey::Enclave(key) => key.public_key(),
+            AgreementKey::File(key) => Ok(crate::sync::crypto::raw_public(&key.public_key())),
+        }
+    }
+
+    /// Opens an ECIES wrap made to this key.
+    pub(crate) fn open(&self, sealed: &[u8]) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+        match self {
+            #[cfg(target_os = "macos")]
+            AgreementKey::Enclave(key) => key.open(sealed),
+            AgreementKey::File(key) => crate::sync::crypto::ecies_open(key, sealed),
+        }
+    }
+
+    /// A new key in the same tier as `like`, the edge's device key.
+    pub(crate) fn create(url: &str, like: &StoredKey) -> Result<(AgreementKey, StoredKey)> {
+        #[cfg(target_os = "macos")]
+        if let StoredKey::SecureEnclave { .. } = like {
+            let key = crate::enclave::EnclaveKey::create(crate::enclave::Presence::Required)?;
+            let handle = STANDARD.encode(key.handle()?);
+            return Ok((AgreementKey::Enclave(key), StoredKey::SecureEnclave { handle }));
+        }
+        let _ = like;
+        let key = p256::SecretKey::random(&mut OsRng);
+        let path = ensure_state_subdir("edge-keys")?.join(format!("{}.agree.p256", &hex(&Sha256::digest(url.as_bytes()))[..16]));
+        if path.exists() {
+            fs::remove_file(&path).with_context(|| format!("replace the unused key {}", path.display()))?;
+        }
+        write_private(&path, &zeroize::Zeroizing::new(STANDARD.encode(key.to_bytes())))?;
+        Ok((AgreementKey::File(key), StoredKey::File { path }))
+    }
+
+    pub(crate) fn load(stored: &StoredKey) -> Result<AgreementKey> {
+        match stored {
+            #[cfg(target_os = "macos")]
+            StoredKey::SecureEnclave { handle } => Ok(AgreementKey::Enclave(crate::enclave::EnclaveKey::from_handle(&STANDARD.decode(handle)?)?)),
+            #[cfg(not(target_os = "macos"))]
+            StoredKey::SecureEnclave { .. } => bail!("this edge's key-agreement key is in a Mac's Secure Enclave"),
+            StoredKey::File { path } => {
+                let text = zeroize::Zeroizing::new(fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?);
+                let bytes = zeroize::Zeroizing::new(STANDARD.decode(text.trim())?);
+                Ok(AgreementKey::File(p256::SecretKey::from_slice(&bytes).context("the key-agreement key file")?))
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "tier", rename_all = "kebab-case")]
-enum StoredKey {
+pub(crate) enum StoredKey {
     /// The enclave's handle for the key: only this Mac's enclave can use it.
     SecureEnclave { handle: String },
     /// A 0600 file holding the private scalar.
@@ -488,28 +628,38 @@ enum StoredKey {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Paired {
-    url: String,
-    device: String,
-    name: String,
-    key: StoredKey,
+pub(crate) struct Paired {
+    pub url: String,
+    pub device: String,
+    pub name: String,
+    pub key: StoredKey,
     /// The edge key, sealed to this Mac's Secure Enclave (base64), when
     /// this machine paired with the folder init wrote. Only this Mac can
     /// open it, with Touch ID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    edge_key: Option<String>,
+    pub edge_key: Option<String>,
+    /// Whether the agent's vault syncs through this edge, and this machine's
+    /// key-agreement key for its ring (`harar edge sync on`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SyncConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SyncConfig {
+    pub on: bool,
+    pub agreement: StoredKey,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct EdgesFile {
-    edges: Vec<Paired>,
+pub(crate) struct EdgesFile {
+    pub edges: Vec<Paired>,
 }
 
 fn edges_path() -> PathBuf {
     state_dir().join("edges.json")
 }
 
-fn read_edges() -> Result<EdgesFile> {
+pub(crate) fn read_edges() -> Result<EdgesFile> {
     match fs::read_to_string(edges_path()) {
         Ok(text) => serde_json::from_str(&text).with_context(|| format!("read {}", edges_path().display())),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(EdgesFile::default()),
@@ -517,7 +667,7 @@ fn read_edges() -> Result<EdgesFile> {
     }
 }
 
-fn write_edges(file: &EdgesFile) -> Result<()> {
+pub(crate) fn write_edges(file: &EdgesFile) -> Result<()> {
     ensure_state_dir()?;
     let path = edges_path();
     let part = path.with_extension("json.part");
@@ -577,7 +727,7 @@ fn pair(cmd: Pair) -> Result<()> {
         (Some((_, raw)), DeviceKey::Enclave(enclave)) => Some(STANDARD.encode(enclave.seal(&raw[..])?)),
         _ => None,
     };
-    let paired = Paired { url: url.clone(), device: device.clone(), name: name.clone(), key: stored.clone(), edge_key: edge_key.clone() };
+    let paired = Paired { url: url.clone(), device: device.clone(), name: name.clone(), key: stored.clone(), edge_key: edge_key.clone(), sync: None };
     edges.edges.push(paired.clone());
     write_edges(&edges)?;
 
@@ -639,8 +789,12 @@ fn new_key(url: &str, file_key: bool) -> Result<(DeviceKey, StoredKey)> {
 impl Paired {
     /// The edge `--edge` names, or the only one this machine is paired with.
     fn find(target: &Target) -> Result<Paired> {
+        Self::find_url(target.edge.as_deref())
+    }
+
+    pub(crate) fn find_url(edge: Option<&str>) -> Result<Paired> {
         let edges = read_edges()?.edges;
-        match &target.edge {
+        match edge {
             Some(url) => {
                 let url = url.trim_end_matches('/');
                 edges.into_iter().find(|e| e.url == url).ok_or_else(|| anyhow!("this machine is not paired with {url}; run harar edge pair {url}"))
@@ -653,7 +807,7 @@ impl Paired {
         }
     }
 
-    fn key(&self) -> Result<DeviceKey> {
+    pub(crate) fn key(&self) -> Result<DeviceKey> {
         match &self.key {
             #[cfg(target_os = "macos")]
             StoredKey::SecureEnclave { handle } => Ok(DeviceKey::Enclave(crate::enclave::EnclaveKey::from_handle(&STANDARD.decode(handle)?)?)),
@@ -668,8 +822,13 @@ impl Paired {
     }
 
     /// A signed request to this edge (docs/edge.md §3).
-    fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
+    pub(crate) fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
         send(&self.url, method, path, body, Some((&self.device, &self.key()?)))
+    }
+
+    /// The same, signed with a device key already opened.
+    pub(crate) fn call_with(&self, key: &DeviceKey, method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
+        send(&self.url, method, path, body, Some((&self.device, key)))
     }
 }
 

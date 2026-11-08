@@ -60,7 +60,7 @@ pub async fn run(cmd: Agent) -> Result<()> {
     if let (true, Some(old)) = (agent::prepare_state(&cmd.state, old)?, old) {
         eprintln!("harar agent moved the vault from {} to {}", old.display(), cmd.state.display());
     }
-    let vault = Vault::new(
+    let mut vault = Vault::new(
         VaultConfig {
             state_path: cmd.state,
             // SAFETY: geteuid has no preconditions.
@@ -73,6 +73,19 @@ pub async fn run(cmd: Agent) -> Result<()> {
         approve,
         Instant::now(),
     );
+    // The edge `harar edge sync on` chose: the agent pulls from it now (into
+    // the sync state; applied once the vault is unlocked).
+    match crate::cli::edge::read_edges().map(|edges| edges.edges.into_iter().find(|e| e.sync.as_ref().is_some_and(|s| s.on))) {
+        Ok(Some(edge)) => match crate::sync::member::Member::load(edge) {
+            Ok(member) => {
+                eprintln!("harar agent syncs the vault through {}", member.edge.url);
+                vault.set_sync(Some(member));
+            }
+            Err(err) => eprintln!("harar agent: not syncing: {err:#}"),
+        },
+        Ok(None) => {}
+        Err(err) => eprintln!("harar agent: not syncing: {err:#}"),
+    }
     eprintln!(
         "harar agent listening on {} and {} (locked)",
         cmd.socket.display(),
@@ -134,20 +147,26 @@ pub async fn status(cmd: Status) -> Result<()> {
     send(&cmd.socket.socket, &AgentRequest::Status)
 }
 
-fn send(socket: &std::path::Path, request: &AgentRequest) -> Result<()> {
-    let mut stream = std::os::unix::net::UnixStream::connect(socket)
-        .with_context(|| format!("no harar agent at {}; start one with `harar agent`", socket.display()))?;
-    stream.write_all(&serde_json::to_vec(request)?)?;
-    stream.shutdown(std::net::Shutdown::Write)?;
-    let mut reply = String::new();
-    stream.read_to_string(&mut reply)?;
-    let reply: serde_json::Value = serde_json::from_str(reply.trim()).context("decode agent reply")?;
+/// One request to the agent; prints its answer, and fails when it refused.
+pub(crate) fn send(socket: &std::path::Path, request: &AgentRequest) -> Result<()> {
+    let reply = ask(socket, request)?;
     let failed = reply.get("ok") == Some(&serde_json::Value::Bool(false));
     print_json(&reply)?;
     if failed {
         return Err(anyhow!("{}", reply["error"].as_str().unwrap_or("agent refused the request")));
     }
     Ok(())
+}
+
+/// One request to the agent, and its answer as it gave it.
+pub(crate) fn ask(socket: &std::path::Path, request: &AgentRequest) -> Result<serde_json::Value> {
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)
+        .with_context(|| format!("no harar agent at {}; start one with `harar agent`", socket.display()))?;
+    stream.write_all(&serde_json::to_vec(request)?)?;
+    stream.shutdown(std::net::Shutdown::Write)?;
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply)?;
+    serde_json::from_str(reply.trim()).context("decode agent reply")
 }
 
 #[cfg(all(test, target_os = "macos"))]
