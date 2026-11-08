@@ -148,9 +148,10 @@ optional expiry. Revoking one is immediate.
 
 - In phase 1 the edge holds only the secrets devices put there for services
   (`PUT /v1/secrets/{path}`), encrypted at rest under its key.
-- In phase 2, members' whole vaults travel between them through the edge
-  **encrypted to each member's own key**. The edge stores and forwards that
-  ciphertext and can't open it.
+- In phase 2, members' whole vaults travel between them through the edge as
+  signed ops **sealed under the ring key**, which only members hold (wrapped
+  to each member's own key). The edge stores and forwards that ciphertext and
+  can't open it, nor learn secrets' names (section 5a).
 
 So someone who gets into the Cloudflare, Vercel or Supabase account gets the
 secrets that edge serves to services, never the vault.
@@ -211,7 +212,7 @@ edge seals its key to it, so every phone holds a copy only it can open.
 
 **Not yet:** `harar edge rekey`, to move every data key to a new edge key.
 
-## 5. The API (phase 1)
+## 5. The API
 
 All bodies are JSON. Errors are `{ "error": "<code>", "message": "…" }` with a
 4xx or 5xx status, and every refusal is logged.
@@ -232,10 +233,130 @@ All bodies are JSON. Errors are `{ "error": "<code>", "message": "…" }` with a
 | `DELETE /v1/tokens/{id}` | device | revokes it |
 | `GET /v1/log?after={seq}` | device | log rows after `seq` |
 | `PUT /v1/recovery`, `GET /v1/recovery` | device | the edge key encrypted with the recovery code (section 4a) |
+| `PUT /v1/sync` | device | `{ ops: [...] }` (1 to 100) → `{ stored, duplicates }`. All or nothing (section 5a). |
+| `POST /v1/sync` | device | `{ since }` → `{ ops, next, more }`, at most 100 ops or about 1 MiB a page (section 5a) |
 
 `resolve` takes the same `harar://` references as the clients'
 `secrets.resolve`, so a service moves between the local agent and the edge by
 changing only how it connects.
+
+## 5a. Sync: members' ops, stored blind (phase 2, step 1)
+
+The design is #101: one ring key per vault, wrapped to each member's
+key-agreement key; every change a signed op, chained per author by hash. The
+edge only stores and forwards ops. It never has the ring key, so nothing it
+holds opens one. Service tokens can't push or pull.
+
+### An op
+
+```json
+{ "author": "d-0123456789abcdef", "seq": 4, "prev": "<64 hex>", "kind": "put",
+  "key": "<43 base64url>", "version": 2, "sealed": "<base64url>",
+  "wrapped_key": "<base64url>", "at": 1762603200000, "sig": "<86 base64url>" }
+```
+
+| Field | Is | The edge checks |
+|---|---|---|
+| `author` | the device id that wrote it | a device paired now (not removed) |
+| `seq` | 1, 2, 3, … per author | exactly the author's last stored `seq` + 1 |
+| `prev` | the hash of the author's previous op; `""` for its first | equals that hash |
+| `kind` | `put`, `rotate`, `delete`, `member.add`, `member.remove`, `rekey` | one of these |
+| `key` | `base64url(HMAC-SHA256(ring key, path))`, no padding | 32 bytes |
+| `version` | the secret's version (members' business) | a whole number |
+| `sealed` | path and value, sealed under a data key | base64url, at most 48 KiB; may be empty |
+| `wrapped_key` | that data key, wrapped by the ring key | base64url, at most 1 KiB; may be empty |
+| `at` | the author's clock, unix milliseconds | not more than 5 minutes ahead of the edge's |
+| `sig` | ECDSA P-256 SHA-256 by the author's device key, raw `r ‖ s` | verifies over the canonical encoding |
+
+An op with any other field is refused, so what the edge stores is what was
+sent. A body is still at most 64 KiB, so an op near the size limit goes in a
+PUT of its own.
+
+**`key`, not `path`** (a change from #101): the edge must not learn secrets'
+names, so an op names its secret by an HMAC of the path under the ring key,
+and the path travels inside `sealed`. The edge can tell that two ops touch the
+same secret (it needs that to compact), not which secret. For `member.*` and
+`rekey` ops, members choose what they put through the HMAC; the edge treats
+`key` the same for every kind.
+
+**The canonical encoding** is what `sig` signs and what an op's hash is of:
+every field but `sig`, in this order, one per line, with `sealed` and
+`wrapped_key` as the hex SHA-256 of their base64url text:
+
+```
+"harar-op-v1\n" author "\n" seq "\n" prev "\n" kind "\n" key "\n" version "\n"
+  hex(sha256(sealed)) "\n" hex(sha256(wrapped_key)) "\n" at
+```
+
+Numbers are decimal with no leading zeros. No field can hold a newline (each is
+hex, base64url, decimal, a device id or a fixed word), so the encoding is
+unambiguous. Ciphertext goes in by its hash so an op whose ciphertext was
+compacted away still verifies, signature and chain (below).
+
+**The op hash** is `hex(sha256(canonical encoding))`. It leaves out `sig`:
+an ECDSA signature isn't unique (a fresh one each time, and `s` can be
+flipped), and the op is the same op whoever re-signs it. An author's first op
+has `prev = ""`, as the log's first row.
+
+### Pushing: `PUT /v1/sync`
+
+The edge checks the whole batch before it logs or stores anything: every
+field, every signature, and each author's chain. A batch may carry ops from
+more than one paired device (a member can relay ops it pulled). If any op
+fails, the batch is refused and nothing is stored: one `deny` row, its reason
+the op's code (`bad_op`, `bad_op_signature`, `unknown_author`, `wrong_seq`,
+`wrong_prev`, `fork`, `clock`).
+
+- An op already stored with the same hash is a duplicate, not an error, so a
+  PUT whose answer was lost can be sent again. One with the same `author` and
+  `seq` but another hash is a `fork`.
+- Ops from a device stop being taken the moment it is unpaired, even ops it
+  signed before and another device relays. Its ops stored before stay.
+- **All or nothing without a transaction**: D1 has none through a plain query,
+  and caps a statement at 100 parameters. The rows go in marked with the
+  batch's id, which every read and check ignores, and one `UPDATE` clears the
+  mark. If another PUT takes one of the batch's places first, the batch's rows
+  are deleted and the answer is `409 sync_busy` (as with pairing codes, that
+  race is an `allow` row followed by a `deny`). Rows a crashed request left
+  marked are deleted by the next PUT after a minute.
+
+### Pulling: `POST /v1/sync`
+
+`since` is `{ "<device id>": <last seq I have> }` (`{}` for everything). The
+answer has each author's ops after that seq, by author and then seq; `next`
+is the `since` for the following call, and `more` says whether there is more
+to read now. Because an author's ops only ever become visible in seq order, a
+cursor of each author's last seq never skips one. A member keeps the last
+`next` and starts its next sync from it.
+
+Each op comes back as sent, plus `hash`, `sealed_sha256`,
+`wrapped_key_sha256` and `compacted`.
+
+### Compaction: 30 days
+
+- **What goes.** A `put`, `rotate` or `delete` op that the edge stored more than
+  30 days ago, and that a later op on the same `key` supersedes. Later is
+  last-write-wins order: larger `at`, then larger author id, then larger
+  `seq`. The latest op on a key is never superseded, so it stays; `member.*`
+  and `rekey` ops are never compacted.
+- **Age is the edge's time**, when the op was stored, not `at`: every member
+  gets 30 days to pull a losing write and flag it, however old its author's
+  clock said it was.
+- **What stays.** Compacting an op drops its `sealed` and `wrapped_key` and
+  keeps the rest: author, seq, prev, kind, key, version, at, sig, the hash and
+  the two ciphertext hashes. Such an op comes back with `sealed: null`,
+  `wrapped_key: null`, `compacted: true`. A member still recomputes its hash
+  from those fields and verifies its signature, so **every author's chain
+  verifies from its first op**; the alternative, trusting the oldest retained
+  op as a new start, would let an edge hide an op by calling it compacted.
+  A compacted op keeps a few hundred bytes.
+- **When.** On every sync request, before a pull's answer and after a push
+  commits: one `UPDATE` that compacts at most 50 ops. Nothing runs on a
+  schedule, so an edge nobody syncs with costs nothing, and the work keeps up
+  with the writes that make it.
+
+The edge does not resolve conflicts, check versions or open anything: members
+do, by these same rules (#101).
 
 ## 6. The log
 
@@ -248,7 +369,9 @@ seq, at, actor, action, resource, decision, reason, ip, prev_hash, hash
 - `actor` is `device:<id>`, `token:<id>` or `anonymous`. `action` is one of
   `pair`, `pairing.create`, `device.remove`, `secret.put`, `secret.rotate`,
   `secret.delete`, `secret.list`, `resolve`, `token.create`, `token.revoke`,
-  `token.list`, `device.list`, `log.read`, `recovery.set`, `recovery.read`.
+  `token.list`, `device.list`, `log.read`, `recovery.set`, `recovery.read`,
+  `sync.put`, `sync.read`. A `sync.put`'s resource is the new ops' places,
+  `<author>:<first seq>-<last seq>` per author, never their keys or contents.
 - **Values are never logged**, nor tokens or codes.
 - `hash = sha256(prev_hash || canonical row)`: changing or deleting a row
   breaks every later hash, as in harar's own audit (architecture §8).
@@ -308,9 +431,14 @@ raises an alarm when the edge's chain stops advancing (phase 3).
    - 1a: the edge file and its three adapters;
    - 1b: `harar edge init|pair|put|token|log` in the CLI;
    - 1c: `vault({ edge, token })` in all six clients.
-2. **Sync**: a signed, hash-chained op log between members, carried blind
-   through the edge. Conflicts: each secret's version, the later write wins,
-   and the other is kept in the history and flagged.
+2. **Sync** (#101): a signed, hash-chained op log between members, carried
+   blind through the edge. One personal vault first. Conflicts: the later
+   write wins (by `at`, then author id), and the other is kept in the history
+   and flagged. Mac sync is opt-in (`harar edge sync on`). 30 days of history,
+   then compaction.
+   - 2a: `harar_ops` and `/v1/sync` on the edge (section 5a);
+   - 2b: the Mac agent as a member, and `harar edge sync on`;
+   - 2c: harar-app as a member (with phase 3).
 3. **harar-app**: the phone pairs by QR code. It is a member, the approver,
    the token manager and the log viewer, and the edge sends its notifications.
 4. **Direct peer transport** over a private network, for rings with no edge.
