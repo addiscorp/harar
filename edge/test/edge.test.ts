@@ -782,6 +782,37 @@ for (const backend of backends) {
       }
     });
 
+    test("sync: a page shares its room among authors, so one author with many ops never starves the others", async () => {
+      const { mac, phone, macM, phoneM } = await ring(backend);
+      const [first, second] = mac.id < phone.id ? [macM, phoneM] : [phoneM, macM];
+      const [firstDev, secondDev] = mac.id < phone.id ? [mac, phone] : [phone, mac];
+      // The author that sorts first has 250 ops; the other has 3.
+      const many: Row[] = [];
+      for (let i = 0; i < 250; i++) many.push(await first.op("put", `k${i}`, "v"));
+      for (let i = 0; i < 250; i += 100) assert.equal((await firstDev.as("PUT", "/v1/sync", { ops: many.slice(i, i + 100) })).status, 200);
+      const few = [await second.op("put", "a", "1"), await second.op("put", "b", "2"), await second.op("put", "c", "3")];
+      await secondDev.as("PUT", "/v1/sync", { ops: few });
+      const page = await phone.as("POST", "/v1/sync", { since: {} });
+      assert.ok(page.body.ops.length <= 100);
+      assert.deepEqual(page.body.ops.filter((o: Row) => o.author === secondDev.id).map((o: Row) => o.seq), [1, 2, 3], "the second author's ops are on the first page");
+      assert.equal(page.body.more, true);
+      assert.deepEqual((await pull(phone)).ops.map(sent).length, 253, "and following next still reads every op once");
+    });
+
+    test("sync: compaction drops an op only for a later write to its key by the same author", async () => {
+      const { clock, mac, phone, macM, phoneM } = await ring(backend);
+      const t = clock.ms;
+      // The phone's op is the latest it wrote on K; the Mac copies K's name
+      // (anyone paired can) and writes later. The phone's op must survive.
+      const phones = await phoneM.op("put", "K", "the phone's", { at: t });
+      await phone.as("PUT", "/v1/sync", { ops: [phones] });
+      const copied = await macM.op("put", "K", "a later write by someone else", { at: t + 1000, key: phones.key });
+      await mac.as("PUT", "/v1/sync", { ops: [copied] });
+      clock.ms = t + 31 * 24 * 60 * 60 * 1000;
+      const { ops } = await pull(mac);
+      assert.equal(ops.find((o) => o.author === phone.id)?.compacted, false, "the phone's latest op on K keeps its ciphertext");
+    });
+
     test("sync: compaction drops only superseded put/rotate/delete ops older than 30 days, and every chain still verifies", async () => {
       const { clock, mac, phone, macM, phoneM } = await ring(backend);
       const t = clock.ms;

@@ -9,6 +9,8 @@ pub(crate) mod op;
 #[cfg(test)]
 mod review2_tests;
 #[cfg(test)]
+mod round3_tests;
+#[cfg(test)]
 mod review_tests;
 #[cfg(test)]
 mod tests;
