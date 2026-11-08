@@ -356,6 +356,9 @@ fn start_default_agent(dir: &Path, key: &Path) -> Child {
         assert!(Instant::now() < deadline, "agent did not listen on {}", socket.display());
         std::thread::sleep(Duration::from_millis(25));
     }
+    // The socket takes connections from the moment it is bound, before the
+    // vault is moved; an answer means the agent is past that.
+    json(&run(&["status"], &socket, None));
     child
 }
 
@@ -456,4 +459,68 @@ fn an_agent_with_a_vault_in_both_places_refuses_to_start_and_touches_neither() {
     assert!(stderr.contains(&old.display().to_string()) && stderr.contains(&state.display().to_string()), "names both: {stderr}");
     assert_eq!(fs::read_to_string(&old).unwrap(), "the older vault");
     assert_eq!(fs::read_to_string(&state).unwrap(), "the newer vault");
+}
+
+/// Where `harar_as_user(dir)` keeps its state.
+fn state_folder(dir: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        dir.join("home/Library/Application Support/harar")
+    } else {
+        dir.join("home/.local/state/harar")
+    }
+}
+
+fn mode_of(path: &Path) -> u32 {
+    fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+#[test]
+fn harar_edge_keeps_the_state_folder_private_whoever_made_it() {
+    // A port nothing listens on: the pair fails after the device key is made.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    for made_loose_before in [false, true] {
+        let dir = tempfile::Builder::new().prefix("ha").tempdir().unwrap();
+        let state = state_folder(dir.path());
+        let up = state.parent().unwrap().to_path_buf();
+        if made_loose_before {
+            // As an older `harar edge` left it: 0755, in a 0755 parent.
+            fs::create_dir_all(&state).unwrap();
+            fs::set_permissions(&up, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut pair = harar_as_user(dir.path())
+            .args(["edge", "pair", &format!("http://127.0.0.1:{closed}"), "--file-key", "--name", "t", "--secret-stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        pair.stdin.take().unwrap().write_all(b"ABCD-EFGH\n").unwrap();
+        let pair = pair.wait_with_output().unwrap();
+        assert!(!pair.status.success(), "nothing listens on {closed}");
+
+        assert_eq!(mode_of(&state), 0o700, "the state folder (made loose before: {made_loose_before})");
+        assert_eq!(mode_of(&state.join("edge-keys")), 0o700, "edge-keys (made loose before: {made_loose_before})");
+        if made_loose_before {
+            assert_eq!(mode_of(&up), 0o755, "a parent of the state folder is never changed");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_agent_makes_a_state_folder_harar_edge_left_open_private() {
+    let dir = tempfile::Builder::new().prefix("ha").tempdir().unwrap();
+    let key = dir.path().join("master.key");
+    fs::write(&key, age::x25519::Identity::generate().to_string().expose_secret()).unwrap();
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o400)).unwrap();
+    let state = state_folder(dir.path());
+    fs::create_dir_all(&state).unwrap();
+    fs::set_permissions(state.parent().unwrap(), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let agent = start_default_agent(dir.path(), &key);
+    assert_eq!(mode_of(&state), 0o700);
+    assert_eq!(mode_of(state.parent().unwrap()), 0o755, "never a parent");
+    stop(agent);
 }

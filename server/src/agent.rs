@@ -18,7 +18,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -345,13 +345,21 @@ pub(crate) fn old_state_path() -> PathBuf {
     harar::agent_dir().join("vault.age")
 }
 
-/// Makes the vault's folder (0700 when harar creates it), and moves a vault
-/// found at `old` to `state` when `state` has none. Returns whether it moved
-/// one. A vault at both is an error that touches neither: only the person
-/// knows which one holds their secrets.
+/// Makes the vault's folder private, and moves a vault found at `old` to
+/// `state` when `state` has none. Returns whether it moved one. A vault at
+/// both is an error that touches neither: only the person knows which one
+/// holds their secrets.
+///
+/// The state folder is made 0700 however it was made (`harar edge` may have
+/// made it first); a folder named with --state is created 0700 when missing
+/// and otherwise left as the person has it.
 pub(crate) fn prepare_state(state: &Path, old: Option<&Path>) -> Result<bool> {
     if let Some(parent) = state.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        create_private_dir(parent)?;
+        if parent == crate::common::state_dir() {
+            crate::common::ensure_state_dir()?;
+        } else {
+            crate::common::create_private_dir(parent)?;
+        }
     }
     let Some(old) = old.filter(|old| *old != state) else {
         return Ok(false);
@@ -377,22 +385,6 @@ fn file_exists(path: &Path) -> Result<bool> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err).with_context(|| format!("inspect {}", path.display())),
     }
-}
-
-/// Creates `dir` 0700; a folder that already exists is left as it is.
-fn create_private_dir(dir: &Path) -> Result<()> {
-    if dir.is_dir() {
-        return Ok(());
-    }
-    if let Some(up) = dir.parent() {
-        fs::create_dir_all(up).with_context(|| format!("create {}", up.display()))?;
-    }
-    match fs::DirBuilder::new().mode(0o700).create(dir) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => return Ok(()),
-        Err(err) => return Err(err).with_context(|| format!("create {}", dir.display())),
-    }
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).with_context(|| format!("restrict {}", dir.display()))
 }
 
 /// Renames `from` to `to` (0600). From a tmpfs to a disk the rename fails with
@@ -805,7 +797,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (old, state) = old_vault(dir.path(), b"sealed");
         fs::set_permissions(&old, fs::Permissions::from_mode(0o644)).unwrap();
-        create_private_dir(state.parent().unwrap()).unwrap();
+        crate::common::create_private_dir(state.parent().unwrap()).unwrap();
 
         copy_across_filesystems(&old, &state, state.parent().unwrap()).unwrap();
         assert_eq!(fs::read(&state).unwrap(), b"sealed");

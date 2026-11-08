@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncReadExt;
 use tokio::net::UnixStream;
@@ -169,6 +169,60 @@ pub(crate) fn state_dir() -> PathBuf {
     home.join(".local/state/harar")
 }
 
+/// `state_dir()`, made private: created 0700 when missing, and set to 0700
+/// when it is looser, whoever made it (an older `harar edge` made it 0755).
+/// Its parents are created with the default mode and never changed.
+pub(crate) fn ensure_state_dir() -> Result<PathBuf> {
+    let dir = state_dir();
+    make_private_dir(&dir, true)?;
+    Ok(dir)
+}
+
+/// A folder of harar's own inside `state_dir()` (`edge-keys`), made private
+/// the way `ensure_state_dir()` makes the state folder.
+pub(crate) fn ensure_state_subdir(name: &str) -> Result<PathBuf> {
+    let dir = ensure_state_dir()?.join(name);
+    make_private_dir(&dir, true)?;
+    Ok(dir)
+}
+
+/// Creates `dir` 0700 when missing; a folder that already exists is left as
+/// it is. For a folder the person named, which harar must never chmod (#37).
+pub(crate) fn create_private_dir(dir: &Path) -> Result<()> {
+    make_private_dir(dir, false)
+}
+
+/// Creates `dir` 0700 when missing (its parents with the default mode), and
+/// with `tighten` sets an existing folder that others can reach to 0700. Only
+/// `dir` itself is ever changed, never a parent, and never through a symlink.
+fn make_private_dir(dir: &Path, tighten: bool) -> Result<()> {
+    if !dir.exists() {
+        if let Some(up) = dir.parent() {
+            fs::create_dir_all(up).with_context(|| format!("create {}", up.display()))?;
+        }
+        match fs::DirBuilder::new().mode(0o700).create(dir) {
+            Ok(()) => {
+                return fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+                    .with_context(|| format!("restrict {}", dir.display()));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err).with_context(|| format!("create {}", dir.display())),
+        }
+    }
+    let metadata = fs::symlink_metadata(dir).with_context(|| format!("inspect {}", dir.display()))?;
+    if !tighten || metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    // SAFETY: geteuid has no preconditions.
+    if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(anyhow!("refusing a state folder this user doesn't own: {}", dir.display()));
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).with_context(|| format!("restrict {}", dir.display()))?;
+    }
+    Ok(())
+}
+
 pub(crate) fn now_epoch_seconds() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("the clock is after 1970").as_secs()
 }
@@ -184,6 +238,36 @@ mod tests {
         assert!(user_exists(&me));
         assert!(!user_exists("harar-no-such-user-7f3a"));
         assert!(!user_exists("bad\0name"));
+    }
+
+    #[test]
+    fn a_state_folder_is_tightened_but_a_named_one_and_the_parents_never_are() {
+        let dir = tempfile::tempdir().unwrap();
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let up = dir.path().join("state");
+        let harar = up.join("harar");
+        fs::create_dir_all(&harar).unwrap();
+        fs::set_permissions(&up, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&harar, fs::Permissions::from_mode(0o755)).unwrap();
+
+        create_private_dir(&harar).unwrap();
+        assert_eq!(mode(&harar), 0o755, "a folder the person named is left as it is");
+        make_private_dir(&harar, true).unwrap();
+        assert_eq!(mode(&harar), 0o700);
+        assert_eq!(mode(&up), 0o755, "never a parent");
+
+        // Through a symlink nothing is changed.
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        make_private_dir(&link, true).unwrap();
+        assert_eq!(mode(&elsewhere), 0o755);
+
+        let fresh = dir.path().join("new/harar");
+        create_private_dir(&fresh).unwrap();
+        assert_eq!(mode(&fresh), 0o700, "created 0700");
     }
 
     #[test]
