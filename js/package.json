@@ -2,7 +2,7 @@
   "name": "harar",
   "version": "0.3.1",
   "description": "harar's client: import { vault } from 'harar'. Where each secret may go, and the secret itself for one host only.",
-  "license": "Apache-2.0",
+  "license": "MIT",
   "homepage": "https://harar.addis.org",
   "repository": { "type": "git", "url": "git+https://github.com/addiscorp/harar.git", "directory": "js" },
   "type": "module",

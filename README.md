@@ -98,4 +98,4 @@ See [docs/architecture.md](docs/architecture.md) for the model.
 
 ## License
 
-[Apache-2.0](LICENSE)
+[MIT](LICENSE)
