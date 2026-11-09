@@ -8,7 +8,7 @@ name = "harar"
 version = "0.3.1"
 description = "harar's client: from harar import vault. Where each secret may go, and the secret itself for one host only."
 readme = "README.md"
-license = "Apache-2.0"
+license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.9"
 dependencies = []

@@ -10,7 +10,7 @@ resolver = "2"
 
 [workspace.package]
 version = "0.3.1"
-license = "Apache-2.0"
+license = "MIT"
 
 [workspace.dependencies]
 axum = "0.7"

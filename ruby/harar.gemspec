@@ -6,7 +6,7 @@ Gem::Specification.new do |s|
   s.name = "harar"
   s.version = Harar::VERSION
   s.summary = "harar's client: Harar.vault. Where each secret may go, and the secret itself for one host only."
-  s.license = "Apache-2.0"
+  s.license = "MIT"
   s.authors = ["Sami Fouad"]
   s.homepage = "https://harar.addis.gg"
   s.metadata = {
