@@ -204,6 +204,9 @@ jobs:
       - run: edge/test/cli-e2e.sh target/debug/harar
       # Every client (TypeScript, Python, Ruby, PHP, Go, Rust) against that edge.
       - run: edge/test/clients-e2e.sh target/debug/harar
+      # Two agents' vaults syncing through that edge (docs/edge.md §5b):
+      # joining, last write wins, and a database with no path or value in it.
+      - run: edge/test/sync-e2e.sh target/debug/harar
       - run: sccache --show-stats
 
   macos:

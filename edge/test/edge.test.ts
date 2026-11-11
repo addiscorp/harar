@@ -2,7 +2,8 @@
 // HARAR_TEST_POSTGRES names one), real P-256 device keys and a stand-in log
 // sink: every test asserts what a caller or the database would see.
 import assert from "node:assert/strict";
-import { createCipheriv, createDecipheriv, createHash, createHmac, webcrypto } from "node:crypto";
+import { createCipheriv, createDecipheriv, createECDH, createHash, createHmac, hkdfSync, webcrypto } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { after, describe, test } from "node:test";
 
@@ -91,8 +92,8 @@ async function setup(backend: Backend, extra: Partial<Config> = {}) {
 }
 
 /** A device: a P-256 key that signs requests the way docs/edge.md says. */
-async function device(call: Awaited<ReturnType<typeof setup>>["call"], clock: { ms: number }, code = SETUP, name = "mac") {
-  const keys = await webcrypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign", "verify"]);
+async function device(call: Awaited<ReturnType<typeof setup>>["call"], clock: { ms: number }, code = SETUP, name = "mac", given?: webcrypto.CryptoKeyPair) {
+  const keys = given ?? (await webcrypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign", "verify"]));
   const raw = new Uint8Array(await webcrypto.subtle.exportKey("raw", keys.publicKey));
   const paired = await call("POST", "/v1/pair", { body: { code, name, public_key: Buffer.from(raw).toString("base64url") } });
   const sign = async (method: string, path: string, body?: unknown, tweak: { time?: number; nonce?: string; bodyOverride?: string } = {}) => {
@@ -781,6 +782,85 @@ for (const backend of backends) {
       }
     });
 
+    /** A membership entry as members write one: plain JSON in `sealed`. */
+    const entryOp = (m: ReturnType<typeof member>, kind: string, entry: Record<string, unknown>) =>
+      m.op(kind, "entry", null, { sealed: Buffer.from(JSON.stringify(entry)).toString("base64url"), wrapped_key: "" });
+
+    test("sync: since names the members; everyone else comes through one discovery cursor", async () => {
+      const env = await ring(backend);
+      const { mac, phone, macM } = env;
+      const pairing = await mac.as("POST", "/v1/pairings");
+      const stranger = await device(env.call, env.clock, pairing.body.code, "stranger");
+      const strangerM = member(stranger, env.clock);
+      await mac.as("PUT", "/v1/sync", { ops: [await macM.op("put", "a", "1"), await macM.op("put", "b", "2")] });
+      await stranger.as("PUT", "/v1/sync", { ops: [await strangerM.op("member.add", "x", null), await strangerM.op("put", "s", "1")] });
+      const fresh = await phone.as("POST", "/v1/sync", { since: { [mac.id]: 0 }, discover: "" });
+      assert.deepEqual(fresh.body.ops.filter((o: Row) => o.author === stranger.id), [], "discovery waits a few seconds, so a batch still committing is never passed over");
+      env.clock.ms += 10_000;
+      const first = await phone.as("POST", "/v1/sync", { since: { [mac.id]: 0 }, discover: "" });
+      assert.equal(first.status, 200);
+      assert.equal(typeof first.body.discover, "string", "the edge hands back a discovery cursor");
+      assert.deepEqual(first.body.ops.map((o: Row) => [o.author, o.seq]).sort(), [[mac.id, 1], [mac.id, 2], [stranger.id, 1], [stranger.id, 2]].sort());
+      assert.deepEqual(Object.keys(first.body.next), [mac.id], "next names only the authors in since");
+      const again = await phone.as("POST", "/v1/sync", { since: first.body.next, discover: first.body.discover });
+      assert.deepEqual(again.body.ops, [], "nothing discovered twice");
+      await stranger.as("PUT", "/v1/sync", { ops: [await strangerM.op("put", "t", "2")] });
+      env.clock.ms += 10_000;
+      const later = await phone.as("POST", "/v1/sync", { since: first.body.next, discover: first.body.discover });
+      assert.deepEqual(later.body.ops.map((o: Row) => [o.author, o.seq]), [[stranger.id, 3]]);
+    });
+
+    test("devices: the ring's authority can't be unpaired by another device, nor a member without the authority's removal", async () => {
+      const env = await ring(backend);
+      const { mac, phone, macM } = env;
+      const pairing = await mac.as("POST", "/v1/pairings");
+      const stranger = await device(env.call, env.clock, pairing.body.code, "stranger");
+      const keys = (d: { id: string }) => ({ device: d.id, name: "n", sign_pub: "s", agree_pub: "a" });
+      const found = await entryOp(macM, "member.add", { type: "found", n: 0, prev: "", epoch: 0, id: "i", member: keys(mac), wraps: {} });
+      const add = await entryOp(macM, "member.add", { type: "add", n: 1, prev: "h", epoch: 0, id: "i", member: keys(phone), wraps: {} });
+      assert.equal((await mac.as("PUT", "/v1/sync", { ops: [found, add] })).status, 200);
+
+      const byPhone = await phone.as("DELETE", `/v1/devices/${mac.id}`);
+      assert.deepEqual([byPhone.status, byPhone.body.error], [403, "authority"], "only the authority unpairs itself");
+      const early = await mac.as("DELETE", `/v1/devices/${phone.id}`);
+      assert.deepEqual([early.status, early.body.error], [409, "needs_removal"], "a member goes only after the authority's removal");
+      const remove = await entryOp(macM, "rekey", { type: "remove", n: 2, prev: "h2", epoch: 1, id: "j", removed: [{ device: phone.id, after: 0 }], wraps: {} });
+      assert.equal((await mac.as("PUT", "/v1/sync", { ops: [remove] })).status, 200);
+      assert.equal((await mac.as("DELETE", `/v1/devices/${phone.id}`)).status, 200);
+      assert.equal((await mac.as("DELETE", `/v1/devices/${stranger.id}`)).status, 200, "a device that isn't a member goes as before");
+    });
+
+    test("sync: a page shares its room among authors, so one author with many ops never starves the others", async () => {
+      const { mac, phone, macM, phoneM } = await ring(backend);
+      const [first, second] = mac.id < phone.id ? [macM, phoneM] : [phoneM, macM];
+      const [firstDev, secondDev] = mac.id < phone.id ? [mac, phone] : [phone, mac];
+      // The author that sorts first has 250 ops; the other has 3.
+      const many: Row[] = [];
+      for (let i = 0; i < 250; i++) many.push(await first.op("put", `k${i}`, "v"));
+      for (let i = 0; i < 250; i += 100) assert.equal((await firstDev.as("PUT", "/v1/sync", { ops: many.slice(i, i + 100) })).status, 200);
+      const few = [await second.op("put", "a", "1"), await second.op("put", "b", "2"), await second.op("put", "c", "3")];
+      await secondDev.as("PUT", "/v1/sync", { ops: few });
+      const page = await phone.as("POST", "/v1/sync", { since: {} });
+      assert.ok(page.body.ops.length <= 100);
+      assert.deepEqual(page.body.ops.filter((o: Row) => o.author === secondDev.id).map((o: Row) => o.seq), [1, 2, 3], "the second author's ops are on the first page");
+      assert.equal(page.body.more, true);
+      assert.deepEqual((await pull(phone)).ops.map(sent).length, 253, "and following next still reads every op once");
+    });
+
+    test("sync: compaction drops an op only for a later write to its key by the same author", async () => {
+      const { clock, mac, phone, macM, phoneM } = await ring(backend);
+      const t = clock.ms;
+      // The phone's op is the latest it wrote on K; the Mac copies K's name
+      // (anyone paired can) and writes later. The phone's op must survive.
+      const phones = await phoneM.op("put", "K", "the phone's", { at: t });
+      await phone.as("PUT", "/v1/sync", { ops: [phones] });
+      const copied = await macM.op("put", "K", "a later write by someone else", { at: t + 1000, key: phones.key });
+      await mac.as("PUT", "/v1/sync", { ops: [copied] });
+      clock.ms = t + 31 * 24 * 60 * 60 * 1000;
+      const { ops } = await pull(mac);
+      assert.equal(ops.find((o) => o.author === phone.id)?.compacted, false, "the phone's latest op on K keeps its ciphertext");
+    });
+
     test("sync: compaction drops only superseded put/rotate/delete ops older than 30 days, and every chain still verifies", async () => {
       const { clock, mac, phone, macM, phoneM } = await ring(backend);
       const t = clock.ms;
@@ -791,33 +871,114 @@ for (const backend of backends) {
       const m2 = await macM.op("member.add", "member", "laptop", { at: t + 1000 });
       const n1 = await macM.op("put", "N", "gone", { at: t });
       const n2 = await macM.op("delete", "N", null, { at: t + 1000, version: 2 });
-      const q1 = await macM.op("put", "Q", "mac wins: later at", { at: t + 5000 });
-      // Same at on one key: the larger author id wins.
-      const tie = await macM.op("put", "T", "mac", { at: t + 2000 });
-      await mac.as("PUT", "/v1/sync", { ops: [k1, k2, l1, m1, m2, n1, n2, q1, tie] });
-      // The phone writes Q later, but with an older at: it loses.
-      const q2 = await phoneM.op("put", "Q", "phone loses: earlier at", { at: t + 4000 });
-      const tie2 = await phoneM.op("put", "T", "phone", { at: t + 2000 });
+      const q1 = await macM.op("put", "Q", "mac: later at", { at: t + 5000 });
+      // Same at on one key by one author: the larger seq supersedes.
+      const s1 = await macM.op("put", "S", "first", { at: t + 2000 });
+      const s2 = await macM.op("rotate", "S", "second", { at: t + 2000, version: 2 });
+      await mac.as("PUT", "/v1/sync", { ops: [k1, k2, l1, m1, m2, n1, n2, q1, s1, s2] });
+      // The phone writes Q too: another author's op on the key compacts
+      // nothing, either way.
+      const q2 = await phoneM.op("put", "Q", "phone: earlier at", { at: t + 4000 });
       clock.ms += 1000;
-      await phone.as("PUT", "/v1/sync", { ops: [q2, tie2] });
-      const [tieWinner, tieLoser] = mac.id > phone.id ? [tie, tie2] : [tie2, tie];
+      await phone.as("PUT", "/v1/sync", { ops: [q2] });
 
       const compacted = async () => (await pull(mac)).ops.filter((o) => o.compacted).map((o) => [o.author, o.seq]);
       clock.ms = t + 29 * 24 * 60 * 60 * 1000;
       assert.deepEqual(await compacted(), [], "nothing before 30 days");
       clock.ms = t + 31 * 24 * 60 * 60 * 1000;
       const ids = (ops: Row[]) => ops.map((o) => [o.author, o.seq]).sort();
-      assert.deepEqual((await compacted()).sort(), ids([k1, n1, q2, tieLoser]));
+      assert.deepEqual((await compacted()).sort(), ids([k1, n1, s1]));
 
       const { ops } = await pull(phone);
       const kept = ops.filter((o) => !o.compacted);
-      assert.deepEqual(ids(kept), ids([k2, l1, m1, m2, n2, q1, tieWinner]));
-      for (const o of kept) assert.deepEqual(sent(o), sent([k1, k2, l1, m1, m2, n1, n2, q1, tie, q2, tie2].find((x) => x.author === o.author && x.seq === o.seq)!));
+      assert.deepEqual(ids(kept), ids([k2, l1, m1, m2, n2, q1, s2, q2]));
+      for (const o of kept) assert.deepEqual(sent(o), sent([k1, k2, l1, m1, m2, n1, n2, q1, s1, s2, q2].find((x) => x.author === o.author && x.seq === o.seq)!));
       for (const o of ops.filter((x) => x.compacted)) assert.deepEqual([o.sealed, o.wrapped_key], [null, null]);
       await checkOps(ops, [mac, phone]);
 
-      // A member who lost the ring's history still learns the latest of each key.
-      assert.deepEqual(kept.filter((o) => o.kind !== "member.add").map((o) => open(o, macM.ring).value).sort(), ["mac wins: later at", "new", "only", null, tieWinner === tie ? "mac" : "phone"].sort());
+      // A member who lost the ring's history still learns each author's latest of each key.
+      assert.deepEqual(kept.filter((o) => o.kind !== "member.add").map((o) => open(o, macM.ring).value).sort(), ["mac: later at", "new", "only", null, "second", "phone: earlier at"].sort());
+    });
+
+    test("sync: harar's own ops (test/sync-vectors.json, made by the Rust member) are what docs/edge.md says, and the edge takes them as they are", async () => {
+      const env = await setup(backend);
+      const v = JSON.parse(readFileSync(new URL("./sync-vectors.json", import.meta.url), "utf8"));
+      const pub = Buffer.from(v.device.sign_pub, "base64url");
+      const curve = { name: "ECDSA", namedCurve: "P-256" };
+      const jwk = { kty: "EC", crv: "P-256", x: pub.subarray(1, 33).toString("base64url"), y: pub.subarray(33).toString("base64url"), d: v.device.sign_d };
+      const keys = { privateKey: await webcrypto.subtle.importKey("jwk", jwk, curve, false, ["sign"]), publicKey: await webcrypto.subtle.importKey("raw", pub, curve, true, ["verify"]) };
+      const ring = Buffer.from(v.ring, "base64url");
+      // The ring's subkeys (docs/edge.md §5b): names, and the wrap of data keys.
+      const subkey = (info: string) => Buffer.from(hkdfSync("sha256", ring, "harar-ring-v1", info, 32));
+      const [nameKey, wrapKey] = [subkey("harar-ring-name"), subkey("harar-ring-wrap")];
+
+      // Read the way this file reads docs/edge.md, not the way harar does.
+      for (const [i, { op, canonical, hash, opens }] of v.ops.entries()) {
+        assert.equal(canonicalOp(op, sha(op.sealed), sha(op.wrapped_key)), canonical, `op ${op.seq}'s canonical encoding`);
+        assert.equal(sha(canonical), hash, `op ${op.seq}'s hash`);
+        assert.equal(op.prev, i === 0 ? "" : v.ops[i - 1].hash, `op ${op.seq}'s prev`);
+        const sig = Buffer.from(op.sig, "base64url");
+        assert.ok(await webcrypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, keys.publicKey, sig, new TextEncoder().encode(canonical)), `op ${op.seq}'s signature`);
+        if (opens) {
+          assert.deepEqual(open(op, wrapKey), opens, `op ${op.seq} opens with the ring's wrap subkey`);
+          assert.throws(() => open(op, ring), `op ${op.seq}'s data key isn't wrapped by the bare ring key`);
+          assert.equal(createHmac("sha256", nameKey).update(opens.path).digest("base64url"), op.key, `op ${op.seq}'s key is the HMAC of its path under the name subkey`);
+        }
+      }
+
+      // The edge: a device with the vectors' key, under the vectors' id.
+      const dev = await device(env.call, env.clock, SETUP, "vector", keys);
+      await env.sql.query(`UPDATE harar_devices SET id = ? WHERE id = ?`, [v.device.id, dev.id]);
+      const as = async (method: string, path: string, body?: unknown) =>
+        env.call(method, path, { body, headers: { ...(await dev.sign(method, path, body)).headers, "harar-device": v.device.id } });
+      const ops = v.ops.map((o: Row) => o.op);
+      assert.deepEqual(await as("PUT", "/v1/sync", { ops }), { status: 200, body: { stored: 4, duplicates: 0 } });
+      const got = await as("POST", "/v1/sync", { since: {} });
+      assert.deepEqual(got.body.ops.map((o: Row) => o.hash), v.ops.map((o: Row) => o.hash), "the edge hashes them as harar does");
+      assert.deepEqual(got.body.ops.map(sent), ops);
+
+      // The log's head and entry key, and the two fingerprints (§5b).
+      const found = v.ops[0].op;
+      assert.equal(sha(`harar-log-v1\n${found.sealed}`), v.head, "head = sha256 of the found op's sealed");
+      assert.equal(createHash("sha256").update(`harar:log|${v.head}`).digest("base64url"), v.entry_key, "entry_key");
+      assert.equal(found.key, v.entry_key, "the found op's key is its entry key");
+      const agreePub = Buffer.from(v.device.agree_pub, "base64url");
+      const fingerprint = (label: string) => (createHash("sha256").update(Buffer.concat([Buffer.from(label), pub, agreePub])).digest("hex").slice(0, 32).match(/.{4}/g) ?? []).join("-");
+      assert.equal(fingerprint("harar-device-fp-v1\n"), v.device.fingerprint, "the device fingerprint");
+      assert.equal(fingerprint("harar-ring-fp-v1\n"), v.device.ring_fingerprint, "the ring fingerprint");
+
+      // The ring wrap in the found entry: ECIES to the founder's agreement
+      // key (X9.63 SHA-256 over the shared secret, the ephemeral point as
+      // shared info: a 16-byte AES-GCM key, then a 16-byte IV), opening to
+      // "harar-ring-wrap-v1\n" || epoch (4, big-endian) || device || "\n" || ring.
+      const entry = JSON.parse(Buffer.from(found.sealed, "base64url").toString("utf8"));
+      assert.equal(entry.wraps[v.device.id], v.ring_wrap.sealed, "the vector's wrap is the found entry's");
+      const wrap = Buffer.from(v.ring_wrap.sealed, "base64url");
+      const point = wrap.subarray(0, 65);
+      const ecdh = createECDH("prime256v1");
+      ecdh.setPrivateKey(Buffer.from(v.device.agree_d, "base64url"));
+      const shared = ecdh.computeSecret(point);
+      const derived = createHash("sha256").update(Buffer.concat([shared, Buffer.from([0, 0, 0, 1]), point])).digest();
+      const body = wrap.subarray(65);
+      const decipher = createDecipheriv("aes-128-gcm", derived.subarray(0, 16), derived.subarray(16, 32));
+      decipher.setAuthTag(body.subarray(body.length - 16));
+      const plain = Buffer.concat([decipher.update(body.subarray(0, body.length - 16)), decipher.final()]);
+      assert.equal(plain.toString("base64url"), v.ring_wrap.plain, "the wrap opens to the vector's plain text");
+      const epoch = Buffer.alloc(4);
+      epoch.writeUInt32BE(v.ring_wrap.epoch);
+      assert.deepEqual(plain, Buffer.concat([Buffer.from("harar-ring-wrap-v1\n"), epoch, Buffer.from(`${v.ring_wrap.to}\n`), ring]), "the wrap's plain text");
+
+      // Compacted, as the edge itself does it once the delete has superseded
+      // the put and the rotate and they are past the history it keeps.
+      env.clock.ms += 31 * 24 * 60 * 60 * 1000;
+      const later = await as("POST", "/v1/sync", { since: {} });
+      const kept = ["author", "seq", "prev", "kind", "key", "version", "sealed", "wrapped_key", "at", "sig", "hash", "sealed_sha256", "wrapped_key_sha256", "compacted"];
+      const pick = (o: Row) => Object.fromEntries(kept.map((k) => [k, o[k]]));
+      assert.deepEqual(later.body.ops.filter((o: Row) => o.compacted).map(pick), v.compacted.map((c: Row) => pick(c.served as Row)), "the edge compacts the put and rotate to the vectors' form");
+      for (const { served, canonical } of v.compacted) {
+        assert.equal(canonicalOp(served, served.sealed_sha256, served.wrapped_key_sha256), canonical, `compacted op ${served.seq}'s canonical`);
+        assert.equal(sha(canonical), served.hash, `compacted op ${served.seq} keeps its hash`);
+      }
     });
   });
 }

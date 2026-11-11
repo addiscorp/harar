@@ -10,6 +10,7 @@ mod primary;
 mod screen;
 mod ssh;
 mod store;
+mod sync;
 mod template;
 
 #[tokio::main]

@@ -43,6 +43,24 @@ pub(crate) enum AgentRequest {
     AllowHost { key: String, host: String },
     #[serde(rename = "revoke_host")]
     RevokeHost { key: String, host: String },
+    /// `harar edge sync …` (docs/edge.md §5b).
+    #[serde(rename = "sync")]
+    Sync(SyncCommand),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "sync", rename_all = "lowercase")]
+pub(crate) enum SyncCommand {
+    On { edge: Option<String> },
+    Off,
+    Status,
+    Now,
+    Trust { fingerprint: String },
+    Approve { device: String, fingerprint: String },
+    Transfer { device: String },
+    #[serde(rename = "reset-edge-view")]
+    ResetEdgeView,
+    Remove { device: String },
 }
 
 /// The vault keeps for itself, out of reach of get, put, delete and list:
@@ -114,6 +132,12 @@ pub(crate) struct Vault {
     unlocked: Option<Unlocked>,
     sessions: HashMap<i32, Instant>,
     last_use: Instant,
+    /// The ring this vault syncs with, when `harar edge sync on`.
+    sync: Option<crate::sync::member::Member>,
+    /// Wakes the sync worker: after a local change, to push it.
+    wake: Option<std::sync::mpsc::Sender<()>>,
+    /// Syncs in a row that had more to pull: the next waits longer.
+    more_streak: u32,
 }
 
 impl Vault {
@@ -129,7 +153,14 @@ impl Vault {
             unlocked: None,
             sessions: HashMap::new(),
             last_use: now,
+            sync: None,
+            wake: None,
+            more_streak: 0,
         }
+    }
+
+    pub(crate) fn set_sync(&mut self, member: Option<crate::sync::member::Member>) {
+        self.sync = member;
     }
 
     /// Forgets the key once the agent has been idle for `idle_lock`, and
@@ -146,6 +177,9 @@ impl Vault {
     pub(crate) fn lock(&mut self) {
         self.unlocked = None;
         self.sessions.clear();
+        if let Some(member) = self.sync.as_mut() {
+            member.forget();
+        }
     }
 
     pub(crate) fn status(&self) -> AgentStatus {
@@ -156,13 +190,15 @@ impl Vault {
         }
     }
 
-    /// Unlocks if needed and makes sure `session` is approved.
+    /// Unlocks if needed and makes sure `session` is approved. Unlocking
+    /// applies what other members wrote while the vault was locked.
     fn admit(&mut self, session: i32, now: Instant) -> Result<()> {
         if self.unlocked.is_none() {
             let identity = (self.unlock)()?;
             let keys = load_keys(&self.state_path, &identity)?;
             self.unlocked = Some(Unlocked { identity, keys });
             self.sessions.clear();
+            self.sync_after("unlock");
         } else if !self.sessions.contains_key(&session) {
             (self.approve)()?;
         }
@@ -206,9 +242,15 @@ impl Vault {
             }
             _ => {}
         }
+        if let AgentRequest::Sync(_) = request {
+            // Sync talks to the edge, so it runs outside the vault's lock
+            // (handle_sync); it never comes here.
+            return AgentReply::Vault(Box::new(VaultResponse::error("bad_request")));
+        }
         if let Err(err) = self.admit(session, now) {
             return AgentReply::Vault(Box::new(VaultResponse::error(format!("not_approved: {err:#}"))));
         }
+        let local_change = matches!(request, AgentRequest::Put { .. } | AgentRequest::Delete { .. });
         let unlocked = self.unlocked.as_mut().expect("admit unlocked the vault");
         let response = match request {
             AgentRequest::Unlock => VaultResponse::ok(),
@@ -291,9 +333,56 @@ impl Vault {
                 }
                 self.persist(next)
             }
-            AgentRequest::Status | AgentRequest::Lock => unreachable!("answered above"),
+            AgentRequest::Status | AgentRequest::Lock | AgentRequest::Sync(_) => unreachable!("answered above"),
         };
+        if local_change && response.ok {
+            self.sync_after("change");
+        }
         AgentReply::Vault(Box::new(response))
+    }
+
+    /// Runs a sync step on the unlocked vault (apply what other members
+    /// wrote, record what changed here as ops), and wakes the worker to push
+    /// any new ops. A failure is the sync's, never the request's: the change
+    /// is in the vault already, and the next step records it.
+    fn sync_after(&mut self, why: &str) {
+        match self.sync_step() {
+            Ok(true) => {
+                if let Some(wake) = &self.wake {
+                    let _ = wake.send(());
+                }
+            }
+            Ok(false) => {}
+            Err(err) => eprintln!("harar agent: sync after {why}: {err:#}"),
+        }
+    }
+
+    /// One sync step on the unlocked vault. Returns whether it queued ops.
+    fn sync_step(&mut self) -> Result<bool> {
+        let (Some(member), Some(unlocked)) = (self.sync.as_mut(), self.unlocked.as_mut()) else {
+            return Ok(false);
+        };
+        let queued = member.state.outbox.len();
+        let mut next = unlocked.keys.clone();
+        let stepped = member.step(&mut next)?;
+        for path in &stepped.changed {
+            // A value another member set goes nowhere until the owner says
+            // here, as a value set here does.
+            let _ = forget_hosts(&mut next, path);
+        }
+        // The ops first: a vault saved without them would never send them.
+        // The waiting ops it applied go only once the vault is saved, so a
+        // crash between the two loses nothing (applying again is harmless).
+        member.save()?;
+        if next != unlocked.keys {
+            write_encrypted_keys(&self.state_path, &unlocked.identity.to_public(), &next)?;
+            unlocked.keys = next;
+        }
+        if !stepped.applied.is_empty() {
+            member.applied(&stepped.applied);
+            member.save()?;
+        }
+        Ok(member.state.outbox.len() > queued)
     }
 
     /// Writes first, then swaps memory, so memory never holds what disk lacks.
@@ -314,6 +403,7 @@ impl Vault {
 pub(crate) enum AgentReply {
     Vault(Box<VaultResponse>),
     Status(AgentStatus),
+    Sync(serde_json::Value),
 }
 
 /// The terminal session a process belongs to. Every process started from one
@@ -464,6 +554,7 @@ pub(crate) fn bind(socket_path: &Path) -> Result<UnixListener> {
 pub(crate) async fn serve(listener: UnixListener, ssh: UnixListener, vault: Vault) -> Result<()> {
     let vault = Arc::new(Mutex::new(vault));
     tokio::spawn(crate::ssh::serve(ssh, Arc::clone(&vault)));
+    start_sync_worker(&vault);
     let mut tick = tokio::time::interval(Duration::from_secs(15));
     loop {
         tokio::select! {
@@ -493,6 +584,10 @@ async fn handle_connection(mut stream: UnixStream, vault: Arc<Mutex<Vault>>) -> 
     let bytes = read_request_bytes(&mut stream).await?;
     let reply = match serde_json::from_slice::<AgentRequest>(&bytes) {
         Err(_) => AgentReply::Vault(Box::new(VaultResponse::error("bad_request"))),
+        Ok(AgentRequest::Sync(command)) => {
+            let session = session_of(peer.pid);
+            tokio::task::spawn_blocking(move || handle_sync(&vault, &peer, session, command)).await.context("agent sync task")?
+        }
         Ok(request) => {
             let session = session_of(peer.pid);
             // Unlocking and approving can wait on the person, so keep that
@@ -511,6 +606,267 @@ async fn handle_connection(mut stream: UnixStream, vault: Arc<Mutex<Vault>>) -> 
     out.push(b'\n');
     stream.write_all(&out).await.context("write agent reply")?;
     Ok(())
+}
+
+// ------------------------------------------------------------------ sync
+
+/// One sync at a time, from the worker or a command.
+static CYCLE: Mutex<()> = Mutex::new(());
+
+/// The worker: a sync when the agent starts and after each local change,
+/// never on a timer (an edge is metered; docs/edge.md §5b).
+fn start_sync_worker(vault: &Arc<Mutex<Vault>>) {
+    let (wake, woken) = std::sync::mpsc::channel::<()>();
+    let start = {
+        let mut v = vault.lock().expect("agent state lock");
+        v.wake = Some(wake.clone());
+        v.sync.is_some()
+    };
+    let vault = Arc::clone(vault);
+    std::thread::spawn(move || {
+        while woken.recv().is_ok() {
+            while woken.try_recv().is_ok() {}
+            if let Err(err) = sync_cycle(&vault) {
+                eprintln!("harar agent: sync: {err:#}");
+            }
+        }
+    });
+    if start {
+        let _ = wake.send(());
+    }
+}
+
+fn lock_vault(vault: &Mutex<Vault>) -> std::sync::MutexGuard<'_, Vault> {
+    vault.lock().expect("agent state lock")
+}
+
+/// Pull, apply, push: a pull before every push, so a push is never refused
+/// for being behind. What fails is kept (ops stay queued) and reported, and
+/// is tried again at the next sync.
+pub(crate) fn sync_cycle(vault: &Mutex<Vault>) -> Result<serde_json::Value> {
+    use crate::sync::member::Member;
+    let _one = CYCLE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (edge, since, discover) = {
+        let v = lock_vault(vault);
+        let Some(member) = v.sync.as_ref() else { return Ok(serde_json::json!({ "on": false })) };
+        (member.edge.clone(), member.since(), member.discovery())
+    };
+    // The network and every signature happen outside the vault's lock.
+    let device = edge.key()?;
+    let pulled = Member::pull(&edge, &device, &since, discover.as_deref());
+    let discover = discover.unwrap_or_default();
+    let (unsigned, more) = {
+        let mut v = lock_vault(vault);
+        let Some(member) = v.sync.as_mut().filter(|m| m.edge.url == edge.url) else { return Ok(serde_json::json!({ "on": false })) };
+        let pulled = match pulled {
+            Ok(pulled) => pulled,
+            Err(err) => {
+                member.state.last_error = Some(format!("pull: {err:#}"));
+                member.save()?;
+                return Err(err.context("pull"));
+            }
+        };
+        member.ingest(pulled.ops);
+        member.state.discover = pulled.discover;
+        member.pull_complete = pulled.complete;
+        if pulled.complete {
+            member.rebase();
+        }
+        member.found_or_request()?;
+        if v.unlocked.is_some() {
+            v.sync_step()?;
+        }
+        let member = v.sync.as_mut().expect("still syncing");
+        member.save()?;
+        (member.unsigned(), !pulled.complete)
+    };
+    let signed = Member::sign(&device, unsigned)?;
+    let ready = {
+        let mut v = lock_vault(vault);
+        let Some(member) = v.sync.as_mut().filter(|m| m.edge.url == edge.url) else { return Ok(serde_json::json!({ "on": false })) };
+        member.signed(signed);
+        member.save()?;
+        member.ready()
+    };
+    let (sent, pushed) = Member::push(&edge, &device, &ready);
+    let mut v = lock_vault(vault);
+    // There was more to pull than one sync takes: another follows, but only
+    // if this one moved the cursor on, and later each time it repeats.
+    let advanced = v.sync.as_ref().is_some_and(|m| m.since() != since || m.state.discover != discover);
+    v.more_streak = if more && advanced { v.more_streak.saturating_add(1) } else { 0 };
+    if v.more_streak > 0
+        && let Some(wake) = v.wake.clone()
+    {
+        let delay = Duration::from_millis(100u64.saturating_mul(1 << v.more_streak.min(9)));
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            let _ = wake.send(());
+        });
+    }
+    let Some(member) = v.sync.as_mut().filter(|m| m.edge.url == edge.url) else { return Ok(serde_json::json!({ "on": false })) };
+    member.sent(&ready[..sent], pushed.as_ref().err());
+    member.save()?;
+    pushed.context("push")?;
+    Ok(serde_json::json!({ "pushed": sent, "queued": member.state.outbox.len(), "waiting": member.state.pending.len(), "more": more }))
+}
+
+/// `harar edge sync …`, for the owner, with the terminal approved as for
+/// any vault request.
+fn handle_sync(vault: &Mutex<Vault>, peer: &PeerCred, session: i32, command: SyncCommand) -> AgentReply {
+    {
+        let mut v = lock_vault(vault);
+        if peer.uid != v.owner_uid {
+            return AgentReply::Vault(Box::new(VaultResponse::error("not_owner")));
+        }
+        let now = Instant::now();
+        v.expire(now);
+        if let Err(err) = v.admit(session, now) {
+            return AgentReply::Vault(Box::new(VaultResponse::error(format!("not_approved: {err:#}"))));
+        }
+    }
+    match run_sync(vault, command) {
+        Ok(mut answer) => {
+            answer["ok"] = serde_json::Value::Bool(true);
+            AgentReply::Sync(answer)
+        }
+        Err(err) => AgentReply::Vault(Box::new(VaultResponse::error(format!("sync: {err:#}")))),
+    }
+}
+
+fn sync_status(vault: &Mutex<Vault>) -> Result<serde_json::Value> {
+    let mut v = lock_vault(vault);
+    let meta = v.unlocked.as_ref().map(|u| crate::sync::apply::VaultMeta::read(&u.keys));
+    match v.sync.as_mut() {
+        Some(member) => {
+            let mut status = member.status(meta.as_ref())?;
+            status["on"] = serde_json::Value::Bool(true);
+            Ok(status)
+        }
+        None => Ok(serde_json::json!({ "on": false })),
+    }
+}
+
+fn run_sync(vault: &Mutex<Vault>, command: SyncCommand) -> Result<serde_json::Value> {
+    use crate::cli::edge::{AgreementKey, Paired, SyncConfig, read_edges, write_edges};
+    use crate::sync::member::Member;
+    use serde_json::json;
+    match command {
+        SyncCommand::On { edge } => {
+            let paired = Paired::find_url(edge.as_deref())?;
+            let mut edges = read_edges()?;
+            if let Some(other) = edges.edges.iter().find(|e| e.url != paired.url && e.sync.is_some()) {
+                return Err(anyhow!("this vault already syncs through {} (one ring per vault)", other.url));
+            }
+            let entry = edges.edges.iter_mut().find(|e| e.url == paired.url).ok_or_else(|| anyhow!("{} is no longer paired", paired.url))?;
+            match entry.sync.as_mut() {
+                Some(config) => config.on = true,
+                None => {
+                    let (_, agreement) = AgreementKey::create(&entry.url, &entry.key)?;
+                    entry.sync = Some(SyncConfig { on: true, agreement });
+                }
+            }
+            let entry = entry.clone();
+            write_edges(&edges)?;
+            lock_vault(vault).sync = Some(Member::load(entry)?);
+            let synced = sync_cycle(vault);
+            let mut status = sync_status(vault)?;
+            if let Err(err) = synced {
+                status["error"] = json!(format!("{err:#}"));
+            }
+            Ok(status)
+        }
+        SyncCommand::Off => {
+            let mut edges = read_edges()?;
+            let mut off = Vec::new();
+            for entry in &mut edges.edges {
+                if let Some(config) = entry.sync.as_mut().filter(|c| c.on) {
+                    config.on = false;
+                    off.push(entry.url.clone());
+                }
+            }
+            write_edges(&edges)?;
+            lock_vault(vault).sync = None;
+            Ok(json!({ "on": false, "off": off, "note": "Nothing was deleted: the ring keys, the queued ops and the vault stay as they are. harar edge sync on picks up where this left off." }))
+        }
+        SyncCommand::Status => sync_status(vault),
+        SyncCommand::Now => {
+            let synced = sync_cycle(vault)?;
+            let mut status = sync_status(vault)?;
+            status["synced"] = synced;
+            Ok(status)
+        }
+        SyncCommand::Trust { fingerprint } => {
+            let trusted = {
+                let mut v = lock_vault(vault);
+                let member = v.sync.as_mut().ok_or_else(|| anyhow!("sync is off; harar edge sync on first"))?;
+                let trusted = member.trust(&fingerprint)?;
+                member.save()?;
+                trusted
+            };
+            let synced = sync_cycle(vault);
+            let mut status = sync_status(vault)?;
+            status["trusted"] = trusted["trusted"].clone();
+            if let Err(err) = synced {
+                status["error"] = json!(format!("{err:#}"));
+            }
+            Ok(status)
+        }
+        SyncCommand::Approve { device, fingerprint } => {
+            sync_cycle(vault)?;
+            let approved = {
+                let mut v = lock_vault(vault);
+                let member = v.sync.as_mut().ok_or_else(|| anyhow!("sync is off; harar edge sync on first"))?;
+                let approved = member.approve(&device, &fingerprint)?;
+                member.save()?;
+                approved
+            };
+            sync_cycle(vault)?;
+            Ok(approved)
+        }
+        SyncCommand::ResetEdgeView => {
+            sync_cycle(vault).ok();
+            let reset = {
+                let mut v = lock_vault(vault);
+                let member = v.sync.as_mut().ok_or_else(|| anyhow!("sync is off; harar edge sync on first"))?;
+                let reset = member.reset_edge_view()?;
+                member.save()?;
+                reset
+            };
+            let synced = sync_cycle(vault);
+            let mut status = sync_status(vault)?;
+            status["reset"] = reset;
+            if let Err(err) = synced {
+                status["error"] = json!(format!("{err:#}"));
+            }
+            Ok(status)
+        }
+        SyncCommand::Transfer { device } => {
+            sync_cycle(vault)?;
+            let moved = {
+                let mut v = lock_vault(vault);
+                let member = v.sync.as_mut().ok_or_else(|| anyhow!("sync is off; harar edge sync on first"))?;
+                let moved = member.transfer(&device)?;
+                member.save()?;
+                moved
+            };
+            sync_cycle(vault)?;
+            Ok(moved)
+        }
+        SyncCommand::Remove { device } => {
+            sync_cycle(vault)?;
+            let removed = {
+                let mut v = lock_vault(vault);
+                let member = v.sync.as_mut().ok_or_else(|| anyhow!("sync is off; harar edge sync on first"))?;
+                let removed = member.remove(&device)?;
+                member.save()?;
+                removed
+            };
+            if removed.is_some() {
+                sync_cycle(vault)?;
+            }
+            Ok(removed.unwrap_or_else(|| json!({ "removed": null, "note": format!("{device} is not a member of the ring") })))
+        }
+    }
 }
 
 /// A LaunchAgent that starts `harar agent` at login and restarts it if it
