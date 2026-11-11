@@ -19,7 +19,7 @@ jobs:
   # The npm package `harar` (import { vault } from 'harar'): its tests on
   # Node and on Bun, and what it would publish.
   js:
-    runs-on: ubuntu-24.04
+    runs-on: mirab-linux-arm64
     defaults:
       run:
         working-directory: js
@@ -146,7 +146,7 @@ jobs:
       - run: go test -race -v ./...
 
   linux:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04  # needs Docker; mirab VMs gain it with the full kernel
     # Compilation is cached in R2. public-ci holds only the key for this
     # repo's sccache buckets (the dsc model); publishing keys are in release.
     environment: public-ci
