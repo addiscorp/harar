@@ -4,11 +4,11 @@
 # never publish here: crates.io versions are permanent (APS 3, APS 9). The
 # harar binary ships from harar-releases, never from a registry (APS 13).
 #
-# The token (APS 3): CARGO_TOKEN in the `release` environment, a crates.io
-# token that can only publish new versions of `harar`. Once the crate exists,
-# crates.io trusted publishing replaces it (this file, `crates.yml`, in the
-# `release` environment: it runs as itself, not inside Promote) and the token
-# is revoked.
+# No token (APS 3): crates.io trusted publishing trusts this file,
+# `crates.yml`, in the `release` environment. Promote dispatches it rather
+# than calling it, because crates.io matches the top-level workflow
+# (`workflow_ref`). crates-io-auth-action swaps the job's OIDC token for a
+# short-lived crates.io token and revokes it when the job ends.
 name: Publish to crates.io
 
 on:
@@ -21,6 +21,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write # OIDC: trusted publishing
 
 jobs:
   publish:
@@ -29,15 +30,8 @@ jobs:
     environment: release
     env:
       V: ${{ inputs.version }}
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
       CARGO_TERM_COLOR: always
     steps:
-      - name: The token is present
-        run: |
-          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
-            echo "::error::Needs Sami: CARGO_TOKEN on addiscorp/harar/release (a crates.io token that may publish new versions of harar)."
-            exit 1
-          fi
       - name: The version is a stable release
         run: |
           if [[ ! "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -60,8 +54,14 @@ jobs:
           true
       - name: Package
         run: cargo package --locked -p harar
+      - name: Trusted publishing token
+        if: steps.existing.outputs.published == 'no'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
       - name: Publish
         if: steps.existing.outputs.published == 'no'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish --locked -p harar
       # Success is crates.io serving these bytes, not a green step: the .crate
       # it serves must be the one this job packaged.
