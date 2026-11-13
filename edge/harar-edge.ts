@@ -11,7 +11,7 @@
 // the edge never has); and a hash-chained log of every request, shipped as
 // OpenTelemetry logs to sinks that should live in another account.
 
-export const VERSION = "0.3.1";
+export const VERSION = "0.4.0";
 
 // ---------------------------------------------------------------- config
 

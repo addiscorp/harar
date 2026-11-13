@@ -411,3 +411,113 @@ async fn a_connection_over_the_limit_is_told_why() {
     assert_eq!(serde_json::from_slice::<PrimaryResponse>(&reply).unwrap().error.as_deref(), Some("too_many_connections"));
     assert!(started.elapsed() < Duration::from_secs(1), "refused before reading anything");
 }
+
+/// id.addis.gg's service on bugsy, as the OS user `addis-id`: it may add,
+/// remove and show the org's members, and nothing else. sami and every human
+/// are bound org-wide (`gg.addis.zone.*`) to roles that become their groups.
+async fn add_identity_service(primary: &Primary) {
+    let approve = |class: &str| Permission { verb: Verb::Approve, resource: class.into(), scopes: vec![] };
+    let role = Role { name: name("gg.addis.role.identity"), allows: vec![approve("actors.*")] };
+    let group = |local: &str| Role { name: name(&format!("gg.addis.role.{local}")), allows: vec![Permission { verb: Verb::Read, resource: format!("{local}/*"), scopes: vec![] }] };
+    let everywhere = || ZoneMatch::Name("gg.addis.zone.*".parse().unwrap());
+    for step in [
+        PolicyChange::SetRole { role },
+        PolicyChange::SetRole { role: group("admin") },
+        PolicyChange::SetRole { role: group("staff") },
+        PolicyChange::Bind {
+            binding: Binding { actor: "gg.addis.service.id".parse().unwrap(), zone: ZoneMatch::Name("gg.addis.zone.bugsy".parse().unwrap()), role: name("gg.addis.role.identity") },
+        },
+        PolicyChange::Bind { binding: Binding { actor: "gg.addis.human.sami".parse().unwrap(), zone: everywhere(), role: name("gg.addis.role.admin") } },
+        PolicyChange::Bind { binding: Binding { actor: "gg.addis.human.*".parse().unwrap(), zone: everywhere(), role: name("gg.addis.role.staff") } },
+        PolicyChange::MapUser { user: "addis-id".into(), actor: name("gg.addis.service.id") },
+    ] {
+        let answer = ask(primary, "sami", change(step)).await;
+        assert!(answer.ok, "{answer:?}");
+    }
+}
+
+fn actor_add(actor: &str) -> PrimaryRequest {
+    PrimaryRequest::ActorAdd { actor: name(actor) }
+}
+
+fn actor_show(actor: &str) -> PrimaryRequest {
+    PrimaryRequest::ActorShow { actor: name(actor) }
+}
+
+fn actor_remove(actor: &str) -> PrimaryRequest {
+    PrimaryRequest::ActorRemove { actor: name(actor) }
+}
+
+#[tokio::test]
+async fn members_are_added_once_by_name_and_shown_with_their_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let (primary, identity) = primary(dir.path()).await;
+    add_identity_service(&primary).await;
+    assert!(ask(&primary, "addis-id", actor_add("gg.addis.agent.ava")).await.ok);
+    // A retry changes nothing and is still ok.
+    assert!(ask(&primary, "addis-id", actor_add("gg.addis.agent.ava")).await.ok);
+    let shown = ask(&primary, "addis-id", actor_show("gg.addis.agent.ava")).await.actor.expect("a member");
+    assert_eq!(shown.name, name("gg.addis.agent.ava"));
+    assert_eq!(shown.added_by, name("gg.addis.service.id"));
+    assert!(shown.groups.is_empty(), "an agent bound nowhere has no groups");
+    // One name, one member: ava@addis.gg can't be a person too.
+    assert_eq!(refused(&ask(&primary, "addis-id", actor_add("gg.addis.human.ava")).await), "name_taken");
+    for wrong in ["gg.addis.service.web", "gg.addis.user.u-1", "com.acme.agent.ava"] {
+        assert_eq!(refused(&ask(&primary, "addis-id", actor_add(wrong)).await), "not_a_member_kind", "{wrong}");
+    }
+    assert!(ask(&primary, "addis-id", actor_add("gg.addis.human.sami")).await.ok);
+    assert_eq!(ask(&primary, "addis-id", actor_show("gg.addis.human.sami")).await.actor.unwrap().groups, ["admin", "staff"]);
+    assert_eq!(refused(&ask(&primary, "addis-id", actor_show("gg.addis.human.meron")).await), "not_found", "only members are shown");
+    // The registry is kept: a restarted primary still knows them.
+    let restarted = with_identity(dir.path(), &identity).await;
+    assert!(ask(&restarted, "addis-id", actor_show("gg.addis.agent.ava")).await.ok);
+}
+
+#[tokio::test]
+async fn groups_are_read_from_the_policy_as_it_is_now() {
+    let dir = tempfile::tempdir().unwrap();
+    let (primary, _) = primary(dir.path()).await;
+    add_identity_service(&primary).await;
+    assert!(ask(&primary, "addis-id", actor_add("gg.addis.agent.ava")).await.ok);
+    let staff = Binding { actor: "gg.addis.agent.ava".parse().unwrap(), zone: ZoneMatch::Name("gg.addis.zone.*".parse().unwrap()), role: name("gg.addis.role.staff") };
+    assert!(ask(&primary, "sami", change(PolicyChange::Bind { binding: staff.clone() })).await.ok);
+    assert_eq!(ask(&primary, "addis-id", actor_show("gg.addis.agent.ava")).await.actor.unwrap().groups, ["staff"]);
+    assert!(ask(&primary, "sami", change(PolicyChange::Unbind { binding: staff })).await.ok);
+    assert!(ask(&primary, "addis-id", actor_show("gg.addis.agent.ava")).await.actor.unwrap().groups.is_empty());
+}
+
+#[tokio::test]
+async fn removing_a_member_takes_its_name_and_its_own_bindings_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (primary, _) = primary(dir.path()).await;
+    add_identity_service(&primary).await;
+    assert!(ask(&primary, "addis-id", actor_add("gg.addis.agent.ava")).await.ok);
+    let own = Binding { actor: "gg.addis.agent.ava".parse().unwrap(), zone: ZoneMatch::Name("gg.addis.zone.*".parse().unwrap()), role: name("gg.addis.role.staff") };
+    assert!(ask(&primary, "sami", change(PolicyChange::Bind { binding: own })).await.ok);
+    assert!(ask(&primary, "addis-id", actor_remove("gg.addis.agent.ava")).await.ok);
+    assert_eq!(refused(&ask(&primary, "addis-id", actor_show("gg.addis.agent.ava")).await), "not_found");
+    let policy = ask(&primary, "sami", PrimaryRequest::PolicyShow).await.policy.unwrap().policy;
+    assert!(!policy.bindings.iter().any(|binding| binding.actor.to_string() == "gg.addis.agent.ava"), "its own binding went with it");
+    assert!(policy.bindings.iter().any(|binding| binding.actor.to_string() == "gg.addis.human.*"), "patterns stay");
+    // Gone already: still ok, so a retry is safe. Added again, it starts with nothing.
+    assert!(ask(&primary, "addis-id", actor_remove("gg.addis.agent.ava")).await.ok);
+    assert!(ask(&primary, "addis-id", actor_add("gg.addis.agent.ava")).await.ok);
+    assert!(ask(&primary, "addis-id", actor_show("gg.addis.agent.ava")).await.actor.unwrap().groups.is_empty());
+    // An OS user still speaks as sami: removing him would lock the owner out.
+    assert!(ask(&primary, "addis-id", actor_add("gg.addis.human.sami")).await.ok);
+    assert_eq!(refused(&ask(&primary, "addis-id", actor_remove("gg.addis.human.sami")).await), "actor_in_use");
+}
+
+#[tokio::test]
+async fn only_a_caller_allowed_actors_may_touch_the_registry() {
+    let dir = tempfile::tempdir().unwrap();
+    let (primary, _) = primary(dir.path()).await;
+    add_site(&primary).await;
+    add_identity_service(&primary).await;
+    for request in [actor_add("gg.addis.agent.ava"), actor_show("gg.addis.agent.ava"), actor_remove("gg.addis.agent.ava")] {
+        assert_eq!(refused(&ask(&primary, "site", request).await), "no_binding");
+    }
+    assert_eq!(refused(&ask(&primary, "mallory", actor_add("gg.addis.agent.ava")).await), "unknown_caller");
+    // The registry is the primary's own entry, never a secret anyone reads.
+    assert_eq!(refused(&ask(&primary, "sami", PrimaryRequest::Get { key: ACTORS_KEY.into() }).await), "reserved_key");
+}

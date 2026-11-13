@@ -22,6 +22,26 @@ A gateway that attaches keys on their way out (`import { gateway } from
 'rixse'`) asks where each may go, and for it for one host only:
 `hosts(secret)` and `send(secret, host)`. A refusal, or a harar that cannot be reached, is an error naming why.
 
+## The org's members
+
+An identity service on the primary's machine (id.addis.gg) keeps people and
+agents in step with the primary over its local socket:
+
+```js
+import { actors } from 'harar'
+
+const members = actors() // the primary at /run/harar.sock
+await members.add('gg.addis.agent.ava')      // again: ok, nothing changes
+const ava = await members.show('gg.addis.agent.ava') // { name, groups, addedAt, addedBy }, or null
+await members.remove('gg.addis.agent.ava')   // with every binding naming it
+```
+
+`groups` is read from the policy each time: the roles bound to the member in
+every zone. The OS user the service runs as needs a role allowing
+`approve actors.*` (or `actors.add`, `actors.remove`, `actors.show`). A
+refusal, or a primary that can't be reached within `timeoutMs` (10 s), is an
+error, so a caller can fail closed.
+
 ## At a harar edge
 
 A service off your network (Railway, Vercel, CI) resolves the same references at

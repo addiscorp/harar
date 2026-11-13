@@ -18,14 +18,22 @@ const MAX_ANSWER = 1024 * 1024
 /** How long harar has to answer (a per-user agent may be asking for Touch ID). */
 const TIMEOUT_MS = 60_000
 
+/** A refusal from harar: `code` is harar's own reason (`no_binding`, `not_found`, …). */
+class Refused extends Error {
+  constructor(message, code) {
+    super(message)
+    this.code = code
+  }
+}
+
 /** One request to harar, and its answer if it says ok; otherwise why not. */
-function ask(socket, request, what) {
+function ask(socket, request, what, timeoutMs = TIMEOUT_MS) {
   return new Promise((done, fail) => {
     const conn = connect(socket)
     const chunks = []
     let size = 0
-    conn.setTimeout(TIMEOUT_MS, () =>
-      conn.destroy(new Error(`harar did not answer in ${TIMEOUT_MS / 1000} s`)),
+    conn.setTimeout(timeoutMs, () =>
+      conn.destroy(new Error(`harar did not answer in ${timeoutMs / 1000} s`)),
     )
     conn.on('connect', () => conn.end(JSON.stringify(request)))
     conn.on('data', (chunk) => {
@@ -44,11 +52,8 @@ function ask(socket, request, what) {
       if (typeof answer !== 'object' || answer === null || Array.isArray(answer))
         return fail(new Error(`harar at ${socket} did not answer with an object`))
       if (answer.ok === true) return done(answer)
-      fail(
-        new Error(
-          `harar refused ${what}: ${typeof answer.error === 'string' ? answer.error : 'no answer'}`,
-        ),
-      )
+      const code = typeof answer.error === 'string' ? answer.error : 'no answer'
+      fail(new Refused(`harar refused ${what}: ${code}`, code))
     })
   })
 }
@@ -150,6 +155,55 @@ function edgeVault(edge, token) {
         keysOf(refs)
         return askEdge(base, token, refs, refs.length === 1 ? refs[0] : `${refs.length} references`)
       },
+    },
+  }
+}
+
+/** Where a primary (`harar serve`) listens by default. */
+export const PRIMARY_SOCKET = '/run/harar.sock'
+/** An identity service asks on behalf of a person signing in: it waits seconds, not a minute. */
+const ACTORS_TIMEOUT_MS = 10_000
+/** A member's name: `<org>.human.<local>` or `<org>.agent.<local>` (harar decides the rest). */
+const MEMBER = /^[a-z0-9-]+(\.[a-z0-9-]+)+\.(human|agent)\.[a-z0-9-]+$/
+
+/** The org's members at a primary (architecture, §2a): `add`, `remove` and
+ *  `show`, for an identity service on the same machine. A refusal or a
+ *  primary that can't be reached is an error; only `show` of a name that is
+ *  not a member answers null. */
+export function actors(options = {}) {
+  const { socket = PRIMARY_SOCKET, timeoutMs = ACTORS_TIMEOUT_MS } = options
+  if (typeof socket !== 'string' || !socket.startsWith('/'))
+    throw new Error('actors({ socket }): the socket is an absolute path')
+  if (!Number.isInteger(timeoutMs) || timeoutMs <= 0)
+    throw new Error('actors({ timeoutMs }): a whole number of milliseconds')
+  const named = (actor) => {
+    if (typeof actor !== 'string' || !MEMBER.test(actor))
+      throw new Error(`not a member's name: ${JSON.stringify(actor)}`)
+    return actor
+  }
+  return {
+    async add(actor) {
+      await ask(socket, { op: 'actor_add', actor: named(actor) }, `adding ${actor}`, timeoutMs)
+    },
+    async remove(actor) {
+      await ask(socket, { op: 'actor_remove', actor: named(actor) }, `removing ${actor}`, timeoutMs)
+    },
+    async show(actor) {
+      let answer
+      try {
+        answer = await ask(socket, { op: 'actor_show', actor: named(actor) }, actor, timeoutMs)
+      } catch (e) {
+        if (e instanceof Refused && e.code === 'not_found') return null
+        throw e
+      }
+      const found = answer.actor
+      if (
+        typeof found !== 'object' || found === null || found.name !== actor ||
+        !Array.isArray(found.groups) || !found.groups.every((g) => typeof g === 'string') ||
+        !Number.isInteger(found.added_at) || typeof found.added_by !== 'string'
+      )
+        throw new Error(`harar sent no member for ${actor}`)
+      return { name: found.name, groups: found.groups, addedAt: found.added_at, addedBy: found.added_by }
     },
   }
 }

@@ -6,7 +6,7 @@ is the OS user your program runs as: the kernel tells harar.
 
 ```toml
 [dependencies]
-harar = "0.3"
+harar = "0.4"
 ```
 
 ```rust,no_run

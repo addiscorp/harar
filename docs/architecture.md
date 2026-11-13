@@ -47,6 +47,34 @@ gg.addis.agent.ava
 An org owns its name by a DNS TXT record on its domain that names its issuer
 URL. That record is how another org finds the issuer when it decides to trust it.
 
+## 2a. Members
+
+The primary keeps a registry of the org's **members**: its humans and agents
+(`harar:actors`, the primary's own entry, never a secret). An identity service
+on the primary's machine (id.addis.gg) keeps its accounts in step with it over
+the local socket (`actors()` in the JavaScript client), so the two can't
+disagree about who exists.
+
+- `actor_add` registers a human or an agent of this org. It grants nothing:
+  bindings do. **One name, one member**: a local label another kind already
+  holds is refused (`name_taken`), because an address like `ava@addis.gg` can
+  only be one of them. Adding a member that is already there is ok and changes
+  nothing, so a retry is safe.
+- `actor_remove` takes a member out at once (it only takes away): its entry
+  and every binding naming it exactly, so a name added again starts with
+  nothing. Not there: ok. A member an OS user still speaks as is refused
+  (`actor_in_use`), so removing one never locks the owner out.
+- `actor_show` answers the member and its **groups**: the local labels of the
+  roles bound to it in every zone (zone pattern `<org>.zone.*`), read from the
+  policy as it is at that moment. A binding to one machine or to a profile is
+  about what runs there, not about who someone is, so it is not a group. This
+  is what an identity provider puts in an ID token's `groups`. Not a member:
+  `not_found`.
+- Each is allowed by an `approve` permission on its class (`actors.add`,
+  `actors.remove`, `actors.show`, or `actors.*`), as `policy.show` is.
+  `decide` doesn't consult the registry; a binding's pattern still matches a
+  name whether or not it is a member.
+
 ## 3. The request rule
 
 A request is allowed when **all** of these hold:
@@ -414,6 +442,11 @@ PRs #31–#36 stay open as reference until their code is moved over.
 - **The issuer for `gg.addis` is `https://account.addis.gg`**, Addis's account
   service (not built yet). Until it is, the issuer URL is configured per
   primary. Names avoid "id" for the account system.
+- **The team's identity is id.addis.gg** (Sami, 12 Nov): people and agents,
+  on our own hardware, beside this primary, which it reaches over the local
+  socket. account.addis.gg stays the public product login. id.addis.gg's
+  accounts and the members registry (§2a) move together: an account exists
+  only once `actor_add` succeeded, and its `groups` are `actor_show`'s.
 
 ## 13. Open questions
 

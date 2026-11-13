@@ -774,6 +774,27 @@ impl Policy {
         Decision::Allow { by_role: role.name.clone() }
     }
 
+    /// `actor`'s groups, for an identity provider's `groups` claim: the local
+    /// labels of the roles bound to it in every zone of the org (zone pattern
+    /// `<org>.zone.*`), sorted, once each. A binding to one machine, or to a
+    /// profile, is about what runs there, not about who someone is, so it is
+    /// not a group. Only roles that exist count.
+    pub fn groups(&self, actor: &Name) -> Vec<String> {
+        let everywhere = |zone: &ZoneMatch| {
+            matches!(zone, ZoneMatch::Name(pattern) if pattern.org == self.org && pattern.kind == Kind::Zone && pattern.wildcard && pattern.local.is_empty())
+        };
+        let mut groups: Vec<String> = self
+            .bindings
+            .iter()
+            .filter(|binding| binding.actor.matches(actor) && everywhere(&binding.zone))
+            .filter_map(|binding| self.role(&binding.role))
+            .map(|role| role.name.local().to_string())
+            .collect();
+        groups.sort();
+        groups.dedup();
+        groups
+    }
+
     /// Every host pattern `actor`, in `zone` (through `via`), may send the
     /// secret at `path` to, sorted: what a station opens for that secret.
     /// Each one still goes through `decide` when the secret is sent.
@@ -930,6 +951,32 @@ mod tests {
         // Vouched for by the zone's own broker, as a real request would be.
         let via = policy.zone(&zone).and_then(|zone| zone.broker.clone());
         policy.decide(&Request { actor: &name(actor), zone: &zone, via: via.as_ref(), action, session: None }, NOW)
+    }
+
+    #[test]
+    fn groups_are_the_roles_bound_in_every_zone_and_nothing_narrower() {
+        let mut policy = Policy::new("gg.addis".parse().unwrap());
+        for role in ["admin", "staff", "builder", "site"] {
+            policy.roles.push(Role { name: name(&format!("gg.addis.role.{role}")), allows: vec![permission(Verb::Read, "x/*")] });
+        }
+        let bind = |actor: &str, zone: ZoneMatch, role: &str| Binding { actor: pattern(actor), zone, role: name(&format!("gg.addis.role.{role}")) };
+        let everywhere = || ZoneMatch::Name(pattern("gg.addis.zone.*"));
+        policy.bindings = vec![
+            bind("gg.addis.human.sami", everywhere(), "staff"),
+            bind("gg.addis.human.sami", everywhere(), "admin"),
+            bind("gg.addis.human.*", everywhere(), "staff"),
+            // On one machine, or a profile: what runs there, not who someone is.
+            bind("gg.addis.human.sami", ZoneMatch::Name(pattern("gg.addis.zone.storage")), "site"),
+            bind("gg.addis.agent.*", ZoneMatch::Profile(name("gg.addis.profile.build-vm")), "builder"),
+            bind("gg.addis.agent.*", ZoneMatch::Name(pattern("gg.addis.zone.vm-*")), "builder"),
+            // A role that doesn't exist is no group.
+            bind("gg.addis.human.sami", everywhere(), "ghost"),
+        ];
+        assert_eq!(policy.groups(&name("gg.addis.human.sami")), ["admin", "staff"]);
+        assert_eq!(policy.groups(&name("gg.addis.human.meron")), ["staff"]);
+        assert!(policy.groups(&name("gg.addis.agent.ava")).is_empty());
+        // Another org's names never match.
+        assert!(policy.groups(&name("com.acme.human.sami")).is_empty());
     }
 
     #[test]
