@@ -61,6 +61,31 @@ pub enum PrimaryRequest {
     /// the old one: a reserved `recovery.codes` change their own device
     /// approves, and the approval returns the codes.
     NewRecoveryCodes,
+    /// Registers a member of the org: a human or an agent (architecture,
+    /// §2a). Grants nothing by itself; bindings do. One name, one member: a
+    /// local label already held by another kind is refused. Adding one that
+    /// is already there is ok and changes nothing, so a retry is safe.
+    /// Allowed by `approve actors.add`.
+    ActorAdd { actor: Name },
+    /// Takes a member out, at once (it only takes away): the registry entry
+    /// and every binding that names it exactly. Removing one that isn't there
+    /// is ok. Allowed by `approve actors.remove`.
+    ActorRemove { actor: Name },
+    /// A registered member and its groups: the roles bound to it in every
+    /// zone (`<org>.zone.*`), what an identity provider puts in `groups`.
+    /// Not registered: `not_found`. Allowed by `approve actors.show`.
+    ActorShow { actor: Name },
+}
+
+/// A member of the org, as `actor_show` answers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActorView {
+    pub name: Name,
+    /// The local labels of the roles bound to it in every zone, sorted.
+    pub groups: Vec<String>,
+    pub added_at: u64,
+    /// Who registered it.
+    pub added_by: Name,
 }
 
 /// What a waiting request would do once approved.
@@ -180,6 +205,9 @@ pub struct PrimaryResponse {
     pub notices: Option<Vec<Notice>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_codes_left: Option<usize>,
+    /// For `actor_show`: the member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<ActorView>,
 }
 
 /// Something a person should know about their own account, kept a week.
@@ -211,6 +239,22 @@ mod tests {
         assert_eq!(serde_json::to_string(&PrimaryRequest::List).unwrap(), r#"{"op":"list"}"#);
         let token: PrimaryRequest = serde_json::from_str(r#"{"op":"token","audience":"https://api.simien.dev","scopes":["deploy:site"]}"#).unwrap();
         assert!(matches!(token, PrimaryRequest::Token(ask) if ask.audience == "https://api.simien.dev"));
+    }
+
+    #[test]
+    fn actor_requests_are_what_the_javascript_client_sends() {
+        let add: PrimaryRequest = serde_json::from_str(r#"{"op":"actor_add","actor":"gg.addis.agent.ava"}"#).unwrap();
+        assert_eq!(add, PrimaryRequest::ActorAdd { actor: "gg.addis.agent.ava".parse().unwrap() });
+        let show: PrimaryRequest = serde_json::from_str(r#"{"op":"actor_show","actor":"gg.addis.human.sami"}"#).unwrap();
+        assert_eq!(show, PrimaryRequest::ActorShow { actor: "gg.addis.human.sami".parse().unwrap() });
+        assert!(serde_json::from_str::<PrimaryRequest>(r#"{"op":"actor_remove","actor":"not a name"}"#).is_err());
+        // The answer js/test/actors.test.js reads back.
+        let view = ActorView { name: "gg.addis.agent.ava".parse().unwrap(), groups: vec!["staff".into()], added_at: 1_800_000_000, added_by: "gg.addis.service.id".parse().unwrap() };
+        let answer = serde_json::to_value(PrimaryResponse { actor: Some(view), ..PrimaryResponse::ok() }).unwrap();
+        assert_eq!(
+            answer,
+            serde_json::json!({ "ok": true, "actor": { "name": "gg.addis.agent.ava", "groups": ["staff"], "added_at": 1_800_000_000u64, "added_by": "gg.addis.service.id" } })
+        );
     }
 
     #[test]

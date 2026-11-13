@@ -30,7 +30,7 @@ Linux x86_64. `sh -s -- --canary` installs the newest build of `main`.
 The `harar` binary is the server. Programs talk to it through a client on its
 local socket; the clients hold no secrets.
 
-- **Rust:** the [`harar`](client/README.md) crate, `harar = "0.3"`.
+- **Rust:** the [`harar`](client/README.md) crate, `harar = "0.4"`.
 - **JavaScript and TypeScript:** the [`harar`](js/README.md) npm package.
 - **Python:** the [`harar`](python/README.md) PyPI package, `pip install harar`.
 - **Ruby:** the [`harar`](ruby/README.md) gem, `gem install harar`.

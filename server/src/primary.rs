@@ -13,7 +13,7 @@ use clap::Args;
 use harar::model::{Action, Binding, Decision, Kind, Name, Org, Permission, Policy, Request, Role, Verb, Zone, ZoneKind, ZoneMatch};
 use harar::oidc::{self, Alg, IdentityRequest};
 use harar::approvals::{self, Approval, ApprovalRequest, ApprovalRule, ApproverDevice, DeviceKind, Widens};
-use harar::primary::{Notice, Pending, PolicyChange, PolicyView, PrimaryRequest, PrimaryResponse, Waiting, waiting_detail};
+use harar::primary::{ActorView, Notice, Pending, PolicyChange, PolicyView, PrimaryRequest, PrimaryResponse, Waiting, waiting_detail};
 use harar::recovery::{StoredCode, replace_recovery_codes, use_recovery_code};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -52,6 +52,10 @@ const RECOVERY_CLASS: &str = "recovery.codes";
 const NOTICES_KEY: &str = "harar:notices";
 const NOTICE_SECONDS: u64 = 7 * 24 * 3600;
 const MAX_NOTICES: usize = 32;
+/// The org's members (architecture, §2a): name → who added it, and when.
+const ACTORS_KEY: &str = "harar:actors";
+/// At most this many members, so the registry stays a small entry.
+const MAX_ACTORS: usize = 4096;
 /// How long a request waits for a person before it lapses.
 const APPROVAL_SECONDS: u64 = 15 * 60;
 /// At most this many requests wait at once, and this many devices are enrolled.
@@ -224,6 +228,28 @@ fn notify(keys: &mut HashMap<String, String>, human: &Name, text: String) {
         !drop
     });
     keys.insert(NOTICES_KEY.into(), serde_json::to_string(&notices).expect("notices serialize"));
+}
+
+/// One member of the org, as the registry keeps it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Member {
+    added_at: u64,
+    added_by: Name,
+}
+
+fn load_actors(keys: &HashMap<String, String>) -> BTreeMap<Name, Member> {
+    let listed: Vec<(Name, Member)> = keys.get(ACTORS_KEY).and_then(|text| serde_json::from_str(text).ok()).unwrap_or_default();
+    listed.into_iter().collect()
+}
+
+fn store_actors(keys: &mut HashMap<String, String>, actors: &BTreeMap<Name, Member>) {
+    let listed: Vec<(&Name, &Member)> = actors.iter().collect();
+    keys.insert(ACTORS_KEY.into(), serde_json::to_string(&listed).expect("members serialize"));
+}
+
+/// Whether `actor` can be a member here: a human or an agent of this org.
+fn member_kind(org: &Org, actor: &Name) -> bool {
+    actor.org() == org && matches!(actor.kind(), Kind::Human | Kind::Agent)
 }
 
 fn load_recovery(keys: &HashMap<String, String>) -> Vec<StoredCode> {
@@ -739,6 +765,66 @@ impl Primary {
                     Err(reason) => (subject, refuse(reason)),
                 }
             }
+            PrimaryRequest::ActorAdd { actor: member } => {
+                let subject = Some(member.to_string());
+                if let Err(reason) = self.check(&policy, actor, &Action::Approve { class: "actors.add".into() }) {
+                    return (subject, refuse(reason));
+                }
+                if !member_kind(&self.org, &member) {
+                    return (subject, refuse("not_a_member_kind"));
+                }
+                let mut actors = load_actors(keys);
+                if actors.contains_key(&member) {
+                    return (subject, reply(PrimaryResponse::ok()));
+                }
+                // One name, one member: `ava` is a human or an agent, never both,
+                // as an address like ava@addis.gg can only be one of them.
+                if actors.keys().any(|other| other.org() == member.org() && other.local() == member.local()) {
+                    return (subject, refuse("name_taken"));
+                }
+                if actors.len() >= MAX_ACTORS {
+                    return (subject, refuse("too_many_actors"));
+                }
+                actors.insert(member, Member { added_at: now_epoch_seconds(), added_by: actor.clone() });
+                let mut next = keys.clone();
+                store_actors(&mut next, &actors);
+                (subject, Outcome::Commit(next))
+            }
+            PrimaryRequest::ActorRemove { actor: member } => {
+                let subject = Some(member.to_string());
+                if let Err(reason) = self.check(&policy, actor, &Action::Approve { class: "actors.remove".into() }) {
+                    return (subject, refuse(reason));
+                }
+                // An OS user still speaks as it: unmap that first, so removing
+                // a member can never lock the owner out.
+                if users.values().any(|speaks| *speaks == member) {
+                    return (subject, refuse("actor_in_use"));
+                }
+                let mut actors = load_actors(keys);
+                let named = |binding: &Binding| binding.actor.to_string() == member.to_string();
+                if actors.remove(&member).is_none() && !policy.bindings.iter().any(named) {
+                    return (subject, reply(PrimaryResponse::ok()));
+                }
+                // Taking away never waits: the entry, and every binding that
+                // names it exactly, so a name added again starts with nothing.
+                let mut next_policy = policy.clone();
+                next_policy.bindings.retain(|binding| !named(binding));
+                let mut next = keys.clone();
+                store_actors(&mut next, &actors);
+                store_policy(&mut next, &next_policy, &users);
+                (subject, Outcome::Commit(next))
+            }
+            PrimaryRequest::ActorShow { actor: member } => {
+                let subject = Some(member.to_string());
+                if let Err(reason) = self.check(&policy, actor, &Action::Approve { class: "actors.show".into() }) {
+                    return (subject, refuse(reason));
+                }
+                let Some(found) = load_actors(keys).remove(&member) else {
+                    return (subject, refuse("not_found"));
+                };
+                let view = ActorView { groups: policy.groups(&member), name: member, added_at: found.added_at, added_by: found.added_by };
+                (subject, reply(PrimaryResponse { actor: Some(view), ..PrimaryResponse::ok() }))
+            }
             PrimaryRequest::RemoveDevice { id } => {
                 let subject = Some(format!("{id} of {actor}"));
                 let mut devices = load_devices(keys);
@@ -1113,6 +1199,9 @@ fn op_name(request: &PrimaryRequest) -> &'static str {
         PrimaryRequest::RemoveDevice { .. } => "remove_device",
         PrimaryRequest::Recover { .. } => "recover",
         PrimaryRequest::NewRecoveryCodes => "new_recovery_codes",
+        PrimaryRequest::ActorAdd { .. } => "actor_add",
+        PrimaryRequest::ActorRemove { .. } => "actor_remove",
+        PrimaryRequest::ActorShow { .. } => "actor_show",
     }
 }
 
